@@ -126,6 +126,17 @@ export async function extractTakesFromPages(
   const dryRun = opts.dryRun ?? false;
   const maxPages = opts.maxPages ?? 50;
   const holder = opts.holder ?? 'system';
+  // Resolve the classifier model. opts.model's JSDoc documents a
+  // `facts.extraction_model` default, but the per-page call below hardcoded
+  // anthropic:claude-haiku-4-5 — so the documented config was ignored and
+  // local-only brains (no ANTHROPIC_API_KEY) hit `llm_unavailable`. Honor the
+  // configured extraction model, then fall back to the brain's chat_model,
+  // then the Haiku default, so a self-hosted/local chat provider works too.
+  const takesModel =
+    opts.model ??
+    (await engine.getConfig('facts.extraction_model')) ??
+    (await engine.getConfig('chat_model')) ??
+    'anthropic:claude-haiku-4-5';
   const sourceFilter = opts.sourceIdFilter ? `AND source_id = $1` : '';
   const params = opts.sourceIdFilter ? [opts.sourceIdFilter] : [];
 
@@ -174,7 +185,7 @@ export async function extractTakesFromPages(
     let response: { text: string };
     try {
       response = await chat({
-        model: opts.model ?? 'anthropic:claude-haiku-4-5',
+        model: takesModel,
         system: CLASSIFIER_SYSTEM,
         messages: [
           {
