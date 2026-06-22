@@ -116,7 +116,8 @@ async function countPending(engine: BrainEngine): Promise<number> {
        FROM pages
       WHERE page_kind = 'markdown'
         AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
-        AND deleted_at IS NULL`,
+        AND deleted_at IS NULL
+        AND type <> 'extract_receipt'`,
     [MARKDOWN_CHUNKER_VERSION],
   );
   return Number(rows[0]?.count ?? 0);
@@ -134,6 +135,7 @@ async function readBatch(engine: BrainEngine, batchSize: number): Promise<Array<
       WHERE page_kind = 'markdown'
         AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
         AND deleted_at IS NULL
+        AND type <> 'extract_receipt'
       ORDER BY id ASC
       LIMIT $2`,
     [MARKDOWN_CHUNKER_VERSION, batchSize],

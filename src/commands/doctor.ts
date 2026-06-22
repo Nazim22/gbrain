@@ -933,7 +933,11 @@ export async function checkContextualRetrievalCoverage(engine: BrainEngine): Pro
          COUNT(*) FILTER (WHERE contextual_retrieval_mode IS NULL)::int AS mode_null
        FROM pages
        WHERE page_kind = 'markdown'
-         AND deleted_at IS NULL`,
+         AND deleted_at IS NULL
+         -- extract_receipt pages are generated audit records (dream_generated,
+         -- 0.3-demoted, excluded from extraction loops). They are never CR-chunked
+         -- content, so they must not count toward CR coverage or they flag forever.
+         AND type <> 'extract_receipt'`,
       [MARKDOWN_CHUNKER_VERSION],
     );
     const chunkerDrift = rows[0]?.chunker_drift ?? 0;
