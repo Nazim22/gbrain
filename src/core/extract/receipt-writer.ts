@@ -204,5 +204,20 @@ export async function writeReceipt(
     { sourceId: input.source_id },
   );
 
+  // Receipts reuse a stable slug (round-{N}) across a run's repeated writes.
+  // putPage overwrites the page row but does NOT rebuild content_chunks, so a
+  // reused slug would otherwise keep the chunk from the PRIOR write — stale
+  // search state (a recurring keeper-pass finding: "page updated, chunks stayed
+  // on the previous run"). Clear chunks on every write so the receipt is left
+  // chunkless at overwrite time (never stale); the normal integrate/embed cycle
+  // re-chunks it fresh from current content. Net: receipt chunks are always
+  // absent-or-fresh, never stale. Best-effort — a chunk-clear failure must not
+  // fail the receipt write (the receipt page itself is the load-bearing record).
+  try {
+    await engine.upsertChunks(slug, [], { sourceId: input.source_id });
+  } catch {
+    // non-fatal: stale-chunk cleanup is maintenance, not correctness-critical.
+  }
+
   return { slug, page };
 }
