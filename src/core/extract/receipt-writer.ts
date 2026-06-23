@@ -37,6 +37,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
+import { MARKDOWN_CHUNKER_VERSION } from '../chunkers/recursive.ts';
 
 /**
  * Round identifier. Matches the progressive-batch primitive's Stage
@@ -200,6 +201,11 @@ export async function writeReceipt(
       title,
       compiled_truth,
       frontmatter,
+      // Stamp the current chunker version so a receipt row is never seen as
+      // "stale" by ANY query (doctor's CR-coverage check OR a raw
+      // chunker_version<current SQL probe). Receipts are audit pages with no
+      // CR chunking, but a v1 row keeps tripping staleness flags forever.
+      chunker_version: MARKDOWN_CHUNKER_VERSION,
     },
     { sourceId: input.source_id },
   );
