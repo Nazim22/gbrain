@@ -33,6 +33,24 @@ export const ollama: Recipe = {
       // OLLAMA_NUM_PARALLEL config; no static cap to declare. v0.32 (#779).
       no_batch_cap: true,
     },
+    chat: {
+      // Ollama serves OpenAI-compatible /v1/chat/completions with native tool
+      // calling (model-dependent — qwen3 / llama3.1+ families support it). The
+      // openai-compat tier does not enforce this list at runtime; any locally
+      // pulled model id is accepted. Without this touchpoint, ollama:<model>
+      // chat/subagent routing classified as 'unknown provider' and dream
+      // synthesis jobs dead-lettered (capabilities.ts even lists ollama among
+      // "known providers with chat" — this makes that true).
+      models: ['qwen3', 'llama3.1', 'mistral'],
+      supports_tools: true,
+      // Local single-box server; stable across crashes/replays — the Minions
+      // gateway tool loop (agent.use_gateway_loop) drives it fine.
+      supports_subagent_loop: true,
+      supports_prompt_cache: false,
+      cost_per_1m_input_usd: 0,
+      cost_per_1m_output_usd: 0,
+      price_last_verified: '2026-07-06',
+    },
   },
   setup_hint: 'Install Ollama from https://ollama.ai, then `ollama pull nomic-embed-text` and `ollama serve`.',
 };
