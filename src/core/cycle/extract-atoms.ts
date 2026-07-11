@@ -52,7 +52,7 @@ import { chat as gatewayChat } from '../ai/gateway.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 
-const DEFAULT_BUDGET_USD = 0.3;
+const DEFAULT_BUDGET_USD = 1000; // S298: raised from 0.3 (cloud-Haiku cost cap) — meaningless for FREE local qwen3; lets a run drain the whole backlog GPU-bound instead of capping at ~2-50 transcripts. Revert to 0.3 if ever switched back to a paid cloud chat model.
 
 // v0.42+ TODO: read atom_type enum from active pack manifest at runtime.
 const ATOM_TYPES = [
