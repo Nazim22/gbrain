@@ -195,6 +195,13 @@ export async function extractTakesFromPages(
     let response: { text: string };
     try {
       response = await chat({
+        // Upstream #2997 adopted our fix but resolves via the FILE-plane
+        // gateway config (getChatModel()). On this brain the two planes
+        // disagree — config.json says `openrouter:qwen36-nothink` while the
+        // DB says `ollama:qwen36-nothink` — so the upstream form would silently
+        // route every takes extraction to PAID OpenRouter. `takesModel` reads
+        // the DB plane (local ollama) and already honours opts.model. Keep ours
+        // until the two planes are reconciled.
         model: takesModel,
         system: CLASSIFIER_SYSTEM,
         messages: [
