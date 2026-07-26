@@ -549,8 +549,17 @@ export async function runPhaseExtractAtoms(
   } catch {
     // Keep safe defaults: Haiku + $0.30.
   }
+  // S386 local patch: a free LOCAL model has no pricing entry, and BudgetTracker
+  // hard-fails `no_pricing` whenever a cap is set but pricing is missing (see
+  // budget-tracker.ts ~L290 — "without pricing we can't enforce the cap"). With
+  // `ollama:` that turned every extraction into BudgetExhausted: the phase
+  // reported `0 atoms … (55 budget-skipped)` and atom coverage silently froze.
+  // Electricity is not billable, so there is no cap to enforce — omit it.
+  // Companion to the DEFAULT_BUDGET_USD=1000 patch above; drop both if we ever
+  // point extract_atoms back at a paid cloud model.
+  const isFreeLocalModel = /^(ollama|llama-server|lmstudio|local):/i.test(extractModel);
   const budgetTracker = new BudgetTracker({
-    maxCostUsd: budgetCap,
+    ...(isFreeLocalModel ? {} : { maxCostUsd: budgetCap }),
     label: 'cycle.extract_atoms',
   });
 
