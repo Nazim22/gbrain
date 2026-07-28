@@ -55,6 +55,12 @@ export async function resolveEntitySlug(
     if (exact) return exact;
   }
 
+  // 1b. Declared alias. Runs after exact-slug (a real slug always wins) but
+  //     BEFORE prefix expansion and fuzzy — an explicitly declared name is
+  //     stronger evidence than a trigram score or a directory guess.
+  const aliased = await tryAliasMatch(engine, source_id, trimmed);
+  if (aliased) return aliased;
+
   // 2. Prefix-expansion match: when the input looks like a bare first name
   //    (no slash, no prefix, slugifies to a single short token), try
   //    `people/<token>-%` then `companies/<token>-%`. Short bare names
@@ -132,6 +138,12 @@ export async function resolveEntitySlugWithSource(
     const exact = await tryExactSlug(engine, source_id, trimmed);
     if (exact) return { slug: exact, source: 'exact_page' };
   }
+
+  // A declared alias names a real page, so it is an exact_page resolution —
+  // NOT fuzzy. Callers gate trajectory lookups on `!== 'fallback_slugify'`,
+  // and mislabelling this as fuzzy would understate a certain match.
+  const aliased = await tryAliasMatch(engine, source_id, trimmed);
+  if (aliased) return { slug: aliased, source: 'exact_page' };
 
   if (isBareName(trimmed)) {
     const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
@@ -323,6 +335,59 @@ function looksLikeSlug(s: string): boolean {
   if (/\s/.test(s)) return false;
   if (s !== s.toLowerCase()) return false;
   return /^[a-z0-9/_-]+$/.test(s);
+}
+
+/**
+ * Alias match — a page declares the names a user actually says for it via
+ * `frontmatter.aliases`, and this resolves those to the canonical slug.
+ *
+ * Why this arm exists: without it the ONLY levers are exact-slug, bare-name
+ * prefix expansion, and trigram fuzzy. An entity whose spoken name shares no
+ * trigram neighbourhood with its slug (a rename, a shortened handle, a page
+ * that moved directory) can never resolve, so every mention slugifies to a
+ * new phantom and trips the stub guard forever. The alternative — hardcoding
+ * the specific slugs into this file — would bake one brain's private entity
+ * names into shared source, which the repo's privacy rule forbids and which
+ * fixes only the instances someone happened to notice.
+ *
+ * Aliases are compared case-insensitively against both the raw input and its
+ * slugified form, so "Widget Co", "widget-co" and "widget co" all land.
+ */
+async function tryAliasMatch(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+): Promise<string | null> {
+  const needle = raw.trim().toLowerCase();
+  if (!needle) return null;
+  const slugged = slugify(raw);
+  try {
+    const rows = await engine.executeRaw<{ slug: string }>(
+      `SELECT p.slug
+         FROM pages p,
+              LATERAL jsonb_array_elements_text(
+                CASE WHEN jsonb_typeof(p.frontmatter->'aliases') = 'array'
+                     THEN p.frontmatter->'aliases' ELSE '[]'::jsonb END) AS a(alias)
+        WHERE p.source_id = $1
+          AND p.deleted_at IS NULL
+          AND (
+            lower(btrim(a.alias)) = $2
+            -- Compare SLUGIFIED forms too, so "Widget Co" (alias) matches
+            -- "Widget-Co" (input). Mirrors slugify()'s ASCII pass: collapse
+            -- every non-alphanumeric run to a hyphen, then trim hyphens.
+            OR btrim(regexp_replace(lower(btrim(a.alias)), '[^a-z0-9]+', '-', 'g'), '-') = $3
+          )
+        LIMIT 2`,
+      [source_id, needle, slugged],
+    );
+    // Ambiguous alias (two pages claim the same name) resolves to neither —
+    // guessing would silently misattribute knowledge, which is worse than a
+    // guarded stub. One alias, one owner.
+    if (rows.length === 1) return rows[0].slug;
+  } catch {
+    // Defensive: fail open. Caller still gets a slug from the fallback.
+  }
+  return null;
 }
 
 async function tryExactSlug(

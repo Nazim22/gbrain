@@ -563,9 +563,14 @@ export async function runPhaseExtractAtoms(
   let budgetExhausted = false;
   let extractModel = DEFAULT_EXTRACT_ATOMS_MODEL;
   let budgetCap = DEFAULT_BUDGET_USD;
+  let extractFallbackModel: string | null = null;
+  let fallbackRecoveries = 0;
   try {
     const configuredModel = await engine.getConfig('models.dream.extract_atoms');
     if (configuredModel) extractModel = configuredModel;
+    // S391: optional second model for the successful-but-empty case below.
+    const configuredFallback = await engine.getConfig('models.dream.extract_atoms_fallback');
+    if (configuredFallback) extractFallbackModel = configuredFallback;
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
     if (configuredBudget) {
       const n = Number(configuredBudget);
@@ -622,25 +627,64 @@ export async function runPhaseExtractAtoms(
 
     const originLabel = item.kind === 'transcript' ? item.filePath : item.slug;
     try {
-      const result = await chat({
-        model: extractModel,
-        system: EXTRACT_PROMPT,
-        messages: [
-          {
-            role: 'user',
-            content: `Source: ${originLabel}\n\n---\n\n${item.content.slice(0, 50_000)}`,
-          },
-        ],
-        maxTokens: 4096,
-      });
-      // Post-await yield: closes the "long LLM call past TTL" hazard
-      // codex flagged. The 30s throttle inside maybeYield bounds the
-      // actual refresh rate so this is cheap when calls are fast.
-      await maybeYield();
+      const runExtraction = async (model: string) => {
+        const r = await chat({
+          model,
+          system: EXTRACT_PROMPT,
+          messages: [
+            {
+              role: 'user',
+              content: `Source: ${originLabel}\n\n---\n\n${item.content.slice(0, 50_000)}`,
+            },
+          ],
+          maxTokens: 4096,
+        });
+        // Post-await yield: closes the "long LLM call past TTL" hazard
+        // codex flagged. The 30s throttle inside maybeYield bounds the
+        // actual refresh rate so this is cheap when calls are fast.
+        await maybeYield();
+        estimatedSpendUsd = budgetTracker.totalSpent;
+        return parseAtomsResponse(r.text);
+      };
 
-      estimatedSpendUsd = budgetTracker.totalSpent;
+      let atoms = await runExtraction(extractModel);
 
-      const atoms = parseAtomsResponse(result.text);
+      // A successful-but-EMPTY extraction on a TRANSCRIPT is a semantic miss,
+      // not a processed transcript. Reproduced S391: the configured local model
+      // handles the very transcripts it intermittently returns 0 atoms for, so
+      // the emptiness is transient (sampling temperature + a single shared
+      // inference slot under cycle load) — exactly the case where counting the
+      // item as processed loses the content permanently, because transcript
+      // idempotency is keyed on EXISTING atom rows and an item with no atoms
+      // simply stops being rediscovered as covered.
+      //
+      // Retry once through `models.dream.extract_atoms_fallback` when set;
+      // otherwise retry the same model once. Pages keep the #2144 tombstone
+      // path below — a page that genuinely yields nothing must stop being
+      // rediscovered, and pages have a content-hash stamp to make that safe.
+      if (atoms.length === 0 && item.kind === 'transcript') {
+        const retryModel = extractFallbackModel && extractFallbackModel !== extractModel
+          ? extractFallbackModel
+          : extractModel;
+        atoms = await runExtraction(retryModel);
+        if (atoms.length > 0) fallbackRecoveries++;
+      }
+
+      if (atoms.length === 0 && item.kind === 'transcript') {
+        // Still empty after a retry. Record it as a RETRYABLE FAILURE rather
+        // than `transcriptsProcessed++` so the gap is visible to doctor and to
+        // the next cycle instead of silently counting as done. The drain's
+        // no-forward-progress guard stops the loop, so this cannot hot-spin.
+        failures.push({
+          source: originLabel,
+          error: `empty_extraction: 0 atoms from ${extractModel}` +
+            (extractFallbackModel && extractFallbackModel !== extractModel
+              ? ` and fallback ${extractFallbackModel}`
+              : ' (retried once)'),
+        });
+        continue;
+      }
+
       if (atoms.length === 0) {
         // #2144: tombstone zero-yield pages so they stop being rediscovered.
         // Idempotency is keyed on atom rows — a page that yields no atoms
@@ -661,8 +705,9 @@ export async function runPhaseExtractAtoms(
             );
           } catch { /* fail-soft: page stays rediscoverable */ }
         }
-        if (item.kind === 'transcript') transcriptsProcessed++;
-        else pagesProcessed++;
+        // PAGES ONLY here — an empty transcript took the retryable-failure
+        // path above and never reaches this block.
+        pagesProcessed++;
         continue;
       }
 
@@ -767,6 +812,7 @@ export async function runPhaseExtractAtoms(
       `${transcriptsProcessed}/${transcripts.length} transcripts + ` +
       `${pagesProcessed}/${pages.length} pages` +
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
+      (fallbackRecoveries > 0 ? ` (${fallbackRecoveries} recovered on retry)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : ''),
@@ -783,6 +829,8 @@ export async function runPhaseExtractAtoms(
       estimated_spend_usd: estimatedSpendUsd,
       budget_usd: budgetCap,
       model: extractModel,
+      fallback_model: extractFallbackModel,
+      empty_retry_recoveries: fallbackRecoveries,
       budget_exhausted: budgetExhausted,
       source_id: sourceId,
       dry_run: opts.dryRun ?? false,
