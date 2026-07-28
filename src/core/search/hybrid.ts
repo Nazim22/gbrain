@@ -1964,6 +1964,29 @@ function rrfKey(r: SearchResult): string {
 }
 
 /**
+ * PINGU LOCAL PATCH (S390) — optional PAGE-grain RRF fusion.
+ *
+ * Chunk-grain fusion has a measured failure mode on multi-chunk documents:
+ * vector nominates chunk A of a page, BM25 nominates chunk B of the SAME page,
+ * and because the fusion keys differ the two votes never combine — the page
+ * competes against itself and loses to single-chunk pages that got both arms
+ * on one key. (Standard RRF fuses DOCUMENTS — Elasticsearch's docs are explicit;
+ * the chunk key is a local design choice, not an RRF requirement.)
+ *
+ * GBRAIN_RRF_KEY=page  → fuse votes at (source_id, slug) grain, keeping the
+ * best-ranked chunk any arm produced as the page's representative.
+ * Default 'chunk' preserves upstream behavior byte-for-byte.
+ *
+ * Deliberately DISABLED on the applyBoost=false path (detail=high/temporal),
+ * which legitimately wants multiple chunks per page to survive fusion.
+ */
+const RRF_PAGE_GRAIN = (process.env.GBRAIN_RRF_KEY ?? 'chunk') === 'page';
+
+function rrfPageKey(r: SearchResult): string {
+  return `${r.source_id ?? 'default'}:${r.slug}`;
+}
+
+/**
  * Canonical query-cache scope key.
  *
  * The semantic cache stores results keyed by `(scope, query, knobs_hash)`.
@@ -1994,19 +2017,26 @@ export function rrfFusionWeighted(
   lists: Array<{ list: SearchResult[]; k: number }>,
   applyBoost = true,
 ): SearchResult[] {
-  const scores = new Map<string, { result: SearchResult; score: number }>();
+  // S390: page-grain only on the standard path; detail=high keeps chunk grain.
+  const pageGrain = RRF_PAGE_GRAIN && applyBoost;
+  const scores = new Map<string, { result: SearchResult; score: number; best: number }>();
 
   for (const { list, k } of lists) {
     for (let rank = 0; rank < list.length; rank++) {
       const r = list[rank];
-      const key = rrfKey(r);
+      const key = pageGrain ? rrfPageKey(r) : rrfKey(r);
       const existing = scores.get(key);
       const rrfScore = 1 / (k + rank);
 
       if (existing) {
         existing.score += rrfScore;
+        // Keep the best-ranked chunk any arm produced as the representative.
+        if (pageGrain && rrfScore > existing.best) {
+          existing.best = rrfScore;
+          existing.result = r;
+        }
       } else {
-        scores.set(key, { result: r, score: rrfScore });
+        scores.set(key, { result: r, score: rrfScore, best: rrfScore });
       }
     }
   }
@@ -2034,19 +2064,25 @@ export function rrfFusionWeighted(
  * After accumulation: normalize to 0-1, then boost compiled_truth chunks.
  */
 export function rrfFusion(lists: SearchResult[][], k: number, applyBoost = true): SearchResult[] {
-  const scores = new Map<string, { result: SearchResult; score: number }>();
+  // S390: page-grain only on the standard path; detail=high keeps chunk grain.
+  const pageGrain = RRF_PAGE_GRAIN && applyBoost;
+  const scores = new Map<string, { result: SearchResult; score: number; best: number }>();
 
   for (const list of lists) {
     for (let rank = 0; rank < list.length; rank++) {
       const r = list[rank];
-      const key = rrfKey(r);
+      const key = pageGrain ? rrfPageKey(r) : rrfKey(r);
       const existing = scores.get(key);
       const rrfScore = 1 / (k + rank);
 
       if (existing) {
         existing.score += rrfScore;
+        if (pageGrain && rrfScore > existing.best) {
+          existing.best = rrfScore;
+          existing.result = r;
+        }
       } else {
-        scores.set(key, { result: r, score: rrfScore });
+        scores.set(key, { result: r, score: rrfScore, best: rrfScore });
       }
     }
   }
