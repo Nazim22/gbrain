@@ -159,8 +159,26 @@ export const DEFAULT_GATE: GateOpts = {
     'title-substring': { hit_at_1: floorEnv('GBRAIN_NTB_TITLE_HIT1', 0.95) },
     'multi-chunk-dilution': { hit_at_3: floorEnv('GBRAIN_NTB_DILUTION_HIT3', 1.0) },
     'alias-synonym': { hit_at_1: floorEnv('GBRAIN_NTB_ALIAS_HIT1', 0.98) },
+    // S393 — RATCHET, not an aspiration.
+    //
+    // `generic-to-named` is the largest family (49 of 80) and the weakest, and
+    // it sat in softFamilies warning at <0.8 indefinitely: the comment above
+    // says soft families are "warn-then-enforce until a 3x baseline noise floor
+    // is established", and that baseline was never established. So the family
+    // that matters most was the one nothing could fail on — it could rot to
+    // zero and the gate would still print PASS.
+    //
+    // The floor is set BELOW the current measurement (0.65 Hit@3 on 2026-07-29,
+    // up from 0.55 that morning), not at the 0.8 target. That is the point: a
+    // gate pinned to an aspiration fails every run and gets ignored, which is
+    // how this family became invisible in the first place. Pinned to reality it
+    // catches REGRESSION — the thing a gate is actually for — while the real
+    // gap stays visible as a warning.
+    //
+    // Raise this as the number improves. Never lower it to make a run pass.
+    'generic-to-named': { hit_at_3: floorEnv('GBRAIN_NTB_GENERIC_HIT3', 0.6) },
   },
-  softFamilies: ['generic-to-named', 'short-vs-rich', 'graph-relationship', 'hard-negative'],
+  softFamilies: ['short-vs-rich', 'graph-relationship', 'hard-negative'],
 };
 
 function floorEnv(name: string, dflt: number): number {
