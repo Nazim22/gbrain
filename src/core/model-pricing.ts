@@ -93,6 +93,21 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   // ── Together / DeepSeek (cross-modal-eval panel) ───────────────────────
   'together:meta-llama/Llama-3.3-70B-Instruct-Turbo': { input: 0.88, output: 0.88 },
   'deepseek:deepseek-chat':               { input:  0.14, output:  0.28 },
+
+  // ── OpenRouter ─────────────────────────────────────────────────────────
+  // OpenRouter ids are deliberately NOT repriced as the inner vendor (see
+  // canonicalLookup's note) — the markup differs from native rates. They are
+  // instead priced here as first-class keys, from OpenRouter's own /models
+  // endpoint (verified 2026-07-29).
+  //
+  // These entries are load-bearing, not cosmetic. `budget-tracker.ts` hard-
+  // fails with BudgetExhausted{reason:'no_pricing'} whenever a cap is set and
+  // the model is unpriced. A cycle phase catches that and counts the item as
+  // "budget-skipped" — so an unpriced model silently processes ZERO items
+  // while reporting spend $0 and failures []. Observed live: after routing
+  // cognition to OpenRouter, `extract_atoms` skipped every new transcript
+  // this way and read as a no-op cycle rather than a misconfiguration.
+  'openrouter:qwen/qwen3-235b-a22b-2507': { input:  0.09, output:  0.55 },
 };
 
 /**
