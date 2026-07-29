@@ -962,9 +962,20 @@ export function formatResult(opName: string, result: unknown): string {
         const { formatResultsExplain } = require('./core/search/explain-formatter.ts');
         return formatResultsExplain(results);
       }
-      return results.map(r =>
+      const body = results.map(r =>
         `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
+      // S395 — absence signal. When EVERY hit is weak_semantic, the brain has
+      // no strong evidence for this query: no alias, no title match, no
+      // keyword-exact, no high-vector hit. Returning nearest neighbors with
+      // no caveat reads as a confident answer ("what is our Kubernetes
+      // cluster config" confidently returned unrelated infra pages). One
+      // honest line turns nearest-neighbor noise into a usable "likely
+      // absent" verdict without changing the result shape any consumer parses.
+      const allWeak = results.length > 0 && results.every((r: any) => r.evidence === 'weak_semantic');
+      return allWeak
+        ? body + '⚠ all hits are weak_semantic — no alias/title/keyword/vector-strong evidence; the brain likely has no page on this. Treat as UNKNOWN, not as the nearest neighbors above.\n'
+        : body;
     }
     case 'get_tags': {
       const tags = result as string[];
