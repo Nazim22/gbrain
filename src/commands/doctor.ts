@@ -7134,6 +7134,7 @@ export async function buildChecks(
       const report = latest.report_json as Record<string, unknown> | null;
       const perQuery = (report?.per_query as Array<{
         contradictions: Array<{
+          verdict?: string;
           severity: 'low' | 'medium' | 'high';
           axis: string;
           a: { slug: string };
@@ -7141,10 +7142,31 @@ export async function buildChecks(
           resolution_command: string;
         }>;
       }> | undefined) ?? [];
-      let high = 0, medium = 0, low = 0;
+      // S393 (Mnemo's finding): `per_query[].contradictions` is a misnomer kept
+      // for wire-compatibility — types.ts states it "contains every
+      // non-`no_contradiction` finding (genuine contradictions PLUS
+      // temporal_supersession / temporal_regression / temporal_evolution /
+      // negation_artifact)" and that "consumers that want the strict-
+      // contradiction subset filter on `f.verdict === 'contradiction'`".
+      //
+      // Doctor did not filter, so it counted temporal supersession — a NEWER
+      // claim correctly replacing an older one, which is the brain working as
+      // designed — as a suspected contradiction. The live brain reported a
+      // HIGH finding whose own attached explanation read `# temporal_supersession`.
+      // Counting healthy temporal evolution as a defect trains the operator to
+      // ignore this check, which is how a real contradiction would slip past.
+      //
+      // Records predating the verdict field have `verdict === undefined`; those
+      // are counted as contradictions (prior behaviour) rather than silently
+      // dropped — under-reporting a real contradiction is the worse error.
+      let high = 0, medium = 0, low = 0, temporal = 0;
       const highFindings: Array<{ a: string; b: string; axis: string; cmd: string }> = [];
       for (const q of perQuery) {
         for (const c of q.contradictions) {
+          if (c.verdict !== undefined && c.verdict !== 'contradiction') {
+            temporal++;
+            continue;
+          }
           if (c.severity === 'high') {
             high++;
             highFindings.push({ a: c.a.slug, b: c.b.slug, axis: c.axis, cmd: c.resolution_command });
@@ -7153,17 +7175,22 @@ export async function buildChecks(
         }
       }
       const total = high + medium + low;
+      // Temporal findings are reported, never counted — they are the brain
+      // updating itself correctly, not a defect to chase.
+      const temporalNote = temporal > 0
+        ? ` (${temporal} temporal/artifact finding(s) excluded — newer claims correctly superseding older ones, not contradictions)`
+        : '';
       if (total === 0) {
         checks.push({
           name: 'contradictions',
           status: 'ok',
-          message: `Latest probe run (${latest.ran_at.slice(0, 10)}) found no suspected contradictions across ${latest.queries_evaluated} queries.`,
+          message: `Latest probe run (${latest.ran_at.slice(0, 10)}) found no suspected contradictions across ${latest.queries_evaluated} queries.${temporalNote}`,
         });
       } else {
         const ciLow = (latest.wilson_ci_lower * 100).toFixed(0);
         const ciHigh = (latest.wilson_ci_upper * 100).toFixed(0);
         const lines = [
-          `${total} suspected contradictions (high=${high} medium=${medium} low=${low}) detected by latest probe — Wilson CI 95%: ${ciLow}-${ciHigh}%.`,
+          `${total} suspected contradictions (high=${high} medium=${medium} low=${low}) detected by latest probe — Wilson CI 95%: ${ciLow}-${ciHigh}%.${temporalNote}`,
         ];
         for (const f of highFindings.slice(0, 3)) {
           lines.push(`  HIGH: ${f.a} vs ${f.b}${f.axis ? ' — ' + f.axis : ''}`);
