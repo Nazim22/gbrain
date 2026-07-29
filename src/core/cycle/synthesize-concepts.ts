@@ -24,6 +24,7 @@ import type { ProgressReporter } from '../progress.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { chat as gatewayChat, isAvailable } from '../ai/gateway.ts';
+import { canonicalLookup } from '../model-pricing.ts';
 // #2163: concept pages route through importFromContent (the same
 // parse→chunk→embed pipeline put_page uses) instead of a bare engine.putPage,
 // so they land in the retrieval surface (content_chunks + embeddings) where
@@ -152,6 +153,8 @@ export async function runPhaseSynthesizeConcepts(
   let conceptsWritten = 0;
   let estimatedSpendUsd = 0;
   const budgetCap = DEFAULT_BUDGET_USD;
+  /** Models that answered but have no CANONICAL_PRICING entry (S393). */
+  const unpricedModels = new Set<string>();
   const failures: Array<{ concept: string; error: string }> = [];
   const tierCounts = { T1: 0, T2: 0, T3: 0, T4: 0 };
 
@@ -204,9 +207,26 @@ export async function runPhaseSynthesizeConcepts(
           // codex flagged. Throttle inside maybeYield bounds the actual
           // refresh rate.
           await maybeYield();
-          // Sonnet at ~$3/M input + $15/M output
-          estimatedSpendUsd +=
-            (result.usage.input_tokens * 3.0 + result.usage.output_tokens * 15.0) / 1_000_000;
+          // S393: price the model that ACTUALLY answered, not a hardcoded
+          // Sonnet rate. The pre-fix line charged $3/M in + $15/M out
+          // unconditionally, so after cognition moved to
+          // `openrouter:qwen/qwen3-235b-a22b-2507` ($0.09/$0.55) this phase
+          // reported `estimated_spend_usd: 0.25311` against a real daily
+          // total of $0.03 — roughly 33x over, and reported as fact.
+          // A cost estimate that silently ignores the model is worse than no
+          // estimate: it is confidently wrong in whichever direction the
+          // model happens to differ.
+          const rate = canonicalLookup(result.model);
+          if (!rate) {
+            // Surfaced in details rather than swallowed: an estimate that
+            // silently omits calls understates spend, which is the same
+            // false-comfort failure as pricing them wrong.
+            unpricedModels.add(result.model);
+          }
+          estimatedSpendUsd += rate
+            ? (result.usage.input_tokens * rate.input
+               + result.usage.output_tokens * rate.output) / 1_000_000
+            : 0;
           narrative = result.text.trim() || deterministicNarrative(group);
         } catch (err) {
           failures.push({
@@ -292,7 +312,10 @@ export async function runPhaseSynthesizeConcepts(
     summary:
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
-      (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : ''),
+      (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '')
+      + (unpricedModels.size > 0
+        ? ` ⚠ spend UNDERSTATED — no pricing for ${[...unpricedModels].join(', ')}`
+        : ''),
     details: {
       concepts_written: conceptsWritten,
       tier_counts: tierCounts,
@@ -300,6 +323,7 @@ export async function runPhaseSynthesizeConcepts(
       atoms_seen: atoms.length,
       failures,
       estimated_spend_usd: estimatedSpendUsd,
+      unpriced_models: [...unpricedModels],
       budget_usd: budgetCap,
       dry_run: opts.dryRun ?? false,
     },
