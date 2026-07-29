@@ -1591,17 +1591,39 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
 export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
   try {
     const { readRecentRerankFailures } = await import('../core/rerank-audit.ts');
+    // S392: resolve the EFFECTIVE reranker config, not just the raw key. A missing
+    // `search.reranker.enabled` was read as "disabled" even though a mode bundle or
+    // an explicit `search.reranker.model` can still activate reranking.
     const cfg = await engine.getConfig('search.reranker.enabled');
-    const rerankerEnabled = cfg === 'true' || cfg === '1';
+    const activeModel = (await engine.getConfig('search.reranker.model')) || '';
+    const rerankerEnabled = cfg === 'true' || cfg === '1' || (cfg == null && activeModel !== '');
 
-    const failures = readRecentRerankFailures(7);
+    // S392: scope failures to the CURRENTLY CONFIGURED model. This check used to
+    // count every `reason:"auth"` row in the rolling 7-day window regardless of
+    // which provider produced it, so six dead `zeroentropyai:zerank-2` rows kept
+    // the warning lit for a week AFTER the brain had switched to a local reranker
+    // that was verifiably 6/6 reachable. Stale rows from a retired provider are
+    // history, not current health. (Found by Mnemo.)
+    const allFailures = readRecentRerankFailures(7);
+    const failures = activeModel
+      ? allFailures.filter((f) => f.model === activeModel)
+      : allFailures;
+    const retiredCount = allFailures.length - failures.length;
+    // Remediation must follow the CONFIGURED provider — a hard-coded
+    // "verify ZEROENTROPY_API_KEY" is actively misleading on a local reranker.
+    const provider = activeModel.includes(':') ? activeModel.split(':')[0] : '';
+    const authHint = provider && !provider.startsWith('zeroentropy')
+      ? `Fix: check credentials/reachability for \`${provider}\` and run \`gbrain models doctor\`.`
+      : 'Fix: verify ZEROENTROPY_API_KEY and run `gbrain models doctor`.';
+
     if (failures.length === 0) {
       return {
         name: 'reranker_health',
         status: 'ok',
-        message: rerankerEnabled
-          ? 'No rerank failures in last 7 days'
-          : 'Reranker disabled — no failures expected',
+        message: (rerankerEnabled
+          ? `No rerank failures in last 7 days${activeModel ? ` for the active reranker (${activeModel})` : ''}`
+          : 'Reranker disabled — no failures expected')
+          + (retiredCount > 0 ? ` (${retiredCount} failure(s) from a retired reranker ignored)` : ''),
       };
     }
 
@@ -1610,7 +1632,23 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${authFails.length} reranker auth failure(s) in last 7 days. Fix: verify ZEROENTROPY_API_KEY and run \`gbrain models doctor\`.`,
+        message: `${authFails.length} reranker auth failure(s) in last 7 days on the active reranker${activeModel ? ` (${activeModel})` : ''}. ${authHint}`,
+      };
+    }
+
+    // S392: llama.cpp rejects an input larger than its physical batch with an
+    // HTTP 500 that has been landing as `network` — a transient class that hides
+    // under the >=5 threshold, so a hard capacity ceiling never surfaced. A
+    // capacity refusal is deterministic and must warn on the FIRST occurrence.
+    const capacityFails = failures.filter((f) => {
+      const s = String(f.error_summary ?? '').toLowerCase();
+      return s.includes('too large to process') || s.includes('physical batch size');
+    });
+    if (capacityFails.length > 0) {
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message: `${capacityFails.length} reranker CAPACITY failure(s) in last 7 days${activeModel ? ` (${activeModel})` : ''}: input exceeded the server's physical batch size. Fix: raise the reranker server's batch (\`-b\`/\`--ubatch\`) or lower \`search.reranker.top_n_in\`. Not a transient — it recurs on every long input.`,
       };
     }
 
@@ -6719,11 +6757,21 @@ export async function buildChecks(
     const { loadOperatorLiterals } = await import('../core/content-sanity-literals.ts');
     const literals = loadOperatorLiterals();
     const scanLimit = fullContentAudit ? null : 1000;
+    // Head slices are transported as BYTEA, not text. On a SQL_ASCII brain
+    // `LEFT()` counts BYTES, so a 2048-cut lands mid-UTF-8-sequence and the
+    // server refuses to emit the broken byte to a UTF8 client
+    // (`invalid byte sequence for encoding "UTF8": 0xe2`) — one split character
+    // on one page aborted the whole scan, so the junk inventory went
+    // unverified brain-wide. `convert_to(..., 'SQL_ASCII')` is a no-op byte
+    // copy that skips output validation, and the truncated tail is repaired
+    // client-side by a lossy TextDecoder (U+FFFD), which cannot affect a
+    // junk-PATTERN match. Portable: on a UTF8 brain `LEFT()` is already
+    // character-based and this stays a plain byte copy of a clean slice.
     const rows = scanLimit
       ? await sql`
           SELECT p.slug, p.source_id, p.title,
-                 LEFT(p.compiled_truth, 2048) AS body_head,
-                 LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
+                 convert_to(LEFT(p.compiled_truth, 2048), 'SQL_ASCII') AS body_head,
+                 convert_to(LEFT(COALESCE(p.timeline, ''), 1024), 'SQL_ASCII') AS tl_head,
                  p.frontmatter
             FROM pages p
            WHERE p.deleted_at IS NULL
@@ -6732,18 +6780,21 @@ export async function buildChecks(
         `
       : await sql`
           SELECT p.slug, p.source_id, p.title,
-                 LEFT(p.compiled_truth, 2048) AS body_head,
-                 LEFT(COALESCE(p.timeline, ''), 1024) AS tl_head,
+                 convert_to(LEFT(p.compiled_truth, 2048), 'SQL_ASCII') AS body_head,
+                 convert_to(LEFT(COALESCE(p.timeline, ''), 1024), 'SQL_ASCII') AS tl_head,
                  p.frontmatter
             FROM pages p
            WHERE p.deleted_at IS NULL
         `;
     const hits: Array<{ slug: string; matched: string[] }> = [];
-    const scanRows = rows as unknown as Array<{ slug: string; source_id: string; title: string; body_head: string; tl_head: string; frontmatter: Record<string, unknown> | null }>;
+    const scanRows = rows as unknown as Array<{ slug: string; source_id: string; title: string; body_head: Uint8Array | null; tl_head: Uint8Array | null; frontmatter: Record<string, unknown> | null }>;
+    // Lossy by design: a byte-truncated tail becomes U+FFFD rather than throwing.
+    const headDecoder = new TextDecoder('utf-8');
+    const decodeHead = (b: Uint8Array | null): string => (b ? headDecoder.decode(b) : '');
     for (const r of scanRows) {
       const sanity = assessContentSanity({
-        compiled_truth: r.body_head ?? '',
-        timeline: r.tl_head ?? '',
+        compiled_truth: decodeHead(r.body_head),
+        timeline: decodeHead(r.tl_head),
         title: r.title ?? '',
         bytes_warn: Number.MAX_SAFE_INTEGER, // we ONLY care about junk-pattern hits here
         bytes_block: Number.MAX_SAFE_INTEGER,
@@ -6774,10 +6825,15 @@ export async function buildChecks(
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    // A scan that THREW has not proven anything. Emitting `ok` here made an
+    // unexpected failure indistinguishable from a clean audit — the live brain
+    // reported `[OK] scraper_junk_pages: Skipped (invalid byte sequence for
+    // encoding "UTF8": 0xe2)` for days, i.e. false-green (S392, found by Mnemo).
+    // An unexpected exception is a WARN: the check could not run.
     checks.push({
       name: 'scraper_junk_pages',
-      status: 'ok',
-      message: `Skipped (${msg})`,
+      status: 'warn',
+      message: `Scan FAILED, junk-page inventory unverified: ${msg}`,
     });
   }
 
