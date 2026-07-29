@@ -770,6 +770,13 @@ export interface SearchResult {
   base_score?: number;
   /** Multiplier applied by applyBacklinkBoost (1.0 = unchanged). */
   backlink_boost?: number;
+  /**
+   * S393: multiplier applied by applySupersededDemote when the page carries
+   * `frontmatter.status: superseded`. Present only when the demote fired, so
+   * --explain can show WHY a retired page dropped rather than leaving the
+   * reader to guess.
+   */
+  superseded_demote?: number;
   /** Multiplier applied by applySalienceBoost. */
   salience_boost?: number;
   /** Multiplier applied by applyRecencyBoost. */

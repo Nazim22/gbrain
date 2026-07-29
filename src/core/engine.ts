@@ -1328,6 +1328,22 @@ export interface BrainEngine {
     pageIds: number[],
   ): Promise<Map<number, { reason: string; detail: string }>>;
   /**
+   * S393: for a list of page_ids, return those whose `frontmatter.status` is
+   * `superseded`. Used by hybrid search to DEMOTE retired pages so a replaced
+   * answer cannot outrank the one that replaced it.
+   *
+   * Why this exists: a superseded page carried no ranking signal at all, and
+   * `effective_date` falls back to `updated_at` — so ADDING a supersede banner
+   * made the dead page look FRESHER than its replacement. Measured live: the
+   * retired "Dae is reviewer-only" policy outranked the S389 rule that
+   * reversed it, and the retired Qwen3 reranker page outranked its successor.
+   * An in-body banner mitigates this for a human reader, but relying on the
+   * reader to notice is not a fix — the ranker has to know.
+   *
+   * Single SQL query, not N+1. Empty input → empty set (no query).
+   */
+  getSupersededPageIds(pageIds: number[]): Promise<Set<number>>;
+  /**
    * v0.27.0: for a list of slugs, return their updated_at timestamps (or created_at fallback).
    * Used by hybrid search recency boost. Single SQL query, not N+1.
    * Slugs with no timestamp get no entry in the map.

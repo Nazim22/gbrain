@@ -3574,6 +3574,19 @@ export class PostgresEngine implements BrainEngine {
     return result;
   }
 
+  async getSupersededPageIds(pageIds: number[]): Promise<Set<number>> {
+    const result = new Set<number>();
+    if (pageIds.length === 0) return result;
+    const sql = this.sql;
+    const rows = await sql`
+      SELECT id FROM pages
+       WHERE id = ANY(${pageIds}::int[])
+         AND lower(frontmatter ->> 'status') = 'superseded'
+    `;
+    for (const r of rows as unknown as { id: number }[]) result.add(Number(r.id));
+    return result;
+  }
+
   async getPageTimestamps(slugs: string[]): Promise<Map<string, Date>> {
     if (slugs.length === 0) return new Map();
     const sql = this.sql;

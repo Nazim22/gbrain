@@ -172,6 +172,47 @@ export function applyBacklinkBoost(
 }
 
 /**
+ * S393 — superseded-page demote multiplier.
+ *
+ * 0.45 is deliberately a DEMOTE, not a hard exclude: a superseded page is
+ * still the right answer to "why was X replaced" / "what did we do before",
+ * and `archive/` hard-excludes already exist for content that must vanish.
+ * Chosen to sit below the measured competitive band — the retired Dae policy
+ * scored 1.007 against its live replacement's 0.920, so a factor that merely
+ * nudges would not have reordered them.
+ */
+export const SUPERSEDED_DEMOTE_FACTOR = 0.45;
+
+/**
+ * Demote results whose page is marked `frontmatter.status: superseded`.
+ *
+ * Why this stage exists: supersession carried NO ranking signal, and
+ * `effective_date` falls back to `updated_at` — so adding a supersede banner
+ * made the retired page look FRESHER than its replacement. Measured live
+ * (S393): the retired "Dae is reviewer-only" policy outranked the S389 rule
+ * that reversed it, and asked "can Dae build on CStoreGenie?" the brain
+ * answered from the dead page. An in-body banner mitigates that for a careful
+ * reader, but a ranker that needs the reader to catch its mistake is not fixed.
+ *
+ * Deliberately NOT floor-gated. The other metadata boosts skip low-scoring
+ * results because boosting noise is pointless; a demote is the opposite — a
+ * superseded page must lose rank wherever it appears, and skipping it below
+ * the floor would leave exactly the weak-but-winning case unhandled.
+ */
+export function applySupersededDemote(
+  results: SearchResult[],
+  supersededPageIds: Set<number>,
+): void {
+  if (supersededPageIds.size === 0) return;
+  for (const r of results) {
+    if (!Number.isFinite(r.score)) continue;
+    if (!supersededPageIds.has(r.page_id)) continue;
+    r.score *= SUPERSEDED_DEMOTE_FACTOR;
+    r.superseded_demote = SUPERSEDED_DEMOTE_FACTOR;
+  }
+}
+
+/**
  * v0.35.6.0 — floor-ratio threshold computation.
  *
  * Returns the absolute score floor below which boost stages skip a result.
@@ -464,6 +505,21 @@ export async function runPostFusionStages(
     } catch {
       // Non-fatal; preserves the existing pre-v0.29.1 contract.
     }
+  }
+
+  // S393 superseded demote. Runs unconditionally (not behind applyBacklinks)
+  // and is NOT floor-gated — a retired page must lose rank wherever it lands.
+  // Best-effort: a lookup failure must never break retrieval, matching the
+  // stampContentFlags contract.
+  try {
+    const supersededIds = await engine.getSupersededPageIds(
+      [...new Set(results
+        .map((r) => r.page_id)
+        .filter((n): n is number => typeof n === 'number' && Number.isFinite(n)))],
+    );
+    applySupersededDemote(results, supersededIds);
+  } catch {
+    // Non-fatal.
   }
 
   // Composite refs for the orthogonal axes (multi-source isolation).

@@ -3407,6 +3407,20 @@ export class PGLiteEngine implements BrainEngine {
     return result;
   }
 
+  async getSupersededPageIds(pageIds: number[]): Promise<Set<number>> {
+    const result = new Set<number>();
+    if (pageIds.length === 0) return result;
+    // Parity with PostgresEngine.getSupersededPageIds (S393).
+    const { rows } = await this.db.query(
+      `SELECT id FROM pages
+        WHERE id = ANY($1::int[])
+          AND lower(frontmatter ->> 'status') = 'superseded'`,
+      [pageIds]
+    );
+    for (const r of rows as { id: number }[]) result.add(Number(r.id));
+    return result;
+  }
+
   async getPageTimestamps(slugs: string[]): Promise<Map<string, Date>> {
     if (slugs.length === 0) return new Map();
     const { rows } = await this.db.query(
