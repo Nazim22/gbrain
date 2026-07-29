@@ -56,6 +56,7 @@ import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { createHash } from 'crypto';
+import { statSync } from 'node:fs';
 import { slugifySegment } from '../sync.ts';
 
 const DEFAULT_BUDGET_USD = 1000; // S298: raised from 0.3 (cloud-Haiku cost cap) — meaningless for FREE local qwen3; lets a run drain the whole backlog GPU-bound instead of capping at ~2-50 transcripts. Revert to 0.3 if ever switched back to a paid cloud chat model.
@@ -712,6 +713,13 @@ export async function runPhaseExtractAtoms(
       }
 
       if (!opts.dryRun) {
+        // Content date is per-ITEM (all atoms from one transcript/page share it).
+        // engine.putPage does NOT run computeEffectiveDate (that lives in the
+        // import path), so pass effective_date explicitly alongside the
+        // frontmatter `date:` — otherwise the column stays NULL and recency
+        // COALESCEs to updated_at (= extraction time), laundering stale facts
+        // as fresh.
+        const contentDate = sourceContentDate(item);
         for (const atom of atoms) {
           const srcRef = item.kind === 'transcript' ? item.filePath : item.slug;
           const slug = atomSlug(atom.title, srcRef);
@@ -731,6 +739,9 @@ export async function runPhaseExtractAtoms(
               frontmatter: {
                 type: 'atom',
                 atom_type: atom.atom_type,
+                // Content date, NOT extraction date — when the fact was stated,
+                // not when the dream cycle happened to process it.
+                date: contentDate,
                 ...originFrontmatter,
                 source_hash: item.contentHash.slice(0, 16),
                 ...(atom.source_quote && { source_quote: atom.source_quote }),
@@ -742,6 +753,8 @@ export async function runPhaseExtractAtoms(
                 extracted_by: 'extract_atoms-v0.41.2.1',
               },
               timeline: '',
+              effective_date: new Date(`${contentDate}T00:00:00Z`),
+              effective_date_source: 'date',
             },
             { sourceId },
           );
@@ -930,6 +943,32 @@ function sourceDate(ref: string): string {
   const base = ref.split('/').pop() ?? ref;
   const m = base.match(/(\d{4}-\d{2}-\d{2})/) ?? ref.match(/(\d{4}-\d{2}-\d{2})/);
   return m ? m[1] : todayDate();
+}
+
+/**
+ * The atom's CONTENT date — "when was the source about?" — for the `date:`
+ * frontmatter that `computeEffectiveDate` consumes. Without it, every atom
+ * falls through the chain to `fallback` (= updated_at = extraction time), so
+ * an atom extracted tonight from a months-old transcript ranks as if the fact
+ * were stated tonight, and recency boosts launder stale facts as fresh.
+ *
+ * Precedence: date in the ref (same rule as `sourceDate`) → transcript FILE
+ * mtime (a session transcript's mtime is the session's own time; undated
+ * uuid-named transcripts are the norm on agent brains) → run date.
+ */
+function sourceContentDate(item: { kind: 'transcript'; filePath: string } | { kind: 'page'; slug: string }): string {
+  const ref = item.kind === 'transcript' ? item.filePath : item.slug;
+  const base = ref.split('/').pop() ?? ref;
+  const m = base.match(/(\d{4}-\d{2}-\d{2})/) ?? ref.match(/(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  if (item.kind === 'transcript') {
+    try {
+      return statSync(ref).mtime.toISOString().slice(0, 10);
+    } catch {
+      // deleted/inaccessible transcript — fall through to run date
+    }
+  }
+  return todayDate();
 }
 
 /**
