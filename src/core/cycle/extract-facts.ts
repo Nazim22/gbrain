@@ -195,11 +195,24 @@ export async function runExtractFacts(
   // live backing page, which both genuine pre-v0.32.2 rows (their
   // entity page exists) satisfy and inline-writer unfenceable rows do
   // not.
+  // S393: EXPIRED rows must not jam the phase either — same failure shape the
+  // live-backing-page requirement above was added to fix, one case further on.
+  // An expired fact is dead: it is excluded from recall and there is nothing
+  // meaningful to fence onto a page, so `apply-migrations` is a ledger-complete
+  // no-op for it and the count can never reach zero on its own.
+  //
+  // Observed live: 769 expired rows across 10 entity slugs — and the slugs are
+  // `pingu`, `memory`, `sessions`, `resources`, `areas`, … i.e. vault DIRECTORY
+  // names, not entities. They are the S300 bulk-page-summary junk that was
+  // mass-expired in S390. Frozen 2026-05-24..2026-06-16, they silently blocked
+  // extract_facts for ~6 weeks while `apply-migrations` reported "up to date"
+  // and the phase reported a tidy "skipped" — success-shaped, doing nothing.
   const legacy = await engine.executeRaw<{ n: string }>(
     `SELECT COUNT(*) AS n
        FROM facts f
       WHERE f.row_num IS NULL
         AND f.entity_slug IS NOT NULL
+        AND f.expired_at IS NULL
         AND EXISTS (
           SELECT 1 FROM pages p
            WHERE p.source_id = f.source_id
