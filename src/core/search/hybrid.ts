@@ -213,6 +213,46 @@ export function applySupersededDemote(
 }
 
 /**
+ * S395 — the supersede demote must SURVIVE the reranker.
+ *
+ * applySupersededDemote multiplies the RRF `score`, but the cross-encoder
+ * re-orders the head purely by its own relevanceScore — so a retired page
+ * that survives into the rerank window gets promoted straight back.
+ * Measured live (S395): the superseded S387 "Dae is reviewer-only" pages
+ * re-took ranks 1–2 on "who writes the code for CStoreGenie" with
+ * reranker_delta +16/+14, `superseded_demote: 0.45` stamped and ignored.
+ * The reranker reads query+text with full attention and no provenance —
+ * a well-worded dead page beats a live one by design unless the demote is
+ * re-applied to the ordering signal the final ranking actually uses.
+ *
+ * Scales `rerank_score` by the same factor and re-sorts the reranked head
+ * (the contiguous leading run of results carrying `rerank_score`) in place.
+ * The un-reranked remainder keeps its order. Stable sort keeps ties fair.
+ */
+export function applySupersededDemotePostRerank(
+  results: SearchResult[],
+  supersededPageIds: Set<number>,
+): void {
+  if (supersededPageIds.size === 0) return;
+  let headEnd = 0;
+  while (headEnd < results.length && typeof results[headEnd]!.rerank_score === 'number') headEnd++;
+  if (headEnd === 0) return;
+  let touched = false;
+  for (let i = 0; i < headEnd; i++) {
+    const r = results[i]!;
+    if (!supersededPageIds.has(r.page_id)) continue;
+    r.rerank_score = (r.rerank_score as number) * SUPERSEDED_DEMOTE_FACTOR;
+    r.superseded_demote = SUPERSEDED_DEMOTE_FACTOR;
+    touched = true;
+  }
+  if (!touched) return;
+  const head = results
+    .slice(0, headEnd)
+    .sort((a, b) => (b.rerank_score as number) - (a.rerank_score as number));
+  for (let i = 0; i < headEnd; i++) results[i] = head[i]!;
+}
+
+/**
  * v0.35.6.0 — floor-ratio threshold computation.
  *
  * Returns the absolute score floor below which boost stages skip a result.
@@ -1653,6 +1693,25 @@ export async function hybridSearch(
   const reranked = rerankerOpts.enabled
     ? await applyReranker(query, deduped, rerankerOpts as any)
     : deduped;
+
+  // S395 — re-apply the supersede demote to the reranker's own ordering
+  // signal; the pre-rerank RRF demote does not survive the cross-encoder
+  // (see applySupersededDemotePostRerank). Runs BEFORE alias hop / autocut
+  // so downstream stages (and autocut's score-cliff) see corrected scores.
+  // Best-effort like the pre-rerank stage: a lookup failure never breaks
+  // retrieval.
+  if (rerankerOpts.enabled) {
+    try {
+      const rerankedIds = [...new Set(reranked
+        .filter((r) => typeof r.rerank_score === 'number')
+        .map((r) => r.page_id)
+        .filter((n): n is number => typeof n === 'number' && Number.isFinite(n)))];
+      const supersededIds = await engine.getSupersededPageIds(rerankedIds);
+      applySupersededDemotePostRerank(reranked, supersededIds);
+    } catch {
+      // Non-fatal.
+    }
+  }
 
   // T3 — free-text alias hop. Runs AFTER rerank so a query that is a page's
   // declared chosen name reliably surfaces that page regardless of how the
