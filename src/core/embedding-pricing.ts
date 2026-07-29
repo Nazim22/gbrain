@@ -49,6 +49,39 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   'perplexity:pplx-embed-v1-4b':   { pricePerMTok: 0.03 },
 };
 
+/**
+ * S393 — providers that run on hardware you already own, so a USD spend cap
+ * must never accrue against them.
+ *
+ * These are deliberately NOT entries in EMBEDDING_PRICING with `pricePerMTok: 0`:
+ * that table is "what a vendor charges", and a zero there would read as a free
+ * hosted tier rather than "there is no vendor". Keeping the concepts separate
+ * means an unpriced HOSTED model still trips the unknown-price path (correct —
+ * we cannot bound its cost), while a local one is bounded at zero by definition.
+ *
+ * Live failure this fixes: `embed-backfill` charged a flat $1/job proxy
+ * regardless of provider, so 25 jobs against local `ollama:bge-m3` — actual
+ * spend $0.00 — saturated the $25 default cap and silently set
+ * `embed_skip_reason: spend_capped`. Embeddings then stopped landing while
+ * every job reported success, which is the same disappear-quietly failure class
+ * as the rest of S393.
+ */
+export const ZERO_COST_EMBEDDING_PROVIDERS: ReadonlySet<string> = new Set([
+  'ollama',
+  'llama-server',
+  'llama-server-reranker',
+  'local',
+  'localai',
+]);
+
+/** True when the model runs on self-hosted hardware, i.e. costs no USD. */
+export function isZeroCostEmbeddingProvider(modelString: string): boolean {
+  if (!modelString) return false;
+  const provider = (modelString.includes(':') ? modelString.split(':', 2)[0] : '')
+    .trim().toLowerCase();
+  return provider !== '' && ZERO_COST_EMBEDDING_PROVIDERS.has(provider);
+}
+
 export type PriceLookupResult =
   | { kind: 'known'; pricePerMTok: number; key: string }
   | { kind: 'unknown'; provider: string; model: string };

@@ -36,6 +36,7 @@
 import type { BrainEngine } from './engine.ts';
 import { MinionQueue } from './minions/queue.ts';
 import { parseUsdLimit, resolveSpendPosture, type SpendPosture } from './spend-posture.ts';
+import { isZeroCostEmbeddingProvider } from './embedding-pricing.ts';
 
 export const COOLDOWN_CONFIG_KEY = 'embed.backfill_cooldown_min';
 export const SPEND_CAP_CONFIG_KEY = 'embed.backfill_max_usd_per_source_24h';
@@ -103,6 +104,23 @@ async function defaultSpend24hForSource(
   engine: BrainEngine,
   sourceId: string,
 ): Promise<number> {
+  // S393: a self-hosted embedder costs no USD, so it must never accrue against
+  // a USD cap. The $1/job proxy below is provider-blind, so 25 jobs against
+  // local `ollama:bge-m3` — actual spend $0.00 — saturated the $25 default and
+  // set `embed_skip_reason: spend_capped`. Embeddings silently stopped landing
+  // while every job still reported success.
+  //
+  // Fixed HERE rather than by disabling the cap, so the cap keeps protecting
+  // paid providers. Turning it off would have unblocked the symptom by removing
+  // the control — which is the wrong trade when the control is the only thing
+  // bounding spend on a hosted embedder.
+  try {
+    const embedModel = await engine.getConfig('embedding_model');
+    if (embedModel && isZeroCostEmbeddingProvider(embedModel)) return 0;
+  } catch {
+    // Fall through to the proxy — a config read failure must not disable the cap.
+  }
+
   // Conservative proxy: count jobs that completed (or are running) in the
   // 24h window. Each is treated as worth `DEFAULT_SPEND_CAP_USD / 25` ($1)
   // toward the cap — i.e. 25 jobs in 24h saturate the default cap.
