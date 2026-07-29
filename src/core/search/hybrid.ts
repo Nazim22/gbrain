@@ -674,7 +674,8 @@ async function applyAliasResolvedBoost(
 
 // T3 — free-text alias hop tuning.
 const ALIAS_HOP_PRESENT_BOOST = 1.10; // bounded boost when canonical already in results
-const MAX_ALIAS_QUERY_TOKENS = 6;     // skip long queries (clearly not a chosen name)
+const MAX_ALIAS_QUERY_TOKENS = 6;     // widest n-gram considered as a name
+const MAX_ALIAS_CANDIDATES = 40;      // S393: hard cap on n-grams per query (one batched lookup)
 const MAX_ALIAS_INJECT = 3;           // cap injected pages per query (collision safety)
 
 /**
@@ -705,15 +706,58 @@ export async function applyAliasHop(
 ): Promise<SearchResult[]> {
   if (!query) return results;
   const qNorm = normalizeAlias(query);
-  if (!qNorm || qNorm.split(' ').length > MAX_ALIAS_QUERY_TOKENS) return results;
+  if (!qNorm) return results;
+
+  // S393: look up the whole query AND its contiguous n-grams, longest first.
+  //
+  // Pre-fix this resolved ONE key — the entire normalized query — so an alias
+  // only fired on a near-exact restatement. Two failures followed, both measured:
+  //
+  //   "where does cstoregenie run"                -> Access Map      1.0663 ✅
+  //   "where does cstoregenie run in production"  -> GCP-era memory  0.9566 ❌
+  //
+  // Two natural qualifying words moved the answer from the current canonical
+  // map to a superseded-era page. And any query over MAX_ALIAS_QUERY_TOKENS was
+  // skipped outright, so "which LXC containers are running and what do they do"
+  // (10 tokens) never consulted aliases at all — despite `Homelab Map` declaring
+  // exactly that entity. This is the dominant cause of the retrieval fixture's
+  // `generic-to-named` family sitting at 43% Hit@1 across 49 queries.
+  //
+  // Substring containment is the right relation here: an alias is a NAME, and a
+  // question that contains the name is about the thing. Bounded by construction
+  // — n-grams are capped at MAX_ALIAS_QUERY_TOKENS wide and MAX_ALIAS_CANDIDATES
+  // total, resolved in ONE batched call (resolveAliases already takes an array).
+  // Minimum width 2: single tokens are too collision-prone to inject on.
+  const tokens = qNorm.split(' ').filter(Boolean);
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (let width = Math.min(tokens.length, MAX_ALIAS_QUERY_TOKENS); width >= 2; width--) {
+    for (let start = 0; start + width <= tokens.length; start++) {
+      const gram = tokens.slice(start, start + width).join(' ');
+      if (seen.has(gram)) continue;
+      seen.add(gram);
+      candidates.push(gram);
+      if (candidates.length >= MAX_ALIAS_CANDIDATES) break;
+    }
+    if (candidates.length >= MAX_ALIAS_CANDIDATES) break;
+  }
+  if (tokens.length === 1 && !seen.has(qNorm)) candidates.push(qNorm);
+  if (candidates.length === 0) return results;
 
   let aliasMap: Map<string, Array<{ slug: string; source_id: string }>>;
   try {
-    aliasMap = await engine.resolveAliases([qNorm], { sourceId: opts.sourceId, sourceIds: opts.sourceIds });
+    aliasMap = await engine.resolveAliases(candidates, { sourceId: opts.sourceId, sourceIds: opts.sourceIds });
   } catch {
     return results; // pre-v110 table-missing OR transient error -> fail-open
   }
-  const refs = aliasMap.get(qNorm);
+  // `candidates` is already ordered widest-first, so the first hit is the most
+  // specific alias present in the query — "park express store id" beats the
+  // "park express" it contains.
+  let refs: Array<{ slug: string; source_id: string }> | undefined;
+  for (const c of candidates) {
+    const hit = aliasMap.get(c);
+    if (hit && hit.length > 0) { refs = hit; break; }
+  }
   if (!refs || refs.length === 0) return results;
 
   // Deterministic + capped. Source-scoped: each canonical is a (source_id, slug)
