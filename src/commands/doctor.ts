@@ -7612,6 +7612,82 @@ export async function buildChecks(
     // surfacing via the batch-retry audit JSONL. Codex H-9 thresholds.
     progress.heartbeat('batch_retry_health');
     checks.push(await checkBatchRetryHealth(engine));
+    // S393: a model that reserves budget but never records usage is failing
+    // 100% of the time. Nothing else catches this — the caller just sees an
+    // empty result, so it reads as "the model returned nothing useful"
+    // rather than "the model never ran". Live case: 3,443 Haiku reserves,
+    // zero records, over two months, on `cycle.extract_atoms` — atom
+    // extraction silently produced nothing while every other check stayed
+    // green. Ratio-based on purpose: it needs no cooperation from the
+    // failing path, which is exactly what a dead provider cannot give.
+    progress.heartbeat('model_completion_health');
+    try {
+      const { readBudgetCompletion, findDeadModels } =
+        await import('../core/audit/budget-completion-audit.ts');
+      const completion = readBudgetCompletion(7);
+      const dead = findDeadModels(completion);
+      if (completion.files_scanned === 0) {
+        checks.push({
+          name: 'model_completion_health',
+          status: 'ok',
+          message: 'No budget audit files in the last 7 days — no model calls to verify.',
+        });
+      } else if (dead.length === 0) {
+        const live = completion.models.filter((m) => m.recorded > 0).length;
+        checks.push({
+          name: 'model_completion_health',
+          status: 'ok',
+          message: `All ${live} model(s) with calls in the last 7 days completed at least one`,
+        });
+      } else {
+        // Severity turns on whether the dead model is STILL configured. A
+        // provider that was already repointed is history that has not yet
+        // aged out of the 7-day window — reporting it as a failure would
+        // keep doctor red for a week after the fix and train the operator
+        // to ignore this check, which is how the original 2-month blind
+        // spot survived in the first place.
+        const sql = db.getConnection();
+        const configuredRows = await sql`
+          SELECT value FROM config
+           WHERE key = 'chat_model' OR key = 'embedding_model'
+              OR key LIKE 'models%' OR key LIKE '%extraction_model'
+        ` as unknown as Array<{ value: string }>;
+        const configured = new Set(configuredRows.map((r) => String(r.value ?? '').trim()).filter(Boolean));
+        const fmt = (m: typeof dead[number]) =>
+          `${m.model} (${m.reserved} attempts, 0 completed, last ${m.last_reserve_ts.slice(0, 19)}Z)`;
+        const stillLive = dead.filter((m) => configured.has(m.model));
+        const historical = dead.filter((m) => !configured.has(m.model));
+
+        if (stillLive.length > 0) {
+          checks.push({
+            name: 'model_completion_health',
+            status: 'fail',
+            message:
+              `${stillLive.length} CONFIGURED model(s) never completed a call in the last 7 days: ` +
+              `${stillLive.map(fmt).join('; ')}. Budget was reserved and no usage recorded — the ` +
+              'provider is unreachable or its credential is missing, and callers are silently ' +
+              'receiving empty results. Fix: `gbrain models doctor` to confirm reachability, then ' +
+              'repoint the model or supply its key.' +
+              (historical.length > 0 ? ` (${historical.length} additional dead model(s) already repointed.)` : ''),
+          });
+        } else {
+          checks.push({
+            name: 'model_completion_health',
+            status: 'warn',
+            message:
+              `${historical.length} model(s) failed 100% of calls in the window but are NO LONGER ` +
+              `CONFIGURED — already repointed, ages out of the 7-day window: ${historical.map(fmt).join('; ')}.`,
+          });
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      checks.push({
+        name: 'model_completion_health',
+        status: 'warn',
+        message: `Model-completion scan FAILED, silent-failure state unverified: ${msg}`,
+      });
+    }
     // issue #1801 wedged_queue — alive-but-wedged worker (claimable work
     // waiting, zero live-lock active, stale completions) as a health error.
     progress.heartbeat('wedged_queue');
