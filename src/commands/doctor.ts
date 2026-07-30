@@ -6291,7 +6291,14 @@ export async function buildChecks(
       )
       SELECT
         (SELECT count(*)::int FROM eligible) AS entities,
-        (SELECT count(DISTINCT from_page_id)::int FROM links WHERE from_page_id IN (SELECT id FROM eligible)) AS linked_from,
+        -- "linked" = participates in the graph in EITHER direction. Counting
+        -- outbound only contradicted entity_link_coverage (inbound-based): a
+        -- person page with 5 inbound links scored 100% there and 0% here in
+        -- the same doctor run. Either-direction is a superset of both, so the
+        -- two checks can no longer disagree in that direction.
+        (SELECT count(*)::int FROM eligible e
+          WHERE EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = e.id)
+             OR EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id)) AS linked_from,
         (SELECT count(DISTINCT page_id)::int FROM timeline_entries WHERE page_id IN (SELECT id FROM eligible)) AS timeline`,
     ))[0] ?? { entities: entityCount, linked_from: 0, timeline: 0 };
 
