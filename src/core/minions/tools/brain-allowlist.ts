@@ -209,6 +209,14 @@ export interface BuildBrainToolsOpts {
    * Unset → legacy 'default'.
    */
   sourceId?: string;
+  /**
+   * Provenance frontmatter keys merged into the page row after every
+   * successful put_page (S396). At-write-time provenance in the child's own
+   * path — survives parent-cycle death, unlike the orchestrator's post-hoc
+   * stamp. Trusted seam (flows from SubagentHandlerData.provenance_frontmatter,
+   * PROTECTED_JOB_NAMES-gated). Merge failures log and never fail the write.
+   */
+  provenanceFrontmatter?: Record<string, unknown>;
 }
 
 interface OpContextDeps {
@@ -295,7 +303,29 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
           sourceId: opts.sourceId,
         });
         const params = (input && typeof input === 'object') ? input as Record<string, unknown> : {};
-        return op.handler(opCtx, params);
+        const result = await op.handler(opCtx, params);
+        // S396 at-creation provenance: stamp the just-written page row in the
+        // child's own path so a dead parent can't orphan pages without a raw
+        // trace. jsonb merge (no YAML surgery on the model's content); a
+        // stamp failure logs and never fails the write itself.
+        if (op.name === 'put_page' && opts.provenanceFrontmatter
+            && typeof params.slug === 'string' && params.slug.length > 0) {
+          try {
+            const { executeRawJsonb } = await import('../../sql-query.ts');
+            await executeRawJsonb(
+              ctx.engine,
+              `UPDATE pages
+                  SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $3::jsonb
+                WHERE slug = $1 AND source_id = $2`,
+              [params.slug, opts.sourceId ?? 'default'],
+              [opts.provenanceFrontmatter],
+            );
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            process.stderr.write(`[subagent-tool:${ctx.jobId}] WARN: provenance stamp failed for ${params.slug}: ${msg}\n`);
+          }
+        }
+        return result;
       },
     };
   });

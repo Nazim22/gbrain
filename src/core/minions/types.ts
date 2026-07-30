@@ -473,6 +473,17 @@ export interface SubagentHandlerData {
    */
   source_id?: string;
   /**
+   * Provenance frontmatter merged into every page this subagent writes via
+   * put_page, AT WRITE TIME in the child's own tool path (S396, Mnemo
+   * needs-human e392a866). The orchestrator's post-hoc stamp
+   * (stampDreamProvenance) is lost whenever the parent cycle dies before
+   * reaching it — 105 synthesized pages shipped without a raw trace that
+   * way. Same trust story as `source_id`: PROTECTED_JOB_NAMES gates who
+   * can set it. Keys are shallow-merged into the page row's frontmatter
+   * jsonb after a successful put_page; they never overwrite the page body.
+   */
+  provenance_frontmatter?: Record<string, unknown>;
+  /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior
    * (omitted or false) prepends a deterministic preamble listing each

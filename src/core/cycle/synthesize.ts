@@ -616,6 +616,15 @@ export async function runPhaseSynthesize(
           // #1586: scope every child tool call to the cycle's resolved source
           // so put_page writes land there instead of the hardcoded 'default'.
           ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
+          // S396 (Mnemo e392a866): stamp provenance in the CHILD's write path
+          // so pages carry their raw trace even when the parent cycle dies
+          // before the post-hoc stampDreamProvenance pass (which remains as
+          // the belt for D6 chunk-slug rewrites).
+          provenance_frontmatter: {
+            dream_generated: true,
+            dream_cycle_date: opts.date ?? today(),
+            raw_source: t.filePath,
+          },
         };
         // Idempotency key parity:
         //   - single-chunk → legacy `dream:synth:<filePath>:<hash16>` (byte-
