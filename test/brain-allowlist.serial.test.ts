@@ -176,6 +176,44 @@ describe('buildBrainTools', () => {
     expect(rows[0].source_id).toBe('mybrain');
   });
 
+  // S396: provenanceFrontmatter is merged into the page row in the CHILD's
+  // own put_page path, so a parent cycle dying before its post-hoc stamp
+  // can no longer orphan synthesized pages without a raw trace.
+  test('execute() on put_page merges provenanceFrontmatter at creation (S396)', async () => {
+    const tools = buildBrainTools({
+      subagentId: 42,
+      engine,
+      config,
+      provenanceFrontmatter: {
+        dream_generated: true,
+        dream_cycle_date: '2026-07-30',
+        raw_source: '/tmp/transcripts/session.part1.txt',
+      },
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page');
+    const ctx: ToolCtx = { engine, jobId: 1, remote: true };
+    await putPage!.execute(
+      { slug: 'wiki/agents/42/provenance-test', content: '---\ntitle: Prov\n---\nbody' },
+      ctx,
+    );
+    const rows = await engine.executeRaw<{ frontmatter: Record<string, unknown> | string }>(
+      `SELECT frontmatter FROM pages WHERE slug = 'wiki/agents/42/provenance-test'`,
+    );
+    expect(rows.length).toBe(1);
+    const fm = typeof rows[0].frontmatter === 'string'
+      ? JSON.parse(rows[0].frontmatter) as Record<string, unknown>
+      : rows[0].frontmatter;
+    expect(fm.raw_source).toBe('/tmp/transcripts/session.part1.txt');
+    expect(fm.dream_generated).toBe(true);
+    expect(fm.dream_cycle_date).toBe('2026-07-30');
+    // (title is extracted into the pages.title column by put_page, not kept
+    // in frontmatter jsonb — assert the merge didn't clobber the row itself.)
+    const titleRows = await engine.executeRaw<{ title: string }>(
+      `SELECT title FROM pages WHERE slug = 'wiki/agents/42/provenance-test'`,
+    );
+    expect(titleRows[0]?.title).toBe('Prov');
+  });
+
   test('buildBrainTools rejects a malformed sourceId at build time (#1586)', () => {
     expect(() =>
       buildBrainTools({ subagentId: 1, engine, config, sourceId: '../evil' }),
