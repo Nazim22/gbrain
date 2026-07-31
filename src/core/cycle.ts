@@ -1768,7 +1768,10 @@ export async function runCycle(
         const { result, duration_ms } = await timePhase(() => runPhaseSynthesize(engine, {
           brainDir,
           dryRun,
-          yieldDuringPhase: opts.yieldDuringPhase,
+          // Keep the cycle DB lock alive while synthesize waits on long-running
+          // subagent children. The phase's keepalive timer fires this wrapper,
+          // which refreshes both the cycle lock and any enclosing job lock.
+          yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase),
           inputFile: opts.synthInputFile,
           date: opts.synthDate,
           from: opts.synthFrom,

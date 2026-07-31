@@ -97,4 +97,15 @@ describe('buildYieldDuringPhase (T3 codex fix)', () => {
     expect(tracker.refreshCount).toBe(5);
     expect(tracker.releaseCount).toBe(0);
   });
+
+  test('legacy synthesize phase receives the cycle-lock-refreshing wrapper', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync(new URL('../../src/core/cycle.ts', import.meta.url), 'utf8');
+    const start = src.indexOf("if (phases.includes('synthesize'))");
+    const end = src.indexOf('// ── Phase 5:', start);
+    const synthesizeBlock = src.slice(start, end);
+    expect(synthesizeBlock).toContain(
+      'yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase)',
+    );
+  });
 });
