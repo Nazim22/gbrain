@@ -390,6 +390,47 @@ describe('v0.41.2.1: runPhaseExtractAtoms — dual-source merge + idempotency', 
     expect(stem.length).toBeLessThanOrEqual(60);
   });
 
+  test('S398: same atom reworded only in case/punctuation upserts — no style twin', async () => {
+    // Real duplicate pair observed in production (S398): identical idea, the
+    // model varied only capitalisation + quotes between two extractions.
+    // atomSlugStem() already normalized BOTH to the same stem, but the hash
+    // beside it was taken over the RAW title — so the stems matched while the
+    // hashes did not, minting two pages for one atom. Same class as the
+    // trailing-dash twin above, one layer down.
+    const titleA = "Noise reduction via 'Substantive Reply' filtering";
+    const titleB = 'Noise reduction via substantive reply filtering';
+    const filePath = '/srv/transcripts/2026-06-13-telegram.md';
+
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'first', contentHash: 'e5e5e5e5f6f6f6f6' }],
+      _pages: [],
+      _chat: stubChat(`[{"title":"${titleA}","atom_type":"insight","body":"b"}]`),
+    });
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'first plus more', contentHash: 'a7a7a7a7b8b8b8b8' }],
+      _pages: [],
+      _chat: stubChat(`[{"title":"${titleB}","atom_type":"insight","body":"b"}]`),
+    });
+
+    const rows = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE type = 'atom'`,
+    );
+    expect(rows.length).toBe(1); // one atom, not a style twin
+
+    // Guard the disambiguation the hash exists for: two GENUINELY different
+    // atoms that share a 60-char prefix must still get separate slugs.
+    const long = 'aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo';
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath: '/srv/transcripts/2026-06-14-x.md', content: 'c', contentHash: 'c9c9c9c9d0d0d0d0' }],
+      _pages: [],
+      _chat: stubChat(`[{"title":"${long} ONE","atom_type":"insight","body":"b"},{"title":"${long} TWO","atom_type":"insight","body":"b"}]`),
+    });
+    const after = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE type = 'atom' AND slug LIKE 'atoms/2026-06-14/%'`,
+    );
+    expect(after.length).toBe(2); // distinct atoms stay distinct
+  });
+
   test('PhaseResult.details has additive page fields populated', async () => {
     const chat = stubChat(`[{"title":"x","atom_type":"insight","body":"b"}]`);
     const result = await runPhaseExtractAtoms(engine, {

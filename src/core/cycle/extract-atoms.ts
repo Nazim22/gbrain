@@ -980,8 +980,22 @@ function sourceContentDate(item: { kind: 'transcript'; filePath: string } | { ki
  *   first 60 chars on separate slugs, so a deterministic slug never silently
  *   clobbers a *different* atom. Hash is over the title only (not body) so an
  *   LLM rewording the body on re-extraction still upserts rather than dupes.
+ * - The hash is over the NORMALIZED title (S398). Hashing the raw title made
+ *   casing/punctuation load-bearing, so the same atom reworded only in style
+ *   minted a twin: "Noise reduction via 'Substantive Reply' filtering" and
+ *   "Noise reduction via substantive reply filtering" produced the IDENTICAL
+ *   stem but different hashes — two pages for one idea. This is the same class
+ *   as the documented "trailing-dash twin", one layer down: the stem was
+ *   normalized while the hash beside it was not.
+ *   Normalizing the FULL title (not the 60-char stem) keeps the disambiguation
+ *   the hash exists for — two genuinely different atoms sharing a 60-char
+ *   prefix still differ after normalization, so they still get separate slugs.
  */
+function normalizeAtomTitle(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
 function atomSlug(title: string, srcRef: string): string {
-  const hash = createHash('sha256').update(title).digest('hex').slice(0, 6);
+  const hash = createHash('sha256').update(normalizeAtomTitle(title)).digest('hex').slice(0, 6);
   return `atoms/${sourceDate(srcRef)}/${atomSlugStem(title)}-${hash}`;
 }
