@@ -1983,7 +1983,11 @@ export async function runCycle(
         const { result, duration_ms } = await timePhase(() => runPhasePatterns(engine, {
           brainDir,
           dryRun,
-          yieldDuringPhase: opts.yieldDuringPhase,
+          // S398: must be the lock-refreshing wrapper, not the bare outer hook —
+          // patterns is long-running, so a bare hook lets `gbrain-cycle` expire
+          // mid-phase and a duplicate cycle start (same defect as ab590f67 /
+          // 4088c262 in propose_takes and legacy synthesize).
+          yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase),
           once: opts.onceForPhase === 'patterns',
           deadlineAtMs: opts.deadlineAtMs ?? null,
         }));
@@ -2097,7 +2101,8 @@ export async function runCycle(
         const { runPhaseConsolidate } = await import('./cycle/phases/consolidate.ts');
         const { result, duration_ms } = await timePhase(() => runPhaseConsolidate(engine, {
           dryRun,
-          yieldDuringPhase: opts.yieldDuringPhase,
+          // S398: lock-refreshing wrapper — see the patterns phase above.
+          yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase),
           signal: opts.signal,
         }));
         result.duration_ms = duration_ms;
