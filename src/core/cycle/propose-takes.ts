@@ -158,6 +158,13 @@ export interface ProposeTakesOpts extends BasePhaseOpts {
   skipPagesWithFence?: boolean;
   /** Override the phase wall-clock deadline (tests). Default: 30 min. */
   deadlineMs?: number;
+  /**
+   * Cooperative in-phase yield. Cycle.ts wraps this with
+   * buildYieldDuringPhase(lock, outer), so each fire renews both the cycle
+   * DB lock and the enclosing Minion job lock while this multi-call phase
+   * is still running.
+   */
+  yieldDuringPhase?: () => Promise<void>;
 }
 
 export interface ProposeTakesResult {
@@ -485,7 +492,26 @@ class ProposeTakesPhase extends BaseCyclePhase {
       opts.reporter.start('propose_takes.pages' as never, pages.length);
     }
 
+    // A propose pass can spend up to 90s in each extractor call and walk 100
+    // pages. Refresh at most every 30s between calls so the 5-minute cycle
+    // lock cannot expire while the phase is healthy, without issuing one DB
+    // UPDATE for every fast cache hit.
+    let lastYieldMs = 0;
+    const maybeYield = async (): Promise<void> => {
+      if (!opts.yieldDuringPhase) return;
+      const now = Date.now();
+      if (now - lastYieldMs < 30_000) return;
+      lastYieldMs = now;
+      try {
+        await opts.yieldDuringPhase();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[propose_takes] yieldDuringPhase failed (non-fatal): ${msg}`);
+      }
+    };
+
     for (const page of pages) {
+      await maybeYield();
       // Phase deadline check. Break (not throw) so the phase returns a
       // partial result with deadline_hit:true; work already banked stays.
       const elapsedMs = Date.now() - phaseStartMs;
@@ -547,6 +573,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           existingTakes,
           modelHint: opts.model,
         });
+        await maybeYield();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);

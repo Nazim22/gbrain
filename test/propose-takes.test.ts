@@ -114,6 +114,26 @@ function buildCtx(engine: BrainEngine): OperationContext {
   };
 }
 
+// ─── in-phase lock refresh ─────────────────────────────────────────
+
+describe('propose_takes cooperative yield', () => {
+  test('fires yieldDuringPhase while walking pages so the cycle lock stays live', async () => {
+    const pages = [
+      buildPage({ slug: 'notes/one', body: 'No gradeable claim here.' }),
+      buildPage({ slug: 'notes/two', body: 'Still no gradeable claim here.' }),
+    ];
+    const { engine } = buildMockEngine({ pages });
+    let yieldCount = 0;
+
+    await runPhaseProposeTakes(buildCtx(engine), {
+      extractor: async () => [],
+      yieldDuringPhase: async () => { yieldCount += 1; },
+    });
+
+    expect(yieldCount).toBe(1);
+  });
+});
+
 // ─── parseExtractorOutput ───────────────────────────────────────────
 
 describe('parseExtractorOutput', () => {
