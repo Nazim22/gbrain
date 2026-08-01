@@ -42,6 +42,31 @@ export const llamaServer: Recipe = {
       // server launched with a larger `-b` can raise this. v0.32 (#779).
       max_batch_items: 32,
     },
+    chat: {
+      // llama-server serves OpenAI-compatible /v1/chat/completions with
+      // native tool calling when launched with `--jinja` (model-dependent).
+      // Like the embedding touchpoint, model identity is whatever the server
+      // was launched with — the alias passed via `--alias`. Without this
+      // touchpoint, llama-server:<model> chat/dream routing fails with
+      // 'Provider "llama-server" does not support touchpoint "chat"'
+      // (hit S398 wiring models.dream.extract_atoms to a local Gemma).
+      // Empty list: the openai-compat tier does not enforce it at runtime
+      // (same as ollama's chat touchpoint) — any launched alias is accepted.
+      models: [],
+      supports_tools: true,
+      supports_subagent_loop: true,
+      supports_prompt_cache: false,
+      cost_per_1m_input_usd: 0,
+      cost_per_1m_output_usd: 0,
+      price_last_verified: '2026-07-30',
+      // A local server's context is whatever it was launched with, and it is
+      // typically FAR below the 128k that capabilities.ts assumes when a recipe
+      // stays silent. Leaving this unset is how a 35,345-token prompt was built
+      // against a 32,768-token server and died on the wire (2026-08-01).
+      // Default verified live against /props (`default_generation_settings.n_ctx`
+      // = 32768, gemma-4-12b-it-qat). Override when launching with a larger -c.
+      max_context_tokens: Number(process.env.GBRAIN_LLAMA_SERVER_MAX_CONTEXT ?? 32_768),
+    },
   },
   /**
    * Probe via the OpenAI-compatible /v1/models endpoint. Caller passes the

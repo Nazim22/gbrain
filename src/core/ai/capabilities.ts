@@ -112,6 +112,27 @@ export function getProviderCapabilities(modelString: string): ProviderCapabiliti
 }
 
 /**
+ * The model's DECLARED context limit, or null when the recipe doesn't state one.
+ *
+ * `getProviderCapabilities().maxContext` substitutes an optimistic 128k default,
+ * which is the right shape for advisory use and the wrong shape for a gate: a
+ * locally-served 32k model inherited "128k" and callers built prompts to match.
+ * A preflight must refuse only what it KNOWS is too large, so it reads this and
+ * stays silent when the limit is merely assumed.
+ *
+ * Returns null (not a guess) for unknown providers, chat-less providers, and
+ * catalog-spanning recipes like openrouter that deliberately omit the field.
+ */
+export function getDeclaredMaxContext(modelString: string): number | null {
+  try {
+    const { recipe } = resolveRecipe(modelString);
+    return recipe.touchpoints.chat?.max_context_tokens ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Tier-1 gate consumed by `enforceSubagentCapable()` in src/core/model-config.ts
  * (D6 + D7). Returns:
  *

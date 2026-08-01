@@ -56,6 +56,7 @@ import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
+import { getDeclaredMaxContext } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
 import { buildGatewayConfig } from './build-gateway-config.ts';
@@ -3141,6 +3142,26 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   }
   const estimatedInputTokens = estimateChatInputTokens(opts);
   const maxOutputTokens = opts.maxTokens ?? defaultMaxOutputTokens(modelStrEarly);
+
+  // Context preflight. ProviderCapabilities.maxContext has always been
+  // documented as "drives the gateway's pre-flight context check; the loop
+  // refuses to send a prompt that exceeds this" — but nothing read it. The
+  // field was declared and never enforced, so an oversized prompt went to the
+  // provider and died there: a 35,345-token patterns prompt against a 32,768
+  // local context burned 3 retries and killed the job with a provider-side
+  // error instead of one clear message here (2026-08-01).
+  //
+  // Refuses only against a DECLARED limit — never the optimistic default —
+  // so this tightens nothing for providers that don't state their ceiling.
+  const declaredMaxContext = getDeclaredMaxContext(modelStrEarly);
+  if (declaredMaxContext !== null && estimatedInputTokens + maxOutputTokens > declaredMaxContext) {
+    throw new AIConfigError(
+      `Prompt does not fit ${modelStrEarly}: ~${estimatedInputTokens} input + ${maxOutputTokens} max output ` +
+      `= ~${estimatedInputTokens + maxOutputTokens} tokens, limit ${declaredMaxContext}.`,
+      `Shorten the prompt, lower maxTokens, or point this tier at a longer-context model. ` +
+      `Retrying unchanged will fail the same way.`,
+    );
+  }
 
   // TX5: reserve BEFORE the provider call. Throws BudgetExhausted on cost,
   // runtime, or no_pricing (when cap is set). Pre-resolution model id is
