@@ -1386,6 +1386,20 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     const purgedClones = allowPurge
       ? await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE)
       : { count: 0, bytes: 0, names: [] as string[] };
+    // An irreversible delete MUST record what it destroyed, on a durable
+    // channel, at the moment it happens. `purged_page_slugs` was already in
+    // the returned details — but the CLI's human output prints only counts
+    // and nothing persists the details, so after 59 pages were hard-deleted
+    // on 2026-08-01 there was NO WAY to say which 59. "Deleted 59 pages" is
+    // not an audit trail; it is a number you cannot act on.
+    if (purgedPages.count > 0 || purgedClones.count > 0) {
+      console.warn(
+        `[cycle.purge] IRREVERSIBLE: hard-deleted ${purgedPages.count} page(s)` +
+        (purgedClones.count > 0 ? ` and ${purgedClones.count} orphan clone(s)` : '') +
+        ` (soft-deleted >${SOFT_DELETE_TTL_HOURS_FOR_PURGE}h ago).\n` +
+        `[cycle.purge] slugs: ${purgedPages.slugs.join(', ') || '(none recorded)'}`,
+      );
+    }
     // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
     // 7-day TTL is deliberately generous; any reasonable long-running op
     // finishes inside that window. Cheap (few KB per row).
