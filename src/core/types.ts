@@ -690,6 +690,17 @@ export interface SearchResult {
   score: number;
   stale: boolean;
   /**
+   * Page last-updated date as `YYYY-MM-DD`, stamped post-fusion by
+   * `stampPageDates`. Absent if the lookup failed — it is best-effort and
+   * must never break retrieval.
+   *
+   * Present so a reader can tell a settled decision from a rotted state
+   * claim. Without it, a months-old page and this morning's page render
+   * identically and the only way to catch a stale answer is to already know
+   * it is stale (S399).
+   */
+  updated_at?: string;
+  /**
    * v0.42 (issue #1699) content-quality gate agent-warning channel. Set
    * when the result's page carries a `frontmatter.content_flag` marker
    * (fuzzy markup-heavy or oversize). The page is still searchable — this

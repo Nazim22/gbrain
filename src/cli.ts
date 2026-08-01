@@ -963,7 +963,11 @@ export function formatResult(opName: string, result: unknown): string {
         return formatResultsExplain(results);
       }
       const body = results.map(r =>
-        `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
+        // S399: the date is NOT decoration. Without it a page from May and one
+        // from this morning render identically, so a rotted state-claim reads
+        // exactly like a settled decision. `(undated)` is shown rather than
+        // omitted — a missing date must look missing, not look current.
+        `[${r.score?.toFixed(4) || '?'}] (${r.updated_at ?? 'undated'}) ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
       // S395 — absence signal. When EVERY hit is weak_semantic, the brain has
       // no strong evidence for this query: no alias, no title match, no

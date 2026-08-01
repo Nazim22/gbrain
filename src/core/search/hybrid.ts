@@ -58,6 +58,70 @@ const pendingCacheWrites = new Set<Promise<unknown>>();
  * candidate pool. Fail-open: the warning is best-effort and never breaks search.
  * Mirrors the stampEvidence post-fusion precedent (T4).
  */
+/**
+ * Stamp each result with the page's last-updated date.
+ *
+ * Recall used to render `[0.6438] memory/…-s300 -- <snippet>` — a relevance
+ * score and nothing else. A page written in May and one written this morning
+ * arrived looking IDENTICAL, so a stale answer was indistinguishable from a
+ * current one by inspection.
+ *
+ * That is not theoretical. On 2026-08-01 the top hit for `synthesize_concepts`
+ * was an S300 page asserting the phase was "dead" — while that same phase was
+ * the day's live production bug. Nothing in the output said the page was
+ * months old. The failure was caught by probing the running system, which is
+ * to say: not caught by the brain at all.
+ *
+ * Age is the cheapest discriminator between "settled decision" (still true)
+ * and "state claim" (rots). One date per line converts an invisible trap into
+ * an obvious one. Best-effort — a date lookup must never break retrieval.
+ */
+export async function stampPageDates(engine: BrainEngine, results: SearchResult[]): Promise<void> {
+  if (results.length === 0) return;
+  try {
+    const ids = [...new Set(
+      results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)),
+    )];
+    if (ids.length === 0) return;
+    const rows = await engine.executeRaw<{
+      id: number; created_at: string | Date | null; updated_at: string | Date | null;
+    }>(
+      `SELECT id, created_at, updated_at FROM pages WHERE id = ANY($1::int[])`,
+      [ids],
+    );
+    const day = (v: string | Date | null): string | null => {
+      if (!v) return null;
+      const d = v instanceof Date ? v : new Date(v);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+    };
+    const byId = new Map<number, string>();
+    for (const row of rows ?? []) {
+      const created = day(row.created_at);
+      const updated = day(row.updated_at);
+      if (!created) { if (updated) byId.set(row.id, updated); continue; }
+      // `updated_at` ALONE is actively misleading: a vault re-sync touches it
+      // without changing a word, so months-old knowledge renders as fresh.
+      // Measured 2026-08-01: 2,644 of 15,811 pages (17%) carry that gap — and
+      // the S300 page that wrongly claimed `synthesize_concepts` was "dead"
+      // was written 06-20 but stamped 07-28. Showing only the touch date
+      // would have made the day's most misleading page look current.
+      //
+      // So: authored date first (how old is this CLAIM), arrow to the revision
+      // date only when they differ. `2026-06-20→07-28` reads as "written June,
+      // touched July" — enough to judge without a second lookup.
+      byId.set(row.id, updated && updated !== created
+        ? `${created}→${updated.slice(5)}`
+        : created);
+    }
+    for (const r of results) {
+      const d = byId.get(r.page_id);
+      if (d) r.updated_at = d;
+    }
+  } catch {
+    // best-effort: never break retrieval over a date.
+  }
+}
+
 export async function stampContentFlags(engine: BrainEngine, results: SearchResult[]): Promise<void> {
   if (results.length === 0) return;
   try {
@@ -1291,6 +1355,7 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
+    await stampPageDates(engine, noEmbedBudgeted);
     lastResultsCount = noEmbedBudgeted.length;
     lastRank1Score = noEmbedBudgeted[0] ? (noEmbedBudgeted[0].base_score ?? noEmbedBudgeted[0].score) : undefined;
     emitMeta({
@@ -1524,6 +1589,7 @@ export async function hybridSearch(
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
+    await stampPageDates(engine, kwBudgeted);
     lastResultsCount = kwBudgeted.length;
     lastRank1Score = kwBudgeted[0] ? (kwBudgeted[0].base_score ?? kwBudgeted[0].score) : undefined;
     emitMeta({
@@ -1778,6 +1844,7 @@ export async function hybridSearch(
   // the same budget behavior as the production query op.
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
   await stampContentFlags(engine, budgeted);
+  await stampPageDates(engine, budgeted);
   lastResultsCount = budgeted.length;
   lastRank1Score = budgeted[0] ? (budgeted[0].base_score ?? budgeted[0].score) : undefined;
   emitMeta({
