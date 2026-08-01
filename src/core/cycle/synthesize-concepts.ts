@@ -78,6 +78,18 @@ export function resolveSynthMaxOutputTokens(modelStr: string): number {
   return isThinkingModel(modelStr) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_SYNTH_MAX_OUTPUT_TOKENS;
 }
 
+// The dollar budget above is NOT a bound on a local model. `canonicalLookup`
+// returns null for llama-server/ollama tiers, so `estimatedSpendUsd` stays 0
+// and the cap never trips — once cognition moved 100% local this phase became
+// effectively unbounded and ran past the 600s minion job timeout. The worker
+// then force-evicts the job but CANNOT kill the handler, so it keeps running
+// orphaned (4h50m observed on 2026-07-31) while the cycle never records
+// completion and `doctor:cycle_freshness` goes stale.
+//
+// A wall-clock deadline is the bound that holds regardless of model pricing.
+// Default leaves headroom under the 600s job timeout for the other phases.
+const DEFAULT_PHASE_BUDGET_MS = Number(process.env.GBRAIN_CONCEPTS_PHASE_BUDGET_MS ?? 240_000);
+
 export interface SynthesizeConceptsOpts {
   brainDir?: string;
   /**
@@ -98,6 +110,14 @@ export interface SynthesizeConceptsOpts {
    * `heartbeat()`; cycle.ts owns start/finish.
    */
   progress?: ProgressReporter;
+  /**
+   * Wall-clock bound for the per-group synthesis loop. The dollar budget is
+   * not a bound on a locally-served model (no canonical price → spend stays
+   * 0), so this is what actually keeps the phase inside its job timeout.
+   */
+  phaseBudgetMs?: number;
+  /** Cooperative cancel. Checked per group so an aborted job can't orphan. */
+  signal?: AbortSignal;
   /** Test seam: alternative chat function. */
   _chat?: typeof gatewayChat;
   /** Test seam: skip DB query; cluster these atoms directly. */
@@ -275,7 +295,19 @@ export async function runPhaseSynthesizeConcepts(
     fallback: 'sonnet',
   });
   const synthMaxOutputTokens = resolveSynthMaxOutputTokens(synthModel);
+  const deadline = Date.now() + (opts.phaseBudgetMs ?? DEFAULT_PHASE_BUDGET_MS);
+  let groupsSkipped = 0;
+
+
   for (const group of atomGroups) {
+    // Stop cleanly BEFORE starting work we can't finish. Returning a partial
+    // result lets the job complete and the cycle record freshness; the next
+    // cycle re-derives groups from atoms and picks up the remainder (already
+    // written concepts upsert, so re-running a group is idempotent).
+    if (Date.now() >= deadline || opts.signal?.aborted) {
+      groupsSkipped = atomGroups.length - tierCounts.T1 - tierCounts.T2 - tierCounts.T3 - tierCounts.T4;
+      break;
+    }
     tierCounts[group.tier]++;
     let narrative: string;
     let synthesisMode: ConceptSynthesisMode;
@@ -464,6 +496,9 @@ export async function runPhaseSynthesizeConcepts(
     summary:
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
+      (groupsSkipped > 0
+        ? ` — PARTIAL: ${groupsSkipped} group(s) left for the next cycle (phase budget reached)`
+        : '') +
       (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
       (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : ''),
     details: {
@@ -471,6 +506,9 @@ export async function runPhaseSynthesizeConcepts(
       tier_counts: tierCounts,
       synthesis_mode_counts: synthesisModeCounts,
       groups_found: atomGroups.length,
+      groups_skipped: groupsSkipped,
+      partial: groupsSkipped > 0,
+      phase_budget_ms: opts.phaseBudgetMs ?? DEFAULT_PHASE_BUDGET_MS,
       atoms_seen: atoms.length,
       failures,
       link_warnings: linkWarnings,
