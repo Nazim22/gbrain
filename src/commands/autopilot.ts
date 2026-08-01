@@ -149,6 +149,41 @@ export function resolveGbrainCliPath(): string {
   );
 }
 
+/**
+ * Should this tick run a FULL cycle, or just targeted handlers?
+ *
+ * Extracted from the dispatch loop so the gate is testable — it was inline,
+ * and an inline boolean is where this bug hid.
+ *
+ * The 60-minute floor is deliberately NOT gated on an empty plan. It used to
+ * be (`score >= 95 && planLength === 0 && ...`), which created a stable trap:
+ * a healthy brain carrying a SMALL BUT PERSISTENT plan matched no branch —
+ * not `planLength === 0` (it was 2), not `> 3`, not `estTotal >= 300`, not
+ * `score < 70` — so this returned false on every tick, forever. Only targeted
+ * handlers ran, `lastFullCycleAt` never advanced, and `cycle_freshness` went
+ * stale while the score stayed too high to trip the hammer.
+ *
+ * Observed 2026-08-01: 4h+ and zero full cycles at score 98 / plan 2, with
+ * doctor reporting "last cycled 6h ago". A full cycle is the phase-coupling
+ * exercise; it has to happen on a clock, not only when there is nothing
+ * else to do.
+ */
+export function shouldRunFullCycle(opts: {
+  score: number;
+  planLength: number;
+  estTotalSeconds: number;
+  minutesSinceLastFull: number;
+  floorMin: number;
+}): boolean {
+  const { score, planLength, estTotalSeconds, minutesSinceLastFull, floorMin } = opts;
+  return (
+    (score >= 95 && minutesSinceLastFull >= floorMin) ||
+    planLength > 3 ||
+    estTotalSeconds >= 300 ||
+    score < 70
+  );
+}
+
 export function shouldSpawnAutopilotWorker(args: string[]): boolean {
   return !args.includes('--no-worker');
 }
@@ -477,7 +512,10 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     const autopilotMaxRssMb = resolveDefaultMaxRssMb();
     childSupervisor = new ChildWorkerSupervisor({
       cliPath,
-      args: ['jobs', 'work', '--max-rss', String(autopilotMaxRssMb)],
+      // The autopilot-cycle and global-maintenance jobs can occupy two slots.
+      // The cycle's patterns phase submits a subagent job and waits for it, so
+      // keep a third slot available without opening broad provider fan-out.
+      args: ['jobs', 'work', '--concurrency', '3', '--max-rss', String(autopilotMaxRssMb)],
       // process.env clone; autopilot doesn't gate shell jobs the way the
       // standalone supervisor does (autopilot is the operator-trust path).
       env: { ...process.env },
@@ -954,11 +992,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         const FULL_CYCLE_FLOOR_MIN = 60;
         const minutesSinceLastFull = (Date.now() - lastFullCycleAt) / 60000;
 
-        const shouldFullCycle =
-          (score >= 95 && plan.length === 0 && minutesSinceLastFull >= FULL_CYCLE_FLOOR_MIN) ||
-          plan.length > 3 ||
-          estTotal >= 300 ||
-          score < 70;
+        const shouldFullCycle = shouldRunFullCycle({
+          score,
+          planLength: plan.length,
+          estTotalSeconds: estTotal,
+          minutesSinceLastFull,
+          floorMin: FULL_CYCLE_FLOOR_MIN,
+        });
 
         const shouldSleep = score >= 95 && plan.length === 0 && minutesSinceLastFull < FULL_CYCLE_FLOOR_MIN;
 
