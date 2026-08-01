@@ -61,6 +61,21 @@ import { slugifySegment } from '../sync.ts';
 import { isFreeLocalModel } from '../model-pricing.ts';
 
 const DEFAULT_BUDGET_USD = 1000; // S298: raised from 0.3 (cloud-Haiku cost cap) — meaningless for FREE local qwen3; lets a run drain the whole backlog GPU-bound instead of capping at ~2-50 transcripts. Revert to 0.3 if ever switched back to a paid cloud chat model.
+
+/**
+ * Wall-clock bound for the extraction loop (S399).
+ *
+ * The dollar cap above is deliberately inert on a local model — correct for
+ * spend, but it left this loop with NO bound whatsoever. It ran until the work
+ * list emptied or the enclosing job timeout killed it mid-item, which is what
+ * kept `autopilot-cycle` dying at its 30-min ceiling (1823.4s, DEAD) even after
+ * the sibling phase `synthesize_concepts` was bounded.
+ *
+ * 15 min = half the 30-min job budget, leaving room for the cycle's other
+ * phases. Extraction is resumable (already-extracted items skip on content
+ * hash), so stopping early costs a delay, never work.
+ */
+const DEFAULT_EXTRACT_PHASE_BUDGET_MS = Number(process.env.GBRAIN_EXTRACT_PHASE_BUDGET_MS ?? 900_000);
 const DEFAULT_EXTRACT_ATOMS_MODEL = 'anthropic:claude-haiku-4-5';
 
 // v0.42+ TODO: read atom_type enum from active pack manifest at runtime.
@@ -157,6 +172,14 @@ export interface ExtractAtomsOpts {
    * after the v0.41.19.0 TTL drop 30→5min.
    */
   yieldDuringPhase?: () => Promise<void>;
+  /**
+   * Wall-clock bound for the extraction loop. The dollar cap is inert on a
+   * free local model, so this is what actually keeps the phase inside the
+   * enclosing job timeout (S399).
+   */
+  phaseBudgetMs?: number;
+  /** Cooperative cancel, checked per item so an aborted job can't orphan. */
+  signal?: AbortSignal;
   /**
    * v0.41.19.0 (T4): progress reporter for in-phase ticks. Cycle.ts
    * passes the SAME reporter (not a child — codex caught the path-
@@ -620,9 +643,29 @@ export async function runPhaseExtractAtoms(
     }
   }
 
+  // Wall-clock bound. The cost cap above is REMOVED entirely for a free local
+  // model (`isFreeLocalModel ? {}`), which is correct for spend and leaves the
+  // loop with NO bound at all: it runs until the work list is exhausted or the
+  // job timeout kills it mid-flight. That is what still killed `autopilot-cycle`
+  // at its 30-min timeout (obs. 2026-08-01: 1823.4s, DEAD) after the sibling
+  // phase was fixed — same bug, one file over.
+  //
+  // Bound by time, the one thing that is scarce regardless of pricing. Checked
+  // BEFORE starting an item so we never begin work we can't finish; the
+  // remainder is picked up next cycle (extraction is resumable — already-
+  // extracted items are skipped by content hash).
+  const phaseDeadline = Date.now() + (opts.phaseBudgetMs ?? DEFAULT_EXTRACT_PHASE_BUDGET_MS);
+  let deadlineHit = false;
+
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
     await maybeYield();
+    if (Date.now() >= phaseDeadline || opts.signal?.aborted) {
+      deadlineHit = true;
+      if (item.kind === 'transcript') transcriptsSkipped++;
+      else pagesSkipped++;
+      continue;
+    }
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
       if (item.kind === 'transcript') transcriptsSkipped++;
       else pagesSkipped++;
@@ -830,9 +873,16 @@ export async function runPhaseExtractAtoms(
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (fallbackRecoveries > 0 ? ` (${fallbackRecoveries} recovered on retry)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
-        ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
+        // "budget-skipped" was the only wording, which mis-reported a
+        // time-bounded run as a spend decision — the exact confusion that hid
+        // this bug (S399).
+        ? deadlineHit
+          ? ` — PARTIAL: ${transcriptsSkipped + pagesSkipped} item(s) left for the next cycle (phase budget reached)`
+          : ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : ''),
     details: {
+      partial: deadlineHit,
+      phase_budget_ms: opts.phaseBudgetMs ?? DEFAULT_EXTRACT_PHASE_BUDGET_MS,
       atoms_extracted: totalAtomsExtracted,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
