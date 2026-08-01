@@ -1367,8 +1367,25 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     }
     const { purgeExpiredSources } = await import('./destructive-guard.ts');
     const purgedSources = await purgeExpiredSources(engine);
-    const purgedPages = await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
-    const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+
+    // Hard-deleting pages is IRREVERSIBLE and, until now, happened as an
+    // unattended side effect of any full cycle. That was survivable while
+    // full cycles were rare; it is not once they run on an hourly floor.
+    // On 2026-08-01 a keeper-triggered remediation cycle hard-deleted 59
+    // pages this way — nobody asked for a purge, it was a side effect of
+    // fixing cycle_freshness.
+    //
+    // Automatic cycles now SKIP the destructive sweep by default. The
+    // non-destructive GC below (checkpoints, brainstorm temp files) still
+    // runs. Opt in with GBRAIN_CYCLE_ALLOW_PURGE=1, or purge deliberately
+    // and visibly with `gbrain purge-deleted --older-than-hours 72`.
+    const allowPurge = process.env.GBRAIN_CYCLE_ALLOW_PURGE === '1';
+    const purgedPages = allowPurge
+      ? await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE)
+      : { slugs: [] as string[], count: 0 };
+    const purgedClones = allowPurge
+      ? await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE)
+      : { count: 0, bytes: 0, names: [] as string[] };
     // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
     // 7-day TTL is deliberately generous; any reasonable long-running op
     // finishes inside that window. Cheap (few KB per row).
