@@ -58,6 +58,7 @@ import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { createHash } from 'crypto';
 import { statSync } from 'node:fs';
 import { slugifySegment } from '../sync.ts';
+import { isFreeLocalModel } from '../model-pricing.ts';
 
 const DEFAULT_BUDGET_USD = 1000; // S298: raised from 0.3 (cloud-Haiku cost cap) — meaningless for FREE local qwen3; lets a run drain the whole backlog GPU-bound instead of capping at ~2-50 transcripts. Revert to 0.3 if ever switched back to a paid cloud chat model.
 const DEFAULT_EXTRACT_ATOMS_MODEL = 'anthropic:claude-haiku-4-5';
@@ -588,9 +589,11 @@ export async function runPhaseExtractAtoms(
   // Electricity is not billable, so there is no cap to enforce — omit it.
   // Companion to the DEFAULT_BUDGET_USD=1000 patch above; drop both if we ever
   // point extract_atoms back at a paid cloud model.
-  const isFreeLocalModel = /^(ollama|llama-server|lmstudio|local):/i.test(extractModel);
+  // The regex used to live here privately. It now has ONE home in
+  // model-pricing.ts next to canonicalLookup — a second copy is exactly how
+  // the sibling phase (synthesize_concepts) drifted and ran unbounded.
   const budgetTracker = new BudgetTracker({
-    ...(isFreeLocalModel ? {} : { maxCostUsd: budgetCap }),
+    ...(isFreeLocalModel(extractModel) ? {} : { maxCostUsd: budgetCap }),
     label: 'cycle.extract_atoms',
   });
 

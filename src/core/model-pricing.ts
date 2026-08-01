@@ -44,6 +44,26 @@ export interface ModelPricing {
 }
 
 /**
+ * Providers whose inference is free at point of use (self-hosted / local).
+ *
+ * The scope note above says free/local models are "intentionally absent —
+ * callers treat those as zero-cost elsewhere". That assumption is load-bearing
+ * and, until this helper existed, unenforced: exactly one caller implemented it
+ * (extract-atoms, S298) with a private regex. Its sibling phase did not, so when
+ * cognition moved 100% local its dollar cap became decorative and the phase ran
+ * unbounded past the job timeout (2026-08-01).
+ *
+ * A cost cap is only a bound when calls actually cost something. Any caller
+ * gating WORK on spend must ask this first — see `test/model-pricing-free-local.test.ts`,
+ * which fails if a new budget-gated caller forgets.
+ */
+const FREE_LOCAL_PROVIDERS = /^(ollama|llama-server|llama-server-reranker|lmstudio|local|vllm):/i;
+
+export function isFreeLocalModel(modelId: string | null | undefined): boolean {
+  return !!modelId && FREE_LOCAL_PROVIDERS.test(modelId);
+}
+
+/**
  * Canonical price table. Keys are provider-prefixed (`provider:model`),
  * matching the exact id strings consumers pass. One physical model may carry
  * more than one key when a provider ships multiple id spellings (e.g.

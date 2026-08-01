@@ -46,7 +46,7 @@ import {
   type JudgeConfig,
   type ChatFn,
 } from './judges.ts';
-import { canonicalLookup } from '../model-pricing.ts';
+import { canonicalLookup, isFreeLocalModel } from '../model-pricing.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 
 // ---------------------------------------------------------------------------
@@ -71,6 +71,20 @@ import {
 import { resolveOwnerHolder } from '../owner-holder.ts';
 
 export { BudgetExhausted };
+
+/**
+ * Price a model for budgeting. Three cases, and conflating them is a bug:
+ *   - free/local  → genuinely $0. The bare `?? {input:3,output:15}` fallback
+ *     charged these at Sonnet rates, so a locally-served run accrued invented
+ *     spend against a real cap and the mid-run guard aborted work that cost
+ *     nothing — failing quiet, as a shortfall that reports success.
+ *   - known paid  → the canonical rate.
+ *   - unknown paid → conservative Sonnet-ish guess, so the guard still bounds.
+ */
+function priceForBudget(model: string): { input: number; output: number } {
+  if (isFreeLocalModel(model)) return { input: 0, output: 0 };
+  return canonicalLookup(model) ?? { input: 3, output: 15 };
+}
 
 // ---------------------------------------------------------------------------
 // Profile (BrainstormProfile is the brainstorm vs LSD config object)
@@ -266,7 +280,7 @@ export function estimateCost(profile: BrainstormProfile, model: string): number 
   const judgeIn = ideas * 350;
   const judgeOut = ideas * 200;
 
-  const pricing = canonicalLookup(model) ?? { input: 3, output: 15 };
+  const pricing = priceForBudget(model);
   const inCost = ((inTokens + judgeIn) / 1_000_000) * pricing.input;
   const outCost = ((outTokens + judgeOut) / 1_000_000) * pricing.output;
   return inCost + outCost;
@@ -795,7 +809,7 @@ async function _runBrainstormInner(
       crossModel = result.model;
       // Mid-run cost guard: if running spend already exceeds the projected
       // ceiling or the strict-budget multiplier, abort the remaining crosses.
-      const runningPricing = canonicalLookup(result.model) ?? { input: 3, output: 15 };
+      const runningPricing = priceForBudget(result.model);
       const runningUsd =
         (totalUsage.input_tokens / 1_000_000) * runningPricing.input +
         (totalUsage.output_tokens / 1_000_000) * runningPricing.output;
@@ -921,7 +935,7 @@ async function _runBrainstormInner(
   // Cost actuals (codex r2 #10).
   const totalIn = totalUsage.input_tokens + judgeUsage.input_tokens;
   const totalOut = totalUsage.output_tokens + judgeUsage.output_tokens;
-  const pricing = canonicalLookup(crossModel) ?? { input: 3, output: 15 };
+  const pricing = priceForBudget(crossModel);
   const actual = (totalIn / 1_000_000) * pricing.input + (totalOut / 1_000_000) * pricing.output;
   stderr(`[${profile.label}] actual cost: ${fmtUsd(actual)} (estimated ${fmtUsd(estimate)}) — in=${totalIn} out=${totalOut} tokens\n`);
 
