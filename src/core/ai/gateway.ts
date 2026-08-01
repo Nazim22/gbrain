@@ -2631,6 +2631,30 @@ function defaultMaxOutputTokens(modelStr: string | undefined): number {
 }
 
 /**
+ * Locally-served reasoning models emit `reasoning_content` BEFORE any `content`.
+ * Gemma 4 QAT spends ~60-90 tokens thinking even on a one-word classification.
+ *
+ * That breaks callers who budgeted for a NON-reasoning model. The search intent
+ * classifier asks for one word in `maxTokens: 16` — against Gemma it returns
+ * `content: ''` with `finish_reason: 'length'`, every single time, and
+ * `parseModality('')` fails open to the fallback. So `intentWeighting` (on in
+ * ALL three search modes) has been silently inert since cognition moved local:
+ * not erroring, not logging, just never actually classifying. Verified live
+ * 2026-08-01 by replaying the exact call against the running server.
+ *
+ * A floor is the fix that holds for every caller at once. Raising the ceiling
+ * cannot change a correct answer — it only stops the budget being consumed
+ * before the answer starts.
+ */
+const REASONING_PROVIDER_RE = /^(llama-server|ollama|lmstudio|local|vllm)[:/]/i;
+const REASONING_MIN_OUTPUT_TOKENS = 512;
+
+export function flooredMaxOutputTokens(modelStr: string | undefined, requested: number): number {
+  if (!modelStr || !REASONING_PROVIDER_RE.test(modelStr)) return requested;
+  return Math.max(requested, REASONING_MIN_OUTPUT_TOKENS);
+}
+
+/**
  * Deep-serialize a tool output into a plain JSON value for the AI SDK v6
  * ModelMessage schema. node-postgres returns `timestamptz` columns as JS
  * `Date` instances, and AI SDK v6's `JSONValue` schema rejects a raw Date,
@@ -3141,7 +3165,10 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     }
   }
   const estimatedInputTokens = estimateChatInputTokens(opts);
-  const maxOutputTokens = opts.maxTokens ?? defaultMaxOutputTokens(modelStrEarly);
+  const maxOutputTokens = flooredMaxOutputTokens(
+    modelStrEarly,
+    opts.maxTokens ?? defaultMaxOutputTokens(modelStrEarly),
+  );
 
   // Context preflight. ProviderCapabilities.maxContext has always been
   // documented as "drives the gateway's pre-flight context check; the loop
