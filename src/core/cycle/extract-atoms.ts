@@ -245,7 +245,7 @@ REJECT (produce NO atom rather than a weak one):
 
 Fewer, sharper atoms beat more atoms. Zero is a valid, correct answer.
 
-Output a JSON array of atoms (0-3 per transcript, never more than 3).
+Output a JSON array of atoms (0-8 per transcript, never more than 8).
 Each atom: {title (≤80 chars), atom_type, body (2-4 sentences),
 source_quote (verbatim ≤200 chars), lesson (one sentence), concepts
 (1-3 topic labels), virality_score (0-100), emotional_register (one of:
@@ -684,7 +684,12 @@ export async function runPhaseExtractAtoms(
               content: `Source: ${originLabel}\n\n---\n\n${item.content.slice(0, 50_000)}`,
             },
           ],
-          maxTokens: 4096,
+          // S400: 4096 was a SECOND cap behind the 0-3 prompt cap. Measured on a
+          // real staged transcript part: identical input yields 6 atoms at 4096
+          // and 8 at 8192 (4025 completion tokens) — the model silently shrinks
+          // its output to fit rather than truncating, so this never showed up as
+          // a parse error. Raising the prompt cap alone would have half-landed.
+          maxTokens: 8192,
         });
         // Post-await yield: closes the "long LLM call past TTL" hazard
         // codex flagged. The 30s throttle inside maybeYield bounds the
