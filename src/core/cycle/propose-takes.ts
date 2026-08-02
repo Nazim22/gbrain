@@ -422,7 +422,14 @@ class ProposeTakesPhase extends BaseCyclePhase {
    * `deadline_hit: true` instead of being killed mid-write by an outer
    * `timeout` wrapper (the recurring SIGTERM in nightly dream runs).
    */
-  private static readonly PHASE_DEADLINE_MS = 30 * 60 * 1000;
+  // S400: raised 30→45 min after the autopilot dispatch floor went to 60 min
+  // (96fb9226). 30 min clipped real backlogs (#5961: page 47/100 at 1,827s)
+  // while the job finished at ~1,960s — the phase cap, not the job cap, was
+  // binding. 45 min keeps ~15 min of tail-phase headroom inside the 60-min
+  // job; do NOT raise further or the outer force-evict (the mid-write killer
+  // this deadline exists to prevent) comes back. Partial receipts on deep
+  // backlogs remain by design — the backlog drains across cycles.
+  private static readonly PHASE_DEADLINE_MS = 45 * 60 * 1000;
 
   protected override mapErrorCode(err: unknown): string {
     if (err instanceof GBrainError) return err.problem;

@@ -351,11 +351,29 @@ async function gatherReflections(
 
 // ── Prompt ────────────────────────────────────────────────────────────
 
+/**
+ * S400: hard char budget for the assembled reflections corpus. #5962 died at
+ * 37,293 tokens against the local model's 32,768 window: 100 × 600-char
+ * excerpts ≈ 17k tokens of corpus on top of ~20k tokens of subagent
+ * system/skill/tool overhead. 32,000 chars ≈ 9k tokens keeps the total near
+ * 29k with margin. Newest reflections win; the drop is REPORTED in the prompt
+ * (no silent caps) and older reflections get their turn in later cycles.
+ */
+const PATTERNS_CORPUS_CHAR_BUDGET = 32_000;
+
 function buildPatternsPrompt(reflections: ReflectionRef[], minEvidence: number, outputRoot = 'wiki'): string {
   const today = new Date().toISOString().slice(0, 10);
-  const corpus = reflections
-    .map((r, i) => `### ${i + 1}. [[${r.slug}]] — ${r.title}\n${r.excerpt}`)
-    .join('\n\n---\n\n');
+  const kept: string[] = [];
+  let used = 0;
+  let dropped = 0;
+  for (const [i, r] of reflections.entries()) {
+    const block = `### ${i + 1}. [[${r.slug}]] — ${r.title}\n${r.excerpt}`;
+    if (used + block.length > PATTERNS_CORPUS_CHAR_BUDGET) { dropped = reflections.length - i; break; }
+    kept.push(block);
+    used += block.length + 7; // separator
+  }
+  const corpus = kept.join('\n\n---\n\n')
+    + (dropped > 0 ? `\n\n---\n\n(+${dropped} older reflection(s) omitted for context budget; they surface in later cycles)` : '');
 
   return `You are surfacing recurring themes across the user's recent reflections.
 
