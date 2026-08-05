@@ -1654,6 +1654,13 @@ export interface HybridSearchMeta {
    */
   autocut?: import('./search/autocut.ts').AutocutDecision;
   /**
+   * S409 — reranker call outcome (applied / failed+reason / doc counts).
+   * Omitted when the reranker was disabled for this call. A 'failed'
+   * status means the results are RRF order, NOT cross-encoder order —
+   * silent fallback was the audit's defect class.
+   */
+  reranker?: import('./search/rerank.ts').RerankCallStatus;
+  /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite
    * consumers).

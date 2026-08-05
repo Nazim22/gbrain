@@ -33,11 +33,42 @@ export interface RerankerOpts {
   /** Per-call timeout in ms (default 5000 — propagates to gateway.rerank). */
   timeoutMs?: number;
   /**
+   * S409 — per-query status sink. "Process is up" is not "reranking works":
+   * the live box logged 426 capacity failures in 7 days while the endpoint
+   * reported healthy, and every one silently fell back to RRF order. The
+   * caller threads this into search meta so a degraded reranker is visible
+   * per query, not only in the failure-audit JSONL.
+   */
+  onStatus?: (status: RerankCallStatus) => void;
+  /**
    * Test seam — when set, applyReranker calls this instead of gateway.rerank.
    * Production must NEVER set this.
    */
   rerankerFn?: (input: RerankInput) => Promise<RerankResult[]>;
 }
+
+/** S409 — outcome of one reranker dispatch (see RerankerOpts.onStatus). */
+export interface RerankCallStatus {
+  status: 'applied' | 'failed' | 'bypassed';
+  /** Failure classification when status === 'failed'. */
+  reason?: RerankFailureReason;
+  /** Documents dispatched. */
+  docs: number;
+  /** Documents whose text was truncated to MAX_RERANK_DOC_CHARS. */
+  truncated_docs: number;
+}
+
+/**
+ * S409 — hard per-document input bound. Oversized single chunks are a
+ * capacity-failure class of their own: one giant document can blow the
+ * reranker's batch token budget and fail the WHOLE call, silently
+ * degrading every result to RRF order. ~2000 chars ≈ 500 BGE tokens,
+ * comfortably inside the reranker's per-pair window while keeping enough
+ * span for relevance judgment.
+ */
+// ponytail: fixed char cap, not a tokenizer — swap for real token counting
+// if truncation shows up in relevance evals.
+export const MAX_RERANK_DOC_CHARS = 2000;
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
 function hashQuery(query: string): string {
@@ -71,7 +102,17 @@ export async function applyReranker(
   // Document text — chunk_text is the matched span. Fall back to title if
   // empty (shouldn't happen in practice; defensive). Empty docs would
   // confuse the reranker, but we still send them — the upstream model decides.
-  const documents = head.map(r => r.chunk_text || r.title || '');
+  // S409: bound each document (see MAX_RERANK_DOC_CHARS) so one oversized
+  // chunk cannot capacity-fail the whole batch.
+  let truncatedDocs = 0;
+  const documents = head.map(r => {
+    const text = r.chunk_text || r.title || '';
+    if (text.length > MAX_RERANK_DOC_CHARS) {
+      truncatedDocs += 1;
+      return text.slice(0, MAX_RERANK_DOC_CHARS);
+    }
+    return text;
+  });
 
   let reranked: RerankResult[];
   try {
@@ -97,11 +138,23 @@ export async function applyReranker(
     } catch {
       // Audit logging must never break search.
     }
+    try {
+      opts.onStatus?.({ status: 'failed', reason, docs: documents.length, truncated_docs: truncatedDocs });
+    } catch { /* status sink must never break search */ }
     return results;
   }
-
-  // Defensive: if the reranker returned a malformed shape, pass through.
-  if (!Array.isArray(reranked) || reranked.length === 0) return results;
+  // Defensive: if the reranker returned a malformed shape, pass through —
+  // and report it as a failure, not silently (S409: silent fallback is the
+  // defect class).
+  if (!Array.isArray(reranked) || reranked.length === 0) {
+    try {
+      opts.onStatus?.({ status: 'failed', reason: 'unknown', docs: documents.length, truncated_docs: truncatedDocs });
+    } catch { /* status sink must never break search */ }
+    return results;
+  }
+  try {
+    opts.onStatus?.({ status: 'applied', docs: documents.length, truncated_docs: truncatedDocs });
+  } catch { /* status sink must never break search */ }
 
   // Build the reordered head. We keep ONLY indices the reranker returned
   // (so a top_n response with fewer items than head.length naturally

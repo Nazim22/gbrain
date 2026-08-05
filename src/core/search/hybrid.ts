@@ -1855,8 +1855,17 @@ export async function hybridSearch(
     model: resolvedMode.reranker_model,
     timeoutMs: resolvedMode.reranker_timeout_ms,
   };
+  // S409 — capture the reranker call outcome for the meta envelope: a
+  // capacity-failed call silently degrades to RRF order, and per-query
+  // visibility is the containment for "426 failures behind a healthy
+  // endpoint".
+  let rerankStatus: import('./rerank.ts').RerankCallStatus | undefined;
+  const rerankerOptsWithStatus = {
+    ...(rerankerOpts as Record<string, unknown>),
+    onStatus: (s: import('./rerank.ts').RerankCallStatus) => { rerankStatus = s; },
+  };
   const reranked = rerankerOpts.enabled
-    ? await applyReranker(query, deduped, rerankerOpts as any)
+    ? await applyReranker(query, deduped, rerankerOptsWithStatus as any)
     : deduped;
 
   // S395 — re-apply the supersede demote to the reranker's own ordering
@@ -1958,6 +1967,7 @@ export async function hybridSearch(
       : {}),
     ...(adaptiveDecision ? { adaptive_return: adaptiveDecision } : {}),
     ...(autocutDecision ? { autocut: autocutDecision } : {}),
+    ...(rerankStatus ? { reranker: rerankStatus } : {}),
   });
   return budgeted;
 }
