@@ -147,9 +147,22 @@ describe('resolveModel — 6-tier precedence', () => {
 });
 
 describe('resolveModel — v0.31.12 tier system', () => {
-  test('models.default beats tier override', async () => {
+  // S409: precedence INVERTED from the original v0.31.12 order. With
+  // models.default checked first, every tier resolved to the same model and
+  // models.tier.* was dead config (live-proven: all four tiers → the global
+  // chat model). A tier key is strictly more specific, so it wins.
+  test('models.tier.<tier> beats models.default (S409)', async () => {
     stub.set('models.default', 'opus');
     stub.set('models.tier.reasoning', 'haiku');
+    const m = await resolveModel(stub as never, {
+      tier: 'reasoning',
+      fallback: 'sonnet',
+    });
+    expect(m).toBe(DEFAULT_ALIASES.haiku);
+  });
+
+  test('models.default still applies when the tier has no override (S409)', async () => {
+    stub.set('models.default', 'opus');
     const m = await resolveModel(stub as never, {
       tier: 'reasoning',
       fallback: 'sonnet',

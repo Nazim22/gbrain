@@ -166,20 +166,24 @@ export async function resolveModel(
       }
     }
 
-    // 4. Global default
-    const def = await engine.getConfig('models.default');
-    if (def && def.trim()) {
-      const resolved = await resolveAlias(engine, def.trim());
-      return enforceSubagentCapable(resolved, opts.tier, 'models.default');
-    }
-
-    // 5. Tier override (v0.31.12)
+    // 4. Tier override — MUST beat the global default (S409 audit: with
+    // models.default set, every tier resolved to the same model and
+    // models.tier.* was dead config; live probe showed utility/reasoning/
+    // deep/subagent all routing to the global chat model). A tier key is
+    // strictly more specific than the global default, so it wins.
     if (opts.tier) {
       const tierVal = await engine.getConfig(`models.tier.${opts.tier}`);
       if (tierVal && tierVal.trim()) {
         const resolved = await resolveAlias(engine, tierVal.trim());
         return enforceSubagentCapable(resolved, opts.tier, `models.tier.${opts.tier}`);
       }
+    }
+
+    // 5. Global default
+    const def = await engine.getConfig('models.default');
+    if (def && def.trim()) {
+      const resolved = await resolveAlias(engine, def.trim());
+      return enforceSubagentCapable(resolved, opts.tier, 'models.default');
     }
   }
 
