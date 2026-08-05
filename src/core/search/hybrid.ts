@@ -155,7 +155,14 @@ export async function stampPageDates(engine: BrainEngine, results: SearchResult[
       if (m.lifecycle_status !== 'current') r.stale = true;
     }
   } catch {
-    // best-effort: never break retrieval over a date.
+    // Best-effort for retrieval availability — but never SILENT (S409 Dae
+    // review P0): a failed metadata query used to leave the SQL-hardcoded
+    // stale:false standing, indistinguishable from a verified-current page.
+    // 'unknown' tells callers the lifecycle (and therefore `stale`) is
+    // UNVERIFIED for this result.
+    for (const r of results) {
+      if (r.lifecycle_status === undefined) r.lifecycle_status = 'unknown';
+    }
   }
 }
 
@@ -2140,7 +2147,31 @@ export async function hybridSearchCached(
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
     const hit = await cache.lookup(queryEmbedding, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash });
+    // S409 (Dae review P0) — lifecycle revalidation at cache-READ time. A
+    // cache row written while a page was current kept serving it as current
+    // rank-1 (stale:false) after the page was superseded, until TTL expiry —
+    // bypassing the whole Slice A containment. Policy: if ANY cached hit
+    // page is lifecycle-demoted NOW, or the check itself fails, the row is
+    // NOT served (fail-closed for current truth) and the lookup falls
+    // through to a fresh search, whose ranking applies the demotes and
+    // whose writeback re-caches a clean row. Clean rows get their
+    // date/lifecycle stamps refreshed so cached metadata can't rot either.
+    let cacheRowServable = false;
     if (hit.hit && hit.results) {
+      try {
+        const cachedIds = [...new Set(hit.results
+          .map((r) => r.page_id)
+          .filter((n): n is number => typeof n === 'number' && Number.isFinite(n)))];
+        const demotedNow = await engine.getSupersededPageIds(cachedIds);
+        if (demotedNow.size === 0) {
+          await stampPageDates(engine, hit.results);
+          cacheRowServable = true;
+        }
+      } catch {
+        cacheRowServable = false; // unverified lifecycle: never serve as current
+      }
+    }
+    if (hit.hit && hit.results && cacheRowServable) {
       cacheStatus = 'hit';
       cacheSimilarity = hit.similarity;
       cacheAge = hit.ageSeconds;
@@ -2182,6 +2213,10 @@ export async function hybridSearchCached(
         ...(opts?.tokenBudget && opts.tokenBudget > 0
           ? { token_budget: hit.meta?.token_budget ?? budgetMeta }
           : {}),
+        // S409 (Dae review P1): explicit cache-hit semantics — no reranker
+        // ran on this call; 'bypassed' says so instead of omitting the field
+        // and letting callers assume a fresh rerank.
+        reranker: { status: 'bypassed', docs: 0, truncated_docs: 0 },
       };
       try {
         opts?.onMeta?.(cachedMeta);
@@ -2248,6 +2283,10 @@ export async function hybridSearchCached(
     ...(innerMeta?.embedding_column ? { embedding_column: innerMeta.embedding_column } : {}),
     ...(innerMeta?.adaptive_return ? { adaptive_return: innerMeta.adaptive_return } : {}),
     ...(innerMeta?.autocut ? { autocut: innerMeta.autocut } : {}),
+    // S409 (Dae review P1): the manual rebuild was dropping the reranker
+    // status — production callers through this wrapper never saw Slice E's
+    // per-query visibility (the same drop class as adaptive_return pre-fix).
+    ...(innerMeta?.reranker ? { reranker: innerMeta.reranker } : {}),
     // Per-call budget: prefer the INNER meta's budget record. The inner
     // hybridSearch already enforced the same resolved budget (per-call wins
     // in resolveSearchMode), so the re-application above sees an

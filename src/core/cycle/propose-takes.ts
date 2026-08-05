@@ -236,11 +236,20 @@ async function listCandidatePages(
          AND tp.prompt_version = ${pvParam}
          AND tp.proposed_at >= pages.updated_at
     )`);
+  // S409 review fix (Dae P1): ledger suppression applies ONLY while the page
+  // is unchanged since the last attempt (last_attempt_at >= updated_at). A
+  // blanket dead_letter exclusion ran BEFORE the loop could compare content
+  // hashes, so an edited page could never revive its dead-lettered ledger.
+  // An edit bumps updated_at → the row re-enters the bounded scan → the
+  // upsert's content-hash comparison resets or continues the ledger
+  // correctly. (A touch-only edit costs one extra extractor attempt; the
+  // same-content ledger then re-suppresses.)
   where.push(`NOT EXISTS (
       SELECT 1 FROM take_proposal_attempts a
        WHERE a.source_id = pages.source_id
          AND a.page_slug = pages.slug
          AND a.prompt_version = ${pvParam}
+         AND a.last_attempt_at >= pages.updated_at
          AND (a.dead_letter OR a.next_retry_at > now())
     )`);
   params.push(limit);
@@ -485,7 +494,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
   protected async process(
     engine: BrainEngine,
     scope: ScopedReadOpts,
-    ctx: OperationContext,
+    _ctx: OperationContext,
     opts: ProposeTakesOpts,
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
     const extractor = opts.extractor ?? defaultExtractor;
@@ -496,29 +505,32 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const phaseStartMs = Date.now();
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
-    // S409 (audit + the S405 verified diagnosis): this phase was the lone
-    // cycle phase with NO config route — `opts.model` existed but was only
-    // ever populated by tests, so a proposed `cycle.propose_takes.model`
-    // setting was accepted as config and silently unconsumed. Primary key is
-    // `models.dream.propose_takes` (matches the models.dream.* convention;
-    // cycle.<phase>.* is budget config). The legacy key is honored with a
-    // deprecation warning. With neither set this is byte-identical to the
-    // old behavior (global chat model) — routing to a JSON-reliable model is
-    // the operator's next move, not this code's.
-    const cfg = ctx.config as unknown as Record<string, unknown>;
-    const cfgRoute = typeof cfg?.['models.dream.propose_takes'] === 'string'
-      ? (cfg['models.dream.propose_takes'] as string)
-      : undefined;
-    const legacyRoute = typeof cfg?.['cycle.propose_takes.model'] === 'string'
-      ? (cfg['cycle.propose_takes.model'] as string)
-      : undefined;
-    if (!cfgRoute && legacyRoute) {
-      console.error(
-        `[propose_takes] DEPRECATED: cycle.propose_takes.model is honored this release but ` +
-          `will be removed — use models.dream.propose_takes instead.`,
-      );
-    }
-    const modelId = opts.model ?? cfgRoute ?? legacyRoute ?? getChatModel();
+    // S409 (audit + the S405 verified diagnosis; route corrected per Dae
+    // review P1): this phase was the lone cycle phase with NO config route —
+    // `opts.model` was only ever populated by tests, so a proposed model key
+    // was accepted as config and silently unconsumed. Resolution goes
+    // through the unified resolveModel chain like every sibling phase
+    // (patterns/synthesize/drift/auto-think) — NOT a ctx.config flat read:
+    // `models.*` DB-plane keys are deliberately not merged into runtime
+    // config, so a flat read only ever worked in tests that injected the
+    // key. resolveModel also gives alias resolution, tier precedence, and
+    // the deprecation warning for the legacy key. With nothing configured
+    // the reasoning tier falls through to the global chat model —
+    // byte-identical to the old behavior; pointing this route at a
+    // JSON-reliable model is the operator's next move, not this code's.
+    // Deliberate divergence from the review's literal `tier: 'reasoning'`
+    // suggestion: resolveModel step 7 makes TIER_DEFAULTS beat the caller
+    // fallback, so passing the tier would route an UNCONFIGURED brain to
+    // the Anthropic tier default — which probeChatModel then skips on a
+    // keyless install, silently disabling the whole phase. Chain here:
+    // configKey → deprecated key → models.default → env → the operator's
+    // global chat model (pre-S409 behavior when nothing is set).
+    const { resolveModel } = await import('../model-config.ts');
+    const modelId = opts.model ?? await resolveModel(engine, {
+      configKey: 'models.dream.propose_takes',
+      deprecatedConfigKey: 'cycle.propose_takes.model',
+      fallback: getChatModel(),
+    });
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /

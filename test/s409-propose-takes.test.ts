@@ -125,6 +125,36 @@ describe('S409.2 retry ledger', () => {
     expect(Number(after[0]!.n)).toBe(0);
   });
 
+  test('a content change REVIVES a dead-lettered page (Dae review P1)', async () => {
+    await seedPages(1, 'wiki/revivable');
+    for (let i = 0; i < 8; i++) {
+      await runPhaseProposeTakes(context(), { extractor: failing, pageLimit: 10 });
+      await engine.executeRaw(
+        `UPDATE take_proposal_attempts SET next_retry_at = now() - interval '1 minute'`,
+      );
+    }
+    const dead = await engine.executeRaw<{ dead_letter: boolean }>(
+      `SELECT dead_letter FROM take_proposal_attempts`,
+    );
+    expect(dead[0]!.dead_letter).toBe(true);
+
+    // Edit the page: new content, bumped updated_at. Pre-fix the blanket
+    // dead_letter SQL exclusion ran before any hash comparison, so the
+    // ledger-reset-on-content-change path could never execute.
+    await engine.executeRaw(
+      `UPDATE pages SET compiled_truth = 'Completely rewritten claim after the edit.',
+              updated_at = now()
+        WHERE slug LIKE 'wiki/revivable/%'`,
+    );
+
+    const r = await runPhaseProposeTakes(context(), { extractor: oneClaim, pageLimit: 10 });
+    expect((r.details as Record<string, unknown>).proposals_inserted).toBe(1);
+    const after = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM take_proposal_attempts`,
+    );
+    expect(Number(after[0]!.n)).toBe(0); // success cleared the ledger
+  });
+
   test('repeated same-content failures dead-letter at 8 attempts', async () => {
     await seedPages(1, 'wiki/poison');
     for (let i = 0; i < 8; i++) {
@@ -146,32 +176,40 @@ describe('S409.2 retry ledger', () => {
 });
 
 describe('S409.3 model route', () => {
-  test('models.dream.propose_takes reaches the extractor as modelHint', async () => {
+  // PRODUCTION-SHAPED (Dae review P1): the route lives in DB-plane config,
+  // which is deliberately NOT merged into ctx.config — a ctx-injected key
+  // only ever worked in tests. These set the key the way an operator does
+  // (engine config) and run the phase with an EMPTY ctx.config.
+  test('models.dream.propose_takes set in ENGINE config reaches the extractor', async () => {
     await seedPages(1, 'wiki/routed');
-    let seenHint: string | undefined;
-    const capture: ProposeTakesExtractor = async (input) => {
-      seenHint = input.modelHint;
-      return [];
-    };
-    await runPhaseProposeTakes(
-      context({ 'models.dream.propose_takes': 'anthropic:claude-haiku-4-5' }),
-      { extractor: capture, pageLimit: 10 },
-    );
-    expect(seenHint).toBe('anthropic:claude-haiku-4-5');
+    await engine.setConfig('models.dream.propose_takes', 'anthropic:claude-haiku-4-5-20251001');
+    try {
+      let seenHint: string | undefined;
+      const capture: ProposeTakesExtractor = async (input) => {
+        seenHint = input.modelHint;
+        return [];
+      };
+      await runPhaseProposeTakes(context(), { extractor: capture, pageLimit: 10 });
+      expect(seenHint).toBe('anthropic:claude-haiku-4-5-20251001');
+    } finally {
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'models.dream.propose_takes'`);
+    }
   });
 
-  test('deprecated cycle.propose_takes.model is honored when the new key is absent', async () => {
+  test('deprecated cycle.propose_takes.model in ENGINE config is honored when the new key is absent', async () => {
     await seedPages(1, 'wiki/legacy-routed');
-    let seenHint: string | undefined;
-    const capture: ProposeTakesExtractor = async (input) => {
-      seenHint = input.modelHint;
-      return [];
-    };
-    await runPhaseProposeTakes(
-      context({ 'cycle.propose_takes.model': 'legacy:model-x' }),
-      { extractor: capture, pageLimit: 10 },
-    );
-    expect(seenHint).toBe('legacy:model-x');
+    await engine.setConfig('cycle.propose_takes.model', 'anthropic:claude-sonnet-4-5-20250929');
+    try {
+      let seenHint: string | undefined;
+      const capture: ProposeTakesExtractor = async (input) => {
+        seenHint = input.modelHint;
+        return [];
+      };
+      await runPhaseProposeTakes(context(), { extractor: capture, pageLimit: 10 });
+      expect(seenHint).toBe('anthropic:claude-sonnet-4-5-20250929');
+    } finally {
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'cycle.propose_takes.model'`);
+    }
   });
 
   test('with no route configured, the global chat model reaches the extractor (not undefined)', async () => {

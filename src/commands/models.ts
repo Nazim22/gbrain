@@ -83,12 +83,14 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
   const tiers = {} as Record<ModelTier, ModelEntry>;
   for (const t of TIERS) {
     const tierOverride = await engine.getConfig(`models.tier.${t}`);
-    // What models.default beats tier — re-walk the chain to attribute properly.
+    // S409 (Dae review P2): attribution mirrors the FIXED precedence — the
+    // tier override beats models.default now, so it must be checked first
+    // here too, or the report names a source the resolver didn't use.
     let source: string;
-    if (globalDefault && globalDefault.trim()) {
-      source = 'config: models.default';
-    } else if (tierOverride && tierOverride.trim()) {
+    if (tierOverride && tierOverride.trim()) {
       source = `config: models.tier.${t}`;
+    } else if (globalDefault && globalDefault.trim()) {
+      source = 'config: models.default';
     } else {
       source = 'default';
     }
