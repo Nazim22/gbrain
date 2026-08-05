@@ -241,10 +241,24 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       // Validate against the merged registry (file + DB plane + builtins).
       // We re-read merged config so a prior `gbrain config set
       // embedding_columns ...` is visible.
+      // S409 R2 (Dae review): loadConfigWithEngine SUPPORTS a null base —
+      // it synthesizes a minimal config so DB-plane keys (including
+      // embedding_columns) merge even on env-only/no-file installs. Gating
+      // the merge on file-config presence skipped the registry cross-check
+      // exactly there, letting a DB-declared vector(3) override of the
+      // builtin pass against a physical vector(1536). Fail CLOSED if the
+      // merged registry cannot be loaded at all.
       const fileCfg = loadConfig();
-      const mergedCfg = fileCfg
-        ? await loadConfigWithEngine(engine, fileCfg).catch(() => fileCfg)
-        : null;
+      let mergedCfg: ReturnType<typeof loadConfig>;
+      try {
+        mergedCfg = await loadConfigWithEngine(engine, fileCfg);
+      } catch (err) {
+        console.error(
+          `[config] Cannot load the merged config/registry (${(err as Error).message}); ` +
+            `refusing to set search_embedding_column against an unverifiable registry.`,
+        );
+        process.exit(1);
+      }
       // S409 (Dae review P1): captured from the registry when available so
       // the unconditional physical gate below can also cross-check the
       // declared type/dimensions.

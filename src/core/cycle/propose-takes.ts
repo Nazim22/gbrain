@@ -518,19 +518,15 @@ class ProposeTakesPhase extends BaseCyclePhase {
     // the reasoning tier falls through to the global chat model —
     // byte-identical to the old behavior; pointing this route at a
     // JSON-reliable model is the operator's next move, not this code's.
-    // Deliberate divergence from the review's literal `tier: 'reasoning'`
-    // suggestion: resolveModel step 7 makes TIER_DEFAULTS beat the caller
-    // fallback, so passing the tier would route an UNCONFIGURED brain to
-    // the Anthropic tier default — which probeChatModel then skips on a
-    // keyless install, silently disabling the whole phase. Chain here:
-    // configKey → deprecated key → models.default → env → the operator's
-    // global chat model (pre-S409 behavior when nothing is set).
-    const { resolveModel } = await import('../model-config.ts');
-    const modelId = opts.model ?? await resolveModel(engine, {
-      configKey: 'models.dream.propose_takes',
-      deprecatedConfigKey: 'cycle.propose_takes.model',
-      fallback: getChatModel(),
-    });
+    // S409 R2: THE shared route (resolveProposeTakesRoute) — identical
+    // resolution in `gbrain models`, so the report can never disagree with
+    // this runtime. Honors explicit models.tier.reasoning overrides but
+    // skips the built-in tier default (useTierDefault:false): an
+    // unconfigured brain must land on the operator's global chat model,
+    // not an Anthropic default it may have no key for (which probeChatModel
+    // would then skip, silently disabling the phase).
+    const { resolveProposeTakesRoute } = await import('../model-config.ts');
+    const modelId = opts.model ?? (await resolveProposeTakesRoute(engine, getChatModel())).model;
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /

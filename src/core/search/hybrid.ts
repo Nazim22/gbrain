@@ -155,13 +155,17 @@ export async function stampPageDates(engine: BrainEngine, results: SearchResult[
       if (m.lifecycle_status !== 'current') r.stale = true;
     }
   } catch {
-    // Best-effort for retrieval availability — but never SILENT (S409 Dae
-    // review P0): a failed metadata query used to leave the SQL-hardcoded
-    // stale:false standing, indistinguishable from a verified-current page.
-    // 'unknown' tells callers the lifecycle (and therefore `stale`) is
-    // UNVERIFIED for this result.
+    // Best-effort for retrieval availability — but never SILENT and never
+    // internally contradictory (S409 Dae review R1): 'unknown' alone left
+    // the SQL-hardcoded `stale:false` standing next to it. While `stale`
+    // is a required boolean, the ONLY fail-closed representation is
+    // stale:true — an unverified page must render with the warning, not as
+    // fresh. lifecycle_status='unknown' tells callers WHY it is flagged.
     for (const r of results) {
-      if (r.lifecycle_status === undefined) r.lifecycle_status = 'unknown';
+      if (r.lifecycle_status === undefined) {
+        r.lifecycle_status = 'unknown';
+        r.stale = true;
+      }
     }
   }
 }

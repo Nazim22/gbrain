@@ -222,4 +222,14 @@ describe('stampPageDates — current-truth metadata', () => {
     await stampPageDates(engine, [r]);
     expect(r.stale).toBe(true);
   });
+
+  it('R2: metadata-query FAILURE marks stale=true + lifecycle unknown — never a contradictory stale:false', async () => {
+    const brokenEngine = {
+      async executeRaw() { throw new Error('metadata query down'); },
+    } as unknown as typeof engine;
+    const r = res('p/unverifiable', 12345, 1.0); // stale:false from SQL
+    await stampPageDates(brokenEngine, [r]);
+    expect(r.lifecycle_status).toBe('unknown');
+    expect(r.stale).toBe(true); // fail-closed: unverified must not render fresh
+  });
 });

@@ -212,6 +212,53 @@ describe('S409.3 model route', () => {
     }
   });
 
+  // R2 (Dae review): the report (`gbrain models` via resolveProposeTakesRoute)
+  // and the runtime (extractor modelHint) must agree in EVERY configuration —
+  // the R1 defect was the report resolving with tier semantics production
+  // didn't use. One shared route function; this matrix pins the equality.
+  test('R2 matrix: report route == runtime modelHint across all five configurations', async () => {
+    const { resolveProposeTakesRoute } = await import('../src/core/model-config.ts');
+    const { getChatModel } = await import('../src/core/ai/gateway.ts');
+    const cases: Array<{ name: string; setup: () => Promise<void> }> = [
+      { name: 'unconfigured', setup: async () => {} },
+      {
+        name: 'per-task key',
+        setup: async () => engine.setConfig('models.dream.propose_takes', 'anthropic:claude-haiku-4-5-20251001'),
+      },
+      {
+        name: 'deprecated key',
+        setup: async () => engine.setConfig('cycle.propose_takes.model', 'anthropic:claude-sonnet-4-5-20250929'),
+      },
+      {
+        name: 'explicit models.tier.reasoning',
+        setup: async () => engine.setConfig('models.tier.reasoning', 'anthropic:claude-opus-4-5-20251101'),
+      },
+      {
+        name: 'models.default',
+        setup: async () => engine.setConfig('models.default', 'anthropic:claude-haiku-4-5-20251001'),
+      },
+    ];
+    for (const c of cases) {
+      await engine.executeRaw(
+        `DELETE FROM config WHERE key IN ('models.dream.propose_takes','cycle.propose_takes.model','models.tier.reasoning','models.default')`,
+      );
+      await c.setup();
+      await seedPages(1, `wiki/matrix-${cases.indexOf(c)}`);
+
+      let runtimeHint: string | undefined;
+      const capture: ProposeTakesExtractor = async (input) => {
+        runtimeHint = input.modelHint;
+        return [];
+      };
+      await runPhaseProposeTakes(context(), { extractor: capture, pageLimit: 10 });
+      const reported = await resolveProposeTakesRoute(engine, getChatModel());
+      expect({ case: c.name, runtime: runtimeHint }).toEqual({ case: c.name, runtime: reported.model });
+    }
+    await engine.executeRaw(
+      `DELETE FROM config WHERE key IN ('models.dream.propose_takes','cycle.propose_takes.model','models.tier.reasoning','models.default')`,
+    );
+  }, 60_000);
+
   test('with no route configured, the global chat model reaches the extractor (not undefined)', async () => {
     await seedPages(1, 'wiki/default-routed');
     let seenHint: string | undefined | null = null;

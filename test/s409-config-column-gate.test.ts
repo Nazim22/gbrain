@@ -73,6 +73,31 @@ describe('S409 search_embedding_column physical gate', () => {
     expect(await engine.getConfig('search_embedding_column')).not.toBe('embedding_ghost');
   });
 
+  test("R2 (Dae's no-file repro): with NO config file, a DB-declared vector(3) override of the builtin is refused against the physical width", async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const emptyHome = mkdtempSync(join(tmpdir(), 'gbrain-s409-nofile-'));
+    const savedHome = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = emptyHome;
+    try {
+      // DB-plane registry declares the BUILTIN column at the wrong width.
+      const reg = await captureRun(['set', 'embedding_columns',
+        JSON.stringify({ embedding: { dimensions: 3, provider: 'test:model-x', type: 'vector' } })]);
+      expect(reg.exitCode).toBeNull();
+      // Pre-R2: fileCfg null → merge skipped → declaredEntry null → the
+      // physical gate saw a valid vector type and PERSISTED the mismatch.
+      const r = await captureRun(['set', 'search_embedding_column', 'embedding', '--yes']);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr).toContain('does not match its');
+      expect(await engine.getConfig('search_embedding_column')).not.toBe('embedding');
+    } finally {
+      if (savedHome === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = savedHome;
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
+  });
+
   test('the real default vector column still passes the physical gate', async () => {
     const r = await captureRun(['set', 'search_embedding_column', 'embedding', '--yes']);
     // Physical gate passes (vector(n) exists); whatever happens later in the

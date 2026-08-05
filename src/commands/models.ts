@@ -32,6 +32,7 @@ import {
   DEFAULT_ALIASES,
   TIER_DEFAULTS,
   resolveModel,
+  resolveProposeTakesRoute,
   type ModelTier,
 } from '../core/model-config.ts';
 
@@ -100,6 +101,18 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
 
   const per_task: ModelsReport['per_task'] = [];
   for (const { key, tier, description } of PER_TASK_KEYS) {
+    // S409 R2: propose_takes resolves through THE shared route function the
+    // phase runtime uses (useTierDefault:false + chat-model fallback), and
+    // its source comes from the resolver itself — the R1 defect was this
+    // report resolving with tier semantics production didn't use, telling
+    // the operator a configured tier model was in play when the phase was
+    // actually on the global chat model.
+    if (key === 'models.dream.propose_takes') {
+      const { getChatModel } = await import('../core/ai/gateway.ts');
+      const r = await resolveProposeTakesRoute(engine, getChatModel());
+      per_task.push({ key, tier, resolved: r.model, source: r.source, description });
+      continue;
+    }
     const resolved = await resolveModel(engine, { configKey: key, tier, fallback: TIER_DEFAULTS[tier] });
     const explicit = await probeSource(engine, key, 'GBRAIN_MODEL');
     const source = explicit ?? `tier.${tier}`;
