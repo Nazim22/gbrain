@@ -261,8 +261,10 @@ export async function resolveProposeTakesRoute(
     useTierDefault: false,
     fallback: chatFallback,
   });
-  // Label the compatibility fallback for what it is.
-  return r.source === 'fallback' ? { ...r, source: 'config: chat_model (compat fallback)' } : r;
+  // Label the compatibility fallback for what it is — provenance-neutral
+  // (Dae R2 note: the chat model itself may come from config, env, or a
+  // built-in default; naming a config key here was over-specific).
+  return r.source === 'fallback' ? { ...r, source: 'chat-model compatibility fallback' } : r;
 }
 
 /**
