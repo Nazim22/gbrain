@@ -918,6 +918,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'embedding_disabled',
   'expansion_model',
   'chat_model',
+  'models.dream.propose_takes',
+  'cycle.propose_takes.model',
   'chat_fallback_chain',
   'provider_base_urls',
   'provider_chat_options',

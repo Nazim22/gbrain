@@ -177,6 +177,8 @@ export interface ProposeTakesResult {
   budget_exhausted: boolean;
   /** True when the phase deadline fired before the page loop completed (partial result). */
   deadline_hit?: boolean;
+  /** S409: extractor failures recorded to the retry ledger this run. */
+  retries_recorded?: number;
   warnings: string[];
 }
 
@@ -201,8 +203,12 @@ async function listCandidatePages(
   engine: BrainEngine,
   scope: ScopedReadOpts,
   limit: number,
+  promptVersion: string,
 ): Promise<ProposeTakesPageRow[]> {
-  const where = ['deleted_at IS NULL'];
+  // S409: machine-written extraction receipts (extracts/<date>/<kind>/…)
+  // are not prose and must not feed the extractor — pre-S409 the newest
+  // receipt page re-entered the candidate window every run (self-feed).
+  const where = ['deleted_at IS NULL', `slug NOT LIKE 'extracts/%'`];
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);
@@ -211,6 +217,32 @@ async function listCandidatePages(
     params.push(scope.sourceId);
     where.push(`source_id = $${params.length}`);
   }
+  // S409 eligibility-in-SQL (audit: candidate starvation). The old shape
+  // selected the newest `limit` pages and ONLY THEN checked the idempotency
+  // cache, so already-processed pages consumed the whole window and page
+  // limit+1 could starve forever. Two SQL filters fix the bulk:
+  //   1. a page with any proposal/tombstone row written at-or-after its own
+  //      updated_at is fully processed at current content — excluded;
+  //   2. a page whose attempts-ledger row is backing off or dead-lettered
+  //      is excluded (see migration v126 + the extractor-failure upsert).
+  // The in-loop content-hash cache check remains the precise guard for
+  // touch-only edits (updated_at bumped, content unchanged).
+  params.push(promptVersion);
+  const pvParam = `$${params.length}`;
+  where.push(`NOT EXISTS (
+      SELECT 1 FROM take_proposals tp
+       WHERE tp.source_id = pages.source_id
+         AND tp.page_slug = pages.slug
+         AND tp.prompt_version = ${pvParam}
+         AND tp.proposed_at >= pages.updated_at
+    )`);
+  where.push(`NOT EXISTS (
+      SELECT 1 FROM take_proposal_attempts a
+       WHERE a.source_id = pages.source_id
+         AND a.page_slug = pages.slug
+         AND a.prompt_version = ${pvParam}
+         AND (a.dead_letter OR a.next_retry_at > now())
+    )`);
   params.push(limit);
   return engine.executeRaw<ProposeTakesPageRow>(
     `SELECT slug, source_id, compiled_truth
@@ -395,9 +427,19 @@ export function parseExtractorOutput(raw: string): ProposedTake[] {
     const r = raw as Record<string, unknown>;
     const claim_text = typeof r.claim_text === 'string' ? r.claim_text.trim() : '';
     if (!claim_text || claim_text.length > 500) continue;
-    const kind = ['fact', 'take', 'bet', 'hunch'].includes(r.kind as string)
-      ? (r.kind as ProposedTake['kind'])
-      : 'take';
+    // S409 taxonomy alignment (audit): the tuned prompt deliberately asks
+    // for 'prediction'|'judgment'|'bet' (narrow enum extracts better), but
+    // the parser only knew the storage taxonomy, so predictions and
+    // judgments collapsed to generic 'take'. Map the prompt enum onto the
+    // storage enum: prediction = future-falsifiable claim → 'bet';
+    // judgment = interpretive stance → 'take' (explicit, not a fallback).
+    const kindRaw = typeof r.kind === 'string' ? r.kind : '';
+    const kind: ProposedTake['kind'] =
+      kindRaw === 'prediction' ? 'bet'
+      : kindRaw === 'judgment' ? 'take'
+      : ['fact', 'take', 'bet', 'hunch'].includes(kindRaw)
+        ? (kindRaw as ProposedTake['kind'])
+        : 'take';
     const holder = typeof r.holder === 'string' && r.holder.length > 0 ? r.holder : 'brain';
     const weightRaw = typeof r.weight === 'number' ? r.weight : 0.5;
     const weight = Math.max(0, Math.min(1, weightRaw));
@@ -443,7 +485,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
   protected async process(
     engine: BrainEngine,
     scope: ScopedReadOpts,
-    _ctx: OperationContext,
+    ctx: OperationContext,
     opts: ProposeTakesOpts,
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
     const extractor = opts.extractor ?? defaultExtractor;
@@ -454,7 +496,29 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const phaseStartMs = Date.now();
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
-    const modelId = opts.model ?? getChatModel();
+    // S409 (audit + the S405 verified diagnosis): this phase was the lone
+    // cycle phase with NO config route — `opts.model` existed but was only
+    // ever populated by tests, so a proposed `cycle.propose_takes.model`
+    // setting was accepted as config and silently unconsumed. Primary key is
+    // `models.dream.propose_takes` (matches the models.dream.* convention;
+    // cycle.<phase>.* is budget config). The legacy key is honored with a
+    // deprecation warning. With neither set this is byte-identical to the
+    // old behavior (global chat model) — routing to a JSON-reliable model is
+    // the operator's next move, not this code's.
+    const cfg = ctx.config as unknown as Record<string, unknown>;
+    const cfgRoute = typeof cfg?.['models.dream.propose_takes'] === 'string'
+      ? (cfg['models.dream.propose_takes'] as string)
+      : undefined;
+    const legacyRoute = typeof cfg?.['cycle.propose_takes.model'] === 'string'
+      ? (cfg['cycle.propose_takes.model'] as string)
+      : undefined;
+    if (!cfgRoute && legacyRoute) {
+      console.error(
+        `[propose_takes] DEPRECATED: cycle.propose_takes.model is honored this release but ` +
+          `will be removed — use models.dream.propose_takes instead.`,
+      );
+    }
+    const modelId = opts.model ?? cfgRoute ?? legacyRoute ?? getChatModel();
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /
@@ -493,7 +557,11 @@ class ProposeTakesPhase extends BaseCyclePhase {
     };
 
     // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
-    const pages = await listCandidatePages(engine, scope, pageLimit);
+    // S409: eligibility is filtered in SQL now, and pageLimit bounds LLM
+    // WORK (cache misses), not scans — a 10× scan ceiling keeps touch-only
+    // edits (bumped updated_at, unchanged content) from starving real work
+    // while still bounding the walk.
+    const pages = await listCandidatePages(engine, scope, pageLimit * 10, promptVersion);
 
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pages.length);
@@ -528,6 +596,17 @@ class ProposeTakesPhase extends BaseCyclePhase {
           `after ${(elapsedMs / 1000).toFixed(0)}s (cap ${(deadlineMs / 1000).toFixed(0)}s); partial completion`,
         );
         result.deadline_hit = true;
+        break;
+      }
+
+      // S409: the LLM-work window. pageLimit now caps extractor calls, so a
+      // backlog drains at up to pageLimit real extractions per run instead
+      // of being scan-starved by already-processed pages.
+      if (result.cache_misses >= pageLimit) {
+        result.warnings.push(
+          `LLM-work window exhausted at ${result.cache_misses} extractions ` +
+          `(${result.pages_scanned}/${pages.length} pages scanned); remainder next cycle`,
+        );
         break;
       }
 
@@ -578,12 +657,47 @@ class ProposeTakesPhase extends BaseCyclePhase {
           pagePath: page.slug,
           pageBody: body,
           existingTakes,
-          modelHint: opts.model,
+          // S409: was `opts.model` — undefined in every production run, so
+          // the gateway silently used its own default and the resolved
+          // route never reached the extractor.
+          modelHint: modelId,
         });
         await maybeYield();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
+        // S409 retry ledger (audit: retry monopoly). Malformed output is
+        // deliberately not tombstoned, but without an attempt record the
+        // same failing pages monopolized every cycle. Exponential backoff
+        // (2^(n-1) hours, capped 7d); dead-letter at 8 attempts. A content
+        // change resets the ledger. Best-effort: a ledger write failure
+        // must not abort the phase.
+        try {
+          await engine.executeRaw(
+            `INSERT INTO take_proposal_attempts
+               (source_id, page_slug, prompt_version, content_hash, attempt_count,
+                last_error, last_model, last_attempt_at, next_retry_at, dead_letter)
+             VALUES ($1, $2, $3, $4, 1, $5, $6, now(),
+                     now() + interval '1 hour', FALSE)
+             ON CONFLICT (source_id, page_slug, prompt_version) DO UPDATE SET
+               attempt_count = CASE WHEN take_proposal_attempts.content_hash = EXCLUDED.content_hash
+                                    THEN take_proposal_attempts.attempt_count + 1 ELSE 1 END,
+               content_hash = EXCLUDED.content_hash,
+               last_error = EXCLUDED.last_error,
+               last_model = EXCLUDED.last_model,
+               last_attempt_at = now(),
+               next_retry_at = now() + (LEAST(pow(2, CASE WHEN take_proposal_attempts.content_hash = EXCLUDED.content_hash
+                                                          THEN take_proposal_attempts.attempt_count ELSE 0 END), 168)::text || ' hours')::interval,
+               dead_letter = (CASE WHEN take_proposal_attempts.content_hash = EXCLUDED.content_hash
+                                   THEN take_proposal_attempts.attempt_count + 1 ELSE 1 END) >= 8`,
+            [sourceId, page.slug, promptVersion, ch, msg.slice(0, 2000), modelId],
+          );
+          result.retries_recorded = (result.retries_recorded ?? 0) + 1;
+        } catch (ledgerErr) {
+          result.warnings.push(
+            `attempt-ledger write failed on ${page.slug}: ${(ledgerErr as Error).message}`,
+          );
+        }
         continue;
       }
 
@@ -651,6 +765,18 @@ class ProposeTakesPhase extends BaseCyclePhase {
           ],
         );
         result.tombstones_written += 1;
+      }
+
+      // S409: a successful extraction (proposals or clean-empty tombstone)
+      // clears the retry ledger — the page is healthy again. Best-effort.
+      try {
+        await engine.executeRaw(
+          `DELETE FROM take_proposal_attempts
+            WHERE source_id = $1 AND page_slug = $2 AND prompt_version = $3`,
+          [sourceId, page.slug, promptVersion],
+        );
+      } catch {
+        // Non-fatal — the ledger row expires via backoff anyway.
       }
     }
 

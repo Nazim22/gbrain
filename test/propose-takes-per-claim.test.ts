@@ -68,8 +68,13 @@ describe('#2138 per-claim proposal idempotency', () => {
     expect((result.details as Record<string, unknown>).proposals_inserted).toBe(2);
     expect(await countProposals('wiki/essays/thesis')).toBe(2);
 
+    // S409: a fully-processed page is now excluded in SQL (proposed_at >=
+    // updated_at), so the rerun never scans it — stronger than the old
+    // in-loop cache hit. The invariant that matters is unchanged: no
+    // duplicate rows, no second LLM spend.
     const rerun = await runPhaseProposeTakes(context(), { extractor: proposals });
-    expect((rerun.details as Record<string, unknown>).cache_hits).toBe(1);
+    expect((rerun.details as Record<string, unknown>).pages_scanned).toBe(0);
+    expect((rerun.details as Record<string, unknown>).cache_hits).toBe(0);
     expect(await countProposals('wiki/essays/thesis')).toBe(2);
   });
 

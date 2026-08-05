@@ -5724,6 +5724,36 @@ export const MIGRATIONS: Migration[] = [
         ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
     `,
   },
+  {
+    version: 126,
+    name: 'take_proposal_attempts_retry_ledger',
+    // S409 (audit): propose_takes had no attempt memory — a page whose
+    // extraction kept failing (malformed JSON is deliberately NOT
+    // tombstoned) re-entered every cycle and, combined with the
+    // newest-100-then-filter window, could monopolize the phase forever.
+    // One row per (source, page, prompt_version): exponential backoff via
+    // next_retry_at, dead_letter after repeated same-content failures,
+    // reset on content change, cleared on success.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS take_proposal_attempts (
+        source_id       TEXT        NOT NULL,
+        page_slug       TEXT        NOT NULL,
+        prompt_version  TEXT        NOT NULL,
+        content_hash    TEXT        NOT NULL,
+        attempt_count   INT         NOT NULL DEFAULT 0,
+        last_error      TEXT,
+        last_model      TEXT,
+        last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        next_retry_at   TIMESTAMPTZ,
+        dead_letter     BOOLEAN     NOT NULL DEFAULT FALSE,
+        PRIMARY KEY (source_id, page_slug, prompt_version)
+      );
+      CREATE INDEX IF NOT EXISTS take_proposal_attempts_retry_idx
+        ON take_proposal_attempts (source_id, next_retry_at)
+        WHERE NOT dead_letter;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
