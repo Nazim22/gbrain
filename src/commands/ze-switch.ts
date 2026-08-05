@@ -110,6 +110,30 @@ export async function runZeSwitch(args: string[], engine: BrainEngine): Promise<
 
   const flags = parseFlags(args);
 
+  // ── S409 FREEZE (audit P0) ─────────────────────────────────────────────
+  // ze-switch can record `ze_switch_applied=true` after changing the vector
+  // column + DB config while `embedding_model`/`embedding_dimensions` stay
+  // file/env-canonical and are EXCLUDED from DB merging — so the runtime
+  // keeps producing old-model vectors against a new-width column, the switch
+  // reports success, and the retry is suppressed (config.ts:646-657,
+  // retrieval-upgrade-planner.ts:399-414). Until the canonical plane is
+  // refreshed inside apply AND post-switch embedding width + model identity
+  // are verified before recording completion, every mutating path is frozen.
+  // --dry-run (plan only, zero writes) stays available.
+  if (!flags.dryRun) {
+    const msg =
+      'ze-switch is FROZEN (S409 audit): apply can report success without switching ' +
+      'the runtime embedding model, risking a dimension-mismatch cutover. ' +
+      'Only --dry-run is available until the canonical-plane refresh + ' +
+      'post-switch verification land. See TODOS.md (S409).';
+    if (flags.json) {
+      console.log(JSON.stringify({ status: 'frozen', reason: 's409_canonical_plane_defect', message: msg }, null, 2));
+    } else {
+      console.error(msg);
+    }
+    process.exit(1);
+  }
+
   try {
     // --dry-run: just plan, never apply.
     if (flags.dryRun) {

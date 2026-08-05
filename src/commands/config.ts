@@ -268,6 +268,53 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
           process.exit(1);
         }
 
+        // S409 physical-existence gate (audit P1). `embedding_columns` is a
+        // CONFIG registry — registering a column does not create storage.
+        // Before this gate, a registered-but-missing column passed the
+        // registry check, the coverage probe errored, the catch warned and
+        // PROCEEDED — and every subsequent vector query generated SQL
+        // against a column that does not exist. Physical verification is a
+        // hard requirement: column must exist in the catalog AND its
+        // type/dimensions must match the registry declaration.
+        try {
+          const catRows = await engine.executeRaw<{ coltype: string }>(
+            `SELECT format_type(a.atttypid, a.atttypmod) AS coltype
+               FROM pg_attribute a
+               JOIN pg_class c ON c.oid = a.attrelid
+              WHERE c.relname = 'content_chunks'
+                AND a.attname = $1
+                AND a.attnum > 0 AND NOT a.attisdropped`,
+            [value],
+          );
+          if (!catRows || catRows.length === 0) {
+            console.error(
+              `[config] Column "${value}" is registered in embedding_columns but does NOT ` +
+                `physically exist on content_chunks. Registry configuration does not create ` +
+                `storage — run the column migration/backfill first, then set the default.`,
+            );
+            process.exit(1);
+          }
+          const declared = registry[value];
+          const m = /^(vector|halfvec)\((\d+)\)$/.exec(catRows[0].coltype.trim());
+          if (m) {
+            const [, physType, physDim] = m;
+            if (physType !== declared.type || Number(physDim) !== declared.dimensions) {
+              console.error(
+                `[config] Column "${value}" physical type ${catRows[0].coltype} does not match ` +
+                  `its registry declaration (${declared.type}(${declared.dimensions})). ` +
+                  `Fix the registry or migrate the column before switching.`,
+              );
+              process.exit(1);
+            }
+          }
+        } catch (err) {
+          console.error(
+            `[config] Cannot verify column "${value}" physically exists (${(err as Error).message}). ` +
+              `Refusing to switch the search default to an unverifiable column.`,
+          );
+          process.exit(1);
+        }
+
         // D14 coverage gate. Probe the column's NULL-rate; refuse when
         // coverage < 90% unless `--coverage-override` or `--yes` is
         // present.
