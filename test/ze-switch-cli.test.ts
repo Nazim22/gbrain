@@ -140,99 +140,66 @@ describe('--dry-run', () => {
   });
 });
 
-describe('--non-interactive', () => {
-  test('without ZE key + without --ignore-missing-key: exits 1', async () => {
+// S409 FREEZE (audit P0): every mutating ze-switch path is frozen until the
+// canonical-plane defect is fixed — apply could record ze_switch_applied=true
+// while the runtime kept producing old-model vectors (embedding_model /
+// embedding_dimensions stay file/env-canonical and are excluded from DB
+// merging), yielding a false-success cutover with retry suppressed. The
+// pre-freeze behavioral pins for these paths live in git history and come
+// back when the freeze lifts.
+describe('S409 freeze — every mutating path refuses', () => {
+  test('--non-interactive: frozen, exits 1, applies NOTHING', async () => {
     await setLegacyConfig();
     await seedPages(150);
-
-    // Clear the env var so the test runs the no-key path even when the
-    // contributor has ZEROENTROPY_API_KEY set in their shell.
-    await withEnv({ ZEROENTROPY_API_KEY: undefined }, async () => {
-      const r = await captureExit(() => runZeSwitch(['--non-interactive'], engine));
-      expect(r.exitCode).toBe(1);
-      expect(r.stderr).toContain('ZEROENTROPY_API_KEY');
-    });
-  });
-
-  test('without ZE key + with --ignore-missing-key: applies, exits 0', async () => {
-    await setLegacyConfig();
-    await seedPages(150);
-
     const r = await captureExit(() =>
       runZeSwitch(['--non-interactive', '--ignore-missing-key'], engine),
     );
-    expect(r.exitCode).toBe(0);
-    expect(await engine.getConfig(KEY_APPLIED)).toBe('true');
-    expect(await engine.getConfig('embedding_model')).toBe('zeroentropyai:zembed-1');
-    expect(await engine.getConfig('embedding_dimensions')).toBe(String(ZE_TARGET_EMBEDDING_DIM));
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('FROZEN');
+    expect(await engine.getConfig(KEY_APPLIED)).toBeNull();
+    expect(await engine.getConfig('embedding_model')).not.toBe('zeroentropyai:zembed-1');
   });
 
-  test('with env ZE key set: applies', async () => {
+  test('--non-interactive with env key: still frozen', async () => {
     await setLegacyConfig();
     await seedPages(150);
     await withEnv({ ZEROENTROPY_API_KEY: 'sk-fake' }, async () => {
       const r = await captureExit(() => runZeSwitch(['--non-interactive'], engine));
-      expect(r.exitCode).toBe(0);
-      expect(await engine.getConfig(KEY_APPLIED)).toBe('true');
+      expect(r.exitCode).toBe(1);
+      expect(await engine.getConfig(KEY_APPLIED)).toBeNull();
     });
   });
 
-  test('--json + --non-interactive: emits {status: "applied"}', async () => {
-    await setLegacyConfig();
-    await seedPages(150);
+  test('--json emits {status: "frozen"} with the defect reason', async () => {
     const r = await captureExit(() =>
       runZeSwitch(['--non-interactive', '--ignore-missing-key', '--json'], engine),
     );
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode).toBe(1);
     const env = JSON.parse(r.stdout);
-    expect(env.status).toBe('applied');
+    expect(env.status).toBe('frozen');
+    expect(env.reason).toBe('s409_canonical_plane_defect');
   });
-});
 
-describe('--resume', () => {
-  test('completes a half-applied switch', async () => {
+  test('--resume: frozen (a half-applied switch must not be completed blind)', async () => {
     await setLegacyConfig();
     await seedPages(150);
-    // Simulate crash partway: requested but not applied.
     await engine.setConfig(KEY_REQUESTED, 'true');
-
     const r = await captureExit(() => runZeSwitch(['--resume'], engine));
-    expect(r.exitCode).toBe(0);
-    expect(await engine.getConfig(KEY_APPLIED)).toBe('true');
-    expect(await engine.getConfig('embedding_model')).toBe('zeroentropyai:zembed-1');
-  });
-});
-
-describe('--undo', () => {
-  test('without snapshot exits 1', async () => {
-    const r = await captureExit(() =>
-      runZeSwitch(['--undo', '--non-interactive', '--confirm-reembed'], engine),
-    );
     expect(r.exitCode).toBe(1);
-  });
-
-  test('--non-interactive without --confirm-reembed exits 1', async () => {
-    const r = await captureExit(() => runZeSwitch(['--undo', '--non-interactive'], engine));
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain('confirm-reembed');
-  });
-
-  test('with snapshot + --confirm-reembed: reverses the switch', async () => {
-    // Set up: apply switch, then undo.
-    await setLegacyConfig();
-    await seedPages(150);
-    await captureExit(() =>
-      runZeSwitch(['--non-interactive', '--ignore-missing-key'], engine),
-    );
-    expect(await engine.getConfig(KEY_APPLIED)).toBe('true');
-
-    const r = await captureExit(() =>
-      runZeSwitch(['--undo', '--non-interactive', '--confirm-reembed'], engine),
-    );
-    expect(r.exitCode).toBe(0);
-    // Reverted to prior model.
-    expect(await engine.getConfig('embedding_model')).toBe('openai:text-embedding-3-large');
-    expect(await engine.getConfig('embedding_dimensions')).toBe('1536');
     expect(await engine.getConfig(KEY_APPLIED)).toBeNull();
+  });
+
+  test('--undo: frozen', async () => {
+    const r = await captureExit(() =>
+      runZeSwitch(['--undo', '--non-interactive', '--confirm-reembed'], engine),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('FROZEN');
+  });
+
+  test('interactive (no flags): frozen', async () => {
+    const r = await captureExit(() => runZeSwitch([], engine));
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('FROZEN');
   });
 });

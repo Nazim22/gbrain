@@ -50,6 +50,12 @@ function buildMockEngine(opts: {
 
   const engine = {
     kind: 'pglite',
+    // S409: the phase now routes its model through resolveModel(engine, …)
+    // like every sibling phase, which consults engine config. No keys set →
+    // falls through to the global chat model, same as before.
+    async getConfig() {
+      return null;
+    },
     async listPages() {
       return opts.pages;
     },

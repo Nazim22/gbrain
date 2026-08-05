@@ -61,6 +61,13 @@ describe('autopilot.ts ↔ ChildWorkerSupervisor wiring', () => {
     expect(AUTOPILOT_SRC).not.toContain("'--max-rss', '2048'");
   });
 
+  it('keeps a third worker slot available for cycle-spawned subagents', () => {
+    // autopilot-cycle and autopilot-global-maintenance can occupy two slots.
+    // The cycle's patterns phase submits a child subagent and waits for it, so
+    // concurrency below 3 can self-starve while maintenance is running.
+    expect(AUTOPILOT_SRC).toContain("'--concurrency', '3'");
+  });
+
   it("constructs ChildWorkerSupervisor with maxCrashes: 5", () => {
     // Matches the legacy `crashCount >= 5` give-up rule from the inline
     // loop. The shared core uses this to decide when to fire

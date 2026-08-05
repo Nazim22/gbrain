@@ -44,6 +44,13 @@ export interface ResolveModelOpts {
    * with a one-shot stderr warn instead).
    */
   tier?: ModelTier;
+  /**
+   * S409 R2 — when false, step 7 (built-in TIER_DEFAULTS) is skipped so an
+   * unconfigured brain lands on the caller-supplied fallback instead of a
+   * tier default it may have no provider key for. Explicit models.tier.*
+   * overrides (step 4) are honored regardless. Default: true.
+   */
+  useTierDefault?: boolean;
   /** Hardcoded last-resort fallback. */
   fallback: string;
 }
@@ -125,20 +132,30 @@ function emitDeprecationWarning(oldKey: string, newKey: string, ignored: boolean
   }
 }
 
+/** S409 R2 — resolution result WITH the precedence step that produced it,
+ * so reporting surfaces (`gbrain models`) can attribute without re-encoding
+ * the chain (the Dae-review defect class: two encodings drifting apart). */
+export interface ResolvedModelWithSource {
+  model: string;
+  source: string;
+}
+
 /**
- * Resolve a model name through the 6-tier precedence chain. Async because it
- * reads config from the engine. Pass `engine: null` for callsites that don't
- * have an engine (rare; usually CLI bootstrap before connect).
+ * Resolve a model name through the precedence chain, returning the model AND
+ * the step that supplied it. This is THE single implementation — resolveModel
+ * is a thin value-only wrapper. Async because it reads config from the
+ * engine. Pass `engine: null` for callsites that don't have an engine (rare;
+ * usually CLI bootstrap before connect).
  */
-export async function resolveModel(
+export async function resolveModelWithSource(
   engine: BrainEngine | null,
   opts: ResolveModelOpts,
-): Promise<string> {
+): Promise<ResolvedModelWithSource> {
   const envVar = opts.envVar ?? 'GBRAIN_MODEL';
 
   // 1. CLI flag wins
   if (opts.cliFlag && opts.cliFlag.trim()) {
-    return await resolveAlias(engine, opts.cliFlag.trim());
+    return { model: await resolveAlias(engine, opts.cliFlag.trim()), source: 'cli-flag' };
   }
 
   if (engine) {
@@ -153,7 +170,7 @@ export async function resolveModel(
             emitDeprecationWarning(opts.deprecatedConfigKey, opts.configKey, /*ignored=*/ true);
           }
         }
-        return await resolveAlias(engine, v.trim());
+        return { model: await resolveAlias(engine, v.trim()), source: `config: ${opts.configKey}` };
       }
     }
 
@@ -162,24 +179,34 @@ export async function resolveModel(
       const v = await engine.getConfig(opts.deprecatedConfigKey);
       if (v && v.trim()) {
         emitDeprecationWarning(opts.deprecatedConfigKey, opts.configKey ?? '<no replacement>', /*ignored=*/ false);
-        return await resolveAlias(engine, v.trim());
+        return { model: await resolveAlias(engine, v.trim()), source: `config: ${opts.deprecatedConfigKey} (deprecated)` };
       }
     }
 
-    // 4. Global default
-    const def = await engine.getConfig('models.default');
-    if (def && def.trim()) {
-      const resolved = await resolveAlias(engine, def.trim());
-      return enforceSubagentCapable(resolved, opts.tier, 'models.default');
-    }
-
-    // 5. Tier override (v0.31.12)
+    // 4. Tier override — MUST beat the global default (S409 audit: with
+    // models.default set, every tier resolved to the same model and
+    // models.tier.* was dead config; live probe showed utility/reasoning/
+    // deep/subagent all routing to the global chat model). A tier key is
+    // strictly more specific than the global default, so it wins.
     if (opts.tier) {
       const tierVal = await engine.getConfig(`models.tier.${opts.tier}`);
       if (tierVal && tierVal.trim()) {
         const resolved = await resolveAlias(engine, tierVal.trim());
-        return enforceSubagentCapable(resolved, opts.tier, `models.tier.${opts.tier}`);
+        return {
+          model: enforceSubagentCapable(resolved, opts.tier, `models.tier.${opts.tier}`),
+          source: `config: models.tier.${opts.tier}`,
+        };
       }
+    }
+
+    // 5. Global default
+    const def = await engine.getConfig('models.default');
+    if (def && def.trim()) {
+      const resolved = await resolveAlias(engine, def.trim());
+      return {
+        model: enforceSubagentCapable(resolved, opts.tier, 'models.default'),
+        source: 'config: models.default',
+      };
     }
   }
 
@@ -187,17 +214,55 @@ export async function resolveModel(
   const env = process.env[envVar];
   if (env && env.trim()) {
     const resolved = await resolveAlias(engine, env.trim());
-    return enforceSubagentCapable(resolved, opts.tier, `env:${envVar}`);
+    return {
+      model: enforceSubagentCapable(resolved, opts.tier, `env:${envVar}`),
+      source: `env: ${envVar}`,
+    };
   }
 
   // 7. Tier default (v0.31.12 — when no override beats us, the tier's
-  //    canonical model wins over caller-supplied fallback)
-  if (opts.tier && TIER_DEFAULTS[opts.tier]) {
-    return await resolveAlias(engine, TIER_DEFAULTS[opts.tier]);
+  //    canonical model wins over caller-supplied fallback). S409 R2:
+  //    `useTierDefault: false` skips this step — for routes whose
+  //    compatibility contract is "unconfigured → caller fallback" (e.g.
+  //    propose_takes → the operator's global chat model), the built-in tier
+  //    default would silently select a model the install may have no key
+  //    for. Explicit tier OVERRIDES (step 4) are always honored.
+  if (opts.tier && TIER_DEFAULTS[opts.tier] && opts.useTierDefault !== false) {
+    return { model: await resolveAlias(engine, TIER_DEFAULTS[opts.tier]), source: `tier-default: ${opts.tier}` };
   }
 
   // 8. Hardcoded fallback (caller-supplied)
-  return await resolveAlias(engine, opts.fallback);
+  return { model: await resolveAlias(engine, opts.fallback), source: 'fallback' };
+}
+
+/** Value-only wrapper around resolveModelWithSource (the historical API). */
+export async function resolveModel(
+  engine: BrainEngine | null,
+  opts: ResolveModelOpts,
+): Promise<string> {
+  return (await resolveModelWithSource(engine, opts)).model;
+}
+
+/**
+ * S409 R2 — THE propose_takes route, shared by the phase runtime and
+ * `gbrain models` so the report can never disagree with production (the R1
+ * defect: the report resolved with tier semantics the runtime didn't use).
+ * `chatFallback` is the operator's global chat model, passed in by the
+ * caller (gateway import stays at the call sites to avoid a cycle).
+ */
+export async function resolveProposeTakesRoute(
+  engine: BrainEngine | null,
+  chatFallback: string,
+): Promise<ResolvedModelWithSource> {
+  const r = await resolveModelWithSource(engine, {
+    configKey: 'models.dream.propose_takes',
+    deprecatedConfigKey: 'cycle.propose_takes.model',
+    tier: 'reasoning',
+    useTierDefault: false,
+    fallback: chatFallback,
+  });
+  // Label the compatibility fallback for what it is.
+  return r.source === 'fallback' ? { ...r, source: 'config: chat_model (compat fallback)' } : r;
 }
 
 /**

@@ -3410,11 +3410,17 @@ export class PGLiteEngine implements BrainEngine {
   async getSupersededPageIds(pageIds: number[]): Promise<Set<number>> {
     const result = new Set<number>();
     if (pageIds.length === 0) return result;
-    // Parity with PostgresEngine.getSupersededPageIds (S393).
+    // Parity with PostgresEngine.getSupersededPageIds (S393; S409 lifecycle
+    // widening — superseded/deprecated/retired status, superseded_by,
+    // freshness:stale all demote).
     const { rows } = await this.db.query(
       `SELECT id FROM pages
         WHERE id = ANY($1::int[])
-          AND lower(frontmatter ->> 'status') = 'superseded'`,
+          AND (
+            lower(frontmatter ->> 'status') IN ('superseded', 'deprecated', 'retired')
+            OR frontmatter ? 'superseded_by'
+            OR lower(frontmatter ->> 'freshness') = 'stale'
+          )`,
       [pageIds]
     );
     for (const r of rows as { id: number }[]) result.add(Number(r.id));
@@ -3435,15 +3441,20 @@ export class PGLiteEngine implements BrainEngine {
     if (refs.length === 0) return new Map();
     const slugs = refs.map(r => r.slug);
     const sourceIds = refs.map(r => r.source_id);
+    // Parity with PostgresEngine.getEffectiveDates (S409: fallback-sourced
+    // dates emit NO entry — sync churn must not buy a recency boost).
     const { rows } = await this.db.query(
-      `SELECT p.slug, p.source_id, COALESCE(p.effective_date, p.updated_at, p.created_at) AS ts
+      `SELECT p.slug, p.source_id,
+              CASE WHEN p.effective_date_source = 'fallback' THEN NULL
+                   ELSE COALESCE(p.effective_date, p.updated_at, p.created_at) END AS ts
          FROM pages p
          JOIN unnest($1::text[], $2::text[]) AS u(slug, source_id)
            ON p.slug = u.slug AND p.source_id = u.source_id`,
       [slugs, sourceIds],
     );
     const out = new Map<string, Date>();
-    for (const r of rows as Array<{slug: string; source_id: string; ts: string | Date}>) {
+    for (const r of rows as Array<{slug: string; source_id: string; ts: string | Date | null}>) {
+      if (r.ts == null) continue;
       const key = `${r.source_id}::${r.slug}`;
       out.set(key, r.ts instanceof Date ? r.ts : new Date(r.ts));
     }

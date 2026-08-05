@@ -32,6 +32,7 @@ import {
   DEFAULT_ALIASES,
   TIER_DEFAULTS,
   resolveModel,
+  resolveProposeTakesRoute,
   type ModelTier,
 } from '../core/model-config.ts';
 
@@ -41,6 +42,7 @@ const PER_TASK_KEYS: Array<{ key: string; tier: ModelTier; description: string }
   { key: 'models.dream.synthesize',         tier: 'reasoning', description: 'Dream synthesis (conversation → brain pages)' },
   { key: 'models.dream.synthesize_verdict', tier: 'utility',   description: 'Dream synthesis verdict (Haiku judge)' },
   { key: 'models.dream.patterns',           tier: 'reasoning', description: 'Pattern discovery (cross-take themes)' },
+  { key: 'models.dream.propose_takes',      tier: 'reasoning', description: 'Take proposal extraction (propose_takes phase, S409)' },
   { key: 'models.drift',                    tier: 'reasoning', description: 'Drift LLM judge (v0.29 scaffold)' },
   { key: 'models.auto_think',               tier: 'deep',      description: 'Auto-think question answering' },
   { key: 'models.think',                    tier: 'deep',      description: '`gbrain think` synthesis op' },
@@ -82,12 +84,14 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
   const tiers = {} as Record<ModelTier, ModelEntry>;
   for (const t of TIERS) {
     const tierOverride = await engine.getConfig(`models.tier.${t}`);
-    // What models.default beats tier — re-walk the chain to attribute properly.
+    // S409 (Dae review P2): attribution mirrors the FIXED precedence — the
+    // tier override beats models.default now, so it must be checked first
+    // here too, or the report names a source the resolver didn't use.
     let source: string;
-    if (globalDefault && globalDefault.trim()) {
-      source = 'config: models.default';
-    } else if (tierOverride && tierOverride.trim()) {
+    if (tierOverride && tierOverride.trim()) {
       source = `config: models.tier.${t}`;
+    } else if (globalDefault && globalDefault.trim()) {
+      source = 'config: models.default';
     } else {
       source = 'default';
     }
@@ -97,6 +101,18 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
 
   const per_task: ModelsReport['per_task'] = [];
   for (const { key, tier, description } of PER_TASK_KEYS) {
+    // S409 R2: propose_takes resolves through THE shared route function the
+    // phase runtime uses (useTierDefault:false + chat-model fallback), and
+    // its source comes from the resolver itself — the R1 defect was this
+    // report resolving with tier semantics production didn't use, telling
+    // the operator a configured tier model was in play when the phase was
+    // actually on the global chat model.
+    if (key === 'models.dream.propose_takes') {
+      const { getChatModel } = await import('../core/ai/gateway.ts');
+      const r = await resolveProposeTakesRoute(engine, getChatModel());
+      per_task.push({ key, tier, resolved: r.model, source: r.source, description });
+      continue;
+    }
     const resolved = await resolveModel(engine, { configKey: key, tier, fallback: TIER_DEFAULTS[tier] });
     const explicit = await probeSource(engine, key, 'GBRAIN_MODEL');
     const source = explicit ?? `tier.${tier}`;

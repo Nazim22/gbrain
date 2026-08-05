@@ -241,10 +241,28 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       // Validate against the merged registry (file + DB plane + builtins).
       // We re-read merged config so a prior `gbrain config set
       // embedding_columns ...` is visible.
+      // S409 R2 (Dae review): loadConfigWithEngine SUPPORTS a null base —
+      // it synthesizes a minimal config so DB-plane keys (including
+      // embedding_columns) merge even on env-only/no-file installs. Gating
+      // the merge on file-config presence skipped the registry cross-check
+      // exactly there, letting a DB-declared vector(3) override of the
+      // builtin pass against a physical vector(1536). Fail CLOSED if the
+      // merged registry cannot be loaded at all.
       const fileCfg = loadConfig();
-      const mergedCfg = fileCfg
-        ? await loadConfigWithEngine(engine, fileCfg).catch(() => fileCfg)
-        : null;
+      let mergedCfg: ReturnType<typeof loadConfig>;
+      try {
+        mergedCfg = await loadConfigWithEngine(engine, fileCfg);
+      } catch (err) {
+        console.error(
+          `[config] Cannot load the merged config/registry (${(err as Error).message}); ` +
+            `refusing to set search_embedding_column against an unverifiable registry.`,
+        );
+        process.exit(1);
+      }
+      // S409 (Dae review P1): captured from the registry when available so
+      // the unconditional physical gate below can also cross-check the
+      // declared type/dimensions.
+      let declaredEntry: { type: string; dimensions: number } | null = null;
       if (mergedCfg) {
         let registry: ReturnType<typeof getEmbeddingColumnRegistry>;
         try {
@@ -267,6 +285,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
           );
           process.exit(1);
         }
+        declaredEntry = registry[value] ?? null;
 
         // D14 coverage gate. Probe the column's NULL-rate; refuse when
         // coverage < 90% unless `--coverage-override` or `--yes` is
@@ -307,6 +326,63 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
             `[config] WARN: coverage probe failed (${(err as Error).message}); proceeding.`,
           );
         }
+      }
+
+      // S409 physical-existence gate (audit P1; hardened per Dae review).
+      // `embedding_columns` is a CONFIG registry — registering a column does
+      // not create storage. Requirements, enforced UNCONDITIONALLY (not
+      // keyed on file-config presence):
+      //   1. the column physically exists on content_chunks (resolved via
+      //      ::regclass, not a bare relname match);
+      //   2. its physical type is EXACTLY vector(n)/halfvec(n) — a TEXT or
+      //      INTEGER column with a vector registry declaration is refused,
+      //      not skipped (the pre-review regex only compared when it
+      //      already matched, so any non-vector type slid through);
+      //   3. when the registry declaration is known, type+dimensions match.
+      // Any verification failure refuses the switch — never warn-and-proceed.
+      try {
+        const catRows = await engine.executeRaw<{ coltype: string }>(
+          `SELECT format_type(a.atttypid, a.atttypmod) AS coltype
+             FROM pg_attribute a
+            WHERE a.attrelid = 'content_chunks'::regclass
+              AND a.attname = $1
+              AND a.attnum > 0 AND NOT a.attisdropped`,
+          [value],
+        );
+        if (!catRows || catRows.length === 0) {
+          console.error(
+            `[config] Column "${value}" does NOT physically exist on content_chunks. ` +
+              `Registry configuration does not create storage — run the column ` +
+              `migration/backfill first, then set the default.`,
+          );
+          process.exit(1);
+        }
+        const coltype = catRows[0].coltype.trim();
+        const m = /^(vector|halfvec)\((\d+)\)$/.exec(coltype);
+        if (!m) {
+          console.error(
+            `[config] Column "${value}" has physical type "${coltype}" — not a ` +
+              `vector(n)/halfvec(n) column. Refusing to route search through it.`,
+          );
+          process.exit(1);
+        }
+        if (declaredEntry) {
+          const [, physType, physDim] = m;
+          if (physType !== declaredEntry.type || Number(physDim) !== declaredEntry.dimensions) {
+            console.error(
+              `[config] Column "${value}" physical type ${coltype} does not match its ` +
+                `registry declaration (${declaredEntry.type}(${declaredEntry.dimensions})). ` +
+                `Fix the registry or migrate the column before switching.`,
+            );
+            process.exit(1);
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[config] Cannot verify column "${value}" physically exists (${(err as Error).message}). ` +
+            `Refusing to switch the search default to an unverifiable column.`,
+        );
+        process.exit(1);
       }
     }
 
