@@ -701,6 +701,17 @@ export interface SearchResult {
    */
   updated_at?: string;
   /**
+   * S409 lifecycle status derived from frontmatter: 'superseded' |
+   * 'deprecated' | 'retired' | 'stale' | 'current'. Stamped post-fusion by
+   * `stampPageDates` (which also backfills the v0.34 effective_date /
+   * effective_date_source fields below for paths whose SQL didn't project
+   * them). Anything non-current also forces `stale: true` — a page that
+   * names its own replacement must never render as fresh.
+   */
+  lifecycle_status?: string;
+  /** Successor slug from `frontmatter.superseded_by`, wikilink-stripped. */
+  superseded_by?: string;
+  /**
    * v0.42 (issue #1699) content-quality gate agent-warning channel. Set
    * when the result's page carries a `frontmatter.content_flag` marker
    * (fuzzy markup-heavy or oversize). The page is still searchable — this

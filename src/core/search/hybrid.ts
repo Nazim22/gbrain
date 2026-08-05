@@ -85,8 +85,14 @@ export async function stampPageDates(engine: BrainEngine, results: SearchResult[
     if (ids.length === 0) return;
     const rows = await engine.executeRaw<{
       id: number; created_at: string | Date | null; updated_at: string | Date | null;
+      effective_date: string | Date | null; effective_date_source: string | null;
+      fm_status: string | null; fm_freshness: string | null; fm_superseded_by: string | null;
     }>(
-      `SELECT id, created_at, updated_at FROM pages WHERE id = ANY($1::int[])`,
+      `SELECT id, created_at, updated_at, effective_date, effective_date_source,
+              lower(frontmatter ->> 'status') AS fm_status,
+              lower(frontmatter ->> 'freshness') AS fm_freshness,
+              frontmatter ->> 'superseded_by' AS fm_superseded_by
+         FROM pages WHERE id = ANY($1::int[])`,
       [ids],
     );
     const day = (v: string | Date | null): string | null => {
@@ -95,7 +101,30 @@ export async function stampPageDates(engine: BrainEngine, results: SearchResult[
       return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
     };
     const byId = new Map<number, string>();
+    // S409 — current-truth metadata rides the same lookup: effective date +
+    // its source (fallback = "this is really updated_at"), and a lifecycle
+    // verdict from frontmatter. A page carrying superseded/deprecated/
+    // retired status, a superseded_by pointer, or freshness:stale must
+    // never reach the caller as `stale: false` (the live S409 failure:
+    // a month-stale overview rendered stale:false with a 1.74× boost).
+    const metaById = new Map<number, {
+      effective_date?: string; effective_date_source?: string;
+      lifecycle_status: string; superseded_by?: string;
+    }>();
     for (const row of rows ?? []) {
+      const status = row.fm_status ?? '';
+      const successor = (row.fm_superseded_by ?? '').replace(/^\[\[|\]\]$/g, '').trim();
+      const lifecycle =
+        status === 'superseded' || status === 'deprecated' || status === 'retired' ? status
+        : successor ? 'superseded'
+        : (row.fm_freshness ?? '') === 'stale' ? 'stale'
+        : 'current';
+      metaById.set(row.id, {
+        effective_date: day(row.effective_date) ?? undefined,
+        effective_date_source: row.effective_date_source ?? undefined,
+        lifecycle_status: lifecycle,
+        superseded_by: successor || undefined,
+      });
       const created = day(row.created_at);
       const updated = day(row.updated_at);
       if (!created) { if (updated) byId.set(row.id, updated); continue; }
@@ -116,6 +145,14 @@ export async function stampPageDates(engine: BrainEngine, results: SearchResult[
     for (const r of results) {
       const d = byId.get(r.page_id);
       if (d) r.updated_at = d;
+      const m = metaById.get(r.page_id);
+      if (!m) continue;
+      if (m.effective_date) r.effective_date = m.effective_date;
+      if (m.effective_date_source) r.effective_date_source = m.effective_date_source;
+      r.lifecycle_status = m.lifecycle_status;
+      if (m.superseded_by) r.superseded_by = m.superseded_by;
+      // One-way: lifecycle can force stale=true, never clear a SQL-computed true.
+      if (m.lifecycle_status !== 'current') r.stale = true;
     }
   } catch {
     // best-effort: never break retrieval over a date.
@@ -802,6 +839,30 @@ const MAX_ALIAS_INJECT = 3;           // cap injected pages per query (collision
  * Fail-open: pre-v110 brains (no page_aliases table) and any lookup error
  * degrade to the input unchanged (D9). Returns a NEW array; caller re-slices.
  */
+/**
+ * S409 — lifecycle verdict from raw frontmatter. Mirrors the SQL predicate in
+ * getSupersededPageIds (both engines): superseded/deprecated/retired status,
+ * an explicit superseded_by pointer, or freshness:stale all mean "not the
+ * current truth". Keep the two in lockstep — a page the SQL demotes must
+ * also be one the alias gate refuses to promote.
+ */
+export function isLifecycleDemoted(fm: Record<string, unknown> | null | undefined): boolean {
+  if (!fm) return false;
+  const status = String(fm.status ?? '').toLowerCase();
+  if (status === 'superseded' || status === 'deprecated' || status === 'retired') return true;
+  if (typeof fm.superseded_by === 'string' && fm.superseded_by.trim() !== '') return true;
+  if (String(fm.freshness ?? '').toLowerCase() === 'stale') return true;
+  return false;
+}
+
+/** S409 — successor slug from frontmatter.superseded_by, wikilink-stripped. */
+export function successorSlugFrom(fm: Record<string, unknown> | null | undefined): string | undefined {
+  const raw = fm?.superseded_by;
+  if (typeof raw !== 'string') return undefined;
+  const cleaned = raw.replace(/^\s*\[\[/, '').replace(/\]\]\s*$/, '').trim();
+  return cleaned || undefined;
+}
+
 export async function applyAliasHop(
   engine: import('../engine.ts').BrainEngine,
   results: SearchResult[],
@@ -874,7 +935,41 @@ export async function applyAliasHop(
   const topScore = out.reduce((m, r) => (Number.isFinite(r.score) && r.score > m ? r.score : m), 0);
   let injectScore = topScore > 0 ? topScore : 1.0;
 
-  for (const ref of ordered) {
+  for (const rawRef of ordered) {
+    // S409 lifecycle gate — the audit's sharpest finding: alias promotion ran
+    // AFTER both supersession demotes, so a retired page whose alias matched
+    // was hoisted straight back to #1 with a fresh injectScore, erasing the
+    // demote. An alias is a NAME; when the named page has been superseded,
+    // the name now means its SUCCESSOR. So: a lifecycle-demoted target with a
+    // live successor redirects the hop to that successor; one with no
+    // successor is left to its (already-demoted) organic rank. Fail-open —
+    // a lookup error preserves the pre-S409 promote path.
+    let ref = rawRef;
+    let fetchedPage: import('../types.ts').Page | null = null;
+    let gateConsulted = false;
+    try {
+      fetchedPage = await engine.getPage(rawRef.slug, { sourceId: rawRef.source_id });
+      gateConsulted = true;
+    } catch {
+      // Gate unavailable — behave exactly as before S409.
+    }
+    if (gateConsulted && fetchedPage && isLifecycleDemoted(fetchedPage.frontmatter)) {
+      const successor = successorSlugFrom(fetchedPage.frontmatter);
+      let successorPage: import('../types.ts').Page | null = null;
+      if (successor && successor !== rawRef.slug) {
+        try {
+          successorPage = await engine.getPage(successor, { sourceId: rawRef.source_id });
+        } catch {
+          successorPage = null;
+        }
+      }
+      if (successorPage && !isLifecycleDemoted(successorPage.frontmatter)) {
+        ref = { slug: successorPage.slug, source_id: successorPage.source_id ?? rawRef.source_id };
+        fetchedPage = successorPage;
+      } else {
+        continue; // demoted, no live successor: never alias-promote it
+      }
+    }
     const idx = out.findIndex(r => r.slug === ref.slug && (r.source_id ?? 'default') === ref.source_id);
     if (idx >= 0) {
       // PINGU LOCAL PATCH (S390) — an exact alias match PROMOTES, it doesn't nudge.
@@ -902,12 +997,16 @@ export async function applyAliasHop(
       out[idx].alias_hit = true;
       continue;
     }
-    // Absent canonical: fetch (in its OWN source) + inject at top-of-organic + epsilon.
-    let page;
-    try {
-      page = await engine.getPage(ref.slug, { sourceId: ref.source_id });
-    } catch {
-      continue;
+    // Absent canonical: inject at top-of-organic + epsilon. The page was
+    // already fetched by the S409 lifecycle gate above; refetch only if the
+    // gate errored out.
+    let page = fetchedPage;
+    if (!page) {
+      try {
+        page = await engine.getPage(ref.slug, { sourceId: ref.source_id });
+      } catch {
+        continue;
+      }
     }
     if (!page) continue;
     injectScore += 1e-6;

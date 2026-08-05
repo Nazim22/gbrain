@@ -3578,10 +3578,19 @@ export class PostgresEngine implements BrainEngine {
     const result = new Set<number>();
     if (pageIds.length === 0) return result;
     const sql = this.sql;
+    // S409 lifecycle widening: exact `status: superseded` was the ONLY demote
+    // trigger, so `deprecated`/`retired`, an explicit `superseded_by`, and
+    // `freshness: stale` pages ranked as current — the S409 audit's stale
+    // c-store overview outranked its own named successor. All four signals
+    // now demote (same 0.45 factor; still a demote, not an exclude).
     const rows = await sql`
       SELECT id FROM pages
        WHERE id = ANY(${pageIds}::int[])
-         AND lower(frontmatter ->> 'status') = 'superseded'
+         AND (
+           lower(frontmatter ->> 'status') IN ('superseded', 'deprecated', 'retired')
+           OR frontmatter ? 'superseded_by'
+           OR lower(frontmatter ->> 'freshness') = 'stale'
+         )
     `;
     for (const r of rows as unknown as { id: number }[]) result.add(Number(r.id));
     return result;
@@ -3605,15 +3614,23 @@ export class PostgresEngine implements BrainEngine {
     // Composite-keyed: a page is unique by (source_id, slug). unnest the
     // two arrays in lockstep so multi-source brains don't fan out across
     // sources (codex pass-1 finding #3).
+    // S409: a 'fallback' effective date IS updated_at — and a vault re-sync
+    // touches updated_at without changing a word, so sync churn was buying
+    // months-old pages a positive recency boost (measured live: a stale
+    // month-old overview at 1.74×). Fallback-dated pages now emit NO date
+    // → applyRecencyBoost skips them → recency-neutral, never recency-boosted.
     const rows = await sql`
-      SELECT p.slug, p.source_id, COALESCE(p.effective_date, p.updated_at, p.created_at) AS ts
+      SELECT p.slug, p.source_id,
+             CASE WHEN p.effective_date_source = 'fallback' THEN NULL
+                  ELSE COALESCE(p.effective_date, p.updated_at, p.created_at) END AS ts
         FROM pages p
         JOIN unnest(${slugs}::text[], ${sourceIds}::text[]) AS u(slug, source_id)
           ON p.slug = u.slug AND p.source_id = u.source_id
     `;
     const out = new Map<string, Date>();
     for (const raw of rows as unknown as Array<Record<string, unknown>>) {
-      const r = raw as { slug: string; source_id: string; ts: string | Date };
+      const r = raw as { slug: string; source_id: string; ts: string | Date | null };
+      if (r.ts == null) continue;
       const key = `${r.source_id}::${r.slug}`;
       out.set(key, r.ts instanceof Date ? r.ts : new Date(r.ts));
     }
