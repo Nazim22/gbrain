@@ -7,15 +7,15 @@
 // both supersession demotes, could hoist a retired page straight back to #1.
 //
 // Four contracts pinned here:
-//   1. getSupersededPageIds demotes the WIDENED lifecycle set (status
-//      superseded/deprecated/retired, superseded_by, freshness:stale).
+//   1. normalizeLifecycle persists the WIDENED lifecycle set as typed columns,
+//      which getSupersededPageIds reads without reparsing frontmatter.
 //   2. getEffectiveDates emits NO date for fallback-sourced pages, so
 //      applyRecencyBoost leaves them recency-neutral.
 //   3. applyAliasHop refuses to promote a lifecycle-demoted page: with a
 //      live successor it redirects the hop; without one it leaves the page
 //      to its already-demoted organic rank.
-//   4. stampPageDates stamps lifecycle_status / superseded_by / effective
-//      date+source and forces stale=true on any non-current page.
+//   4. stampPageDates stamps effective date+source only; lifecycle stamping and
+//      fail-closed stale metadata are covered by the post-rank policy contract.
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -28,6 +28,7 @@ import {
   successorSlugFrom,
 } from '../src/core/search/hybrid.ts';
 import { DEFAULT_FALLBACK } from '../src/core/search/recency-decay.ts';
+import { normalizeLifecycle } from '../src/core/lifecycle.ts';
 import type { SearchResult } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
@@ -61,6 +62,19 @@ async function insertPage(
   return Number(rows[0].id);
 }
 
+async function insertNormalizedPage(
+  slug: string,
+  frontmatter: Record<string, unknown>,
+): Promise<number> {
+  const id = await insertPage(slug, frontmatter);
+  const lifecycle = normalizeLifecycle(frontmatter);
+  await engine.executeRaw(
+    `UPDATE pages SET lifecycle_status = $2 WHERE id = $1`,
+    [id, lifecycle.lifecycle_status],
+  );
+  return id;
+}
+
 function res(slug: string, page_id: number, score: number): SearchResult {
   return {
     slug, page_id, score,
@@ -69,16 +83,16 @@ function res(slug: string, page_id: number, score: number): SearchResult {
   } as SearchResult;
 }
 
-describe('getSupersededPageIds — widened lifecycle set', () => {
-  it('demotes all four lifecycle signals, not just exact status:superseded', async () => {
+describe('getSupersededPageIds — normalized lifecycle columns', () => {
+  it('reads normalized lifecycle columns for all four legacy signals', async () => {
     const ids = {
-      superseded: await insertPage('p/superseded', { status: 'Superseded' }),
-      deprecated: await insertPage('p/deprecated', { status: 'deprecated' }),
-      retired: await insertPage('p/retired', { status: 'RETIRED' }),
-      pointer: await insertPage('p/pointer', { superseded_by: '[[p/current]]' }),
-      stale: await insertPage('p/stale', { freshness: 'stale' }),
-      current: await insertPage('p/current', { status: 'active' }),
-      bare: await insertPage('p/bare', {}),
+      superseded: await insertNormalizedPage('p/superseded', { status: 'Superseded' }),
+      deprecated: await insertNormalizedPage('p/deprecated', { status: 'deprecated' }),
+      retired: await insertNormalizedPage('p/retired', { status: 'RETIRED' }),
+      pointer: await insertNormalizedPage('p/pointer', { superseded_by: '[[p/current]]' }),
+      stale: await insertNormalizedPage('p/stale', { freshness: 'stale' }),
+      current: await insertNormalizedPage('p/current', { status: 'active' }),
+      bare: await insertNormalizedPage('p/bare', {}),
     };
     const demoted = await engine.getSupersededPageIds(Object.values(ids));
     expect(demoted.has(ids.superseded)).toBe(true);
@@ -187,49 +201,11 @@ describe('applyAliasHop — lifecycle gate', () => {
   });
 });
 
-describe('stampPageDates — current-truth metadata', () => {
-  it('stamps lifecycle, successor, effective date+source, and forces stale=true', async () => {
-    const oldId = await insertPage(
-      'p/stamp-old',
-      { status: 'superseded', superseded_by: '[[p/stamp-new]]' },
-      { effectiveDate: '2026-06-27', effectiveDateSource: 'frontmatter' },
-    );
-    const syncedId = await insertPage(
-      'p/stamp-synced',
-      {},
-      { effectiveDate: '2026-08-04', effectiveDateSource: 'fallback' },
-    );
-
-    const results = [res('p/stamp-old', oldId, 1.0), res('p/stamp-synced', syncedId, 0.8)];
-    await stampPageDates(engine, results);
-
-    const old = results[0];
-    expect(old.lifecycle_status).toBe('superseded');
-    expect(old.superseded_by).toBe('p/stamp-new');
-    expect(old.effective_date).toBe('2026-06-27');
-    expect(old.effective_date_source).toBe('frontmatter');
-    expect(old.stale).toBe(true); // never stale:false for a superseded page
-
-    const synced = results[1];
-    expect(synced.lifecycle_status).toBe('current');
-    expect(synced.effective_date_source).toBe('fallback');
-    expect(synced.stale).toBe(false); // current page: SQL verdict stands
-  });
-
+describe('stampPageDates — effective-date metadata', () => {
   it('never clears a SQL-computed stale=true on a current page', async () => {
     const id = await insertPage('p/sql-stale', {});
     const r = { ...res('p/sql-stale', id, 1.0), stale: true };
     await stampPageDates(engine, [r]);
     expect(r.stale).toBe(true);
-  });
-
-  it('R2: metadata-query FAILURE marks stale=true + lifecycle unknown — never a contradictory stale:false', async () => {
-    const brokenEngine = {
-      async executeRaw() { throw new Error('metadata query down'); },
-    } as unknown as typeof engine;
-    const r = res('p/unverifiable', 12345, 1.0); // stale:false from SQL
-    await stampPageDates(brokenEngine, [r]);
-    expect(r.lifecycle_status).toBe('unknown');
-    expect(r.stale).toBe(true); // fail-closed: unverified must not render fresh
   });
 });
