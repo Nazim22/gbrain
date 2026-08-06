@@ -97,6 +97,14 @@ CREATE TABLE IF NOT EXISTS pages (
   timeline      TEXT    NOT NULL DEFAULT '',
   frontmatter   JSONB   NOT NULL DEFAULT '{}',
   content_hash  TEXT,
+  -- v0.43 / migration v127: normalized structural knowledge lifecycle.
+  lifecycle_status TEXT NOT NULL DEFAULT 'current'
+                   CHECK (lifecycle_status IN ('current','superseded','historical','draft')),
+  superseded_by_page_id INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+  canonical_page_id     INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+  valid_from            TIMESTAMPTZ,
+  valid_until           TIMESTAMPTZ,
+  authored_at           TIMESTAMPTZ,
   -- v0.29: deterministic 0..1 score (tag emotion + take density + Garry-as-holder ratio).
   -- Populated by the `recompute_emotional_weight` cycle phase. Default 0.0 so freshly
   -- imported pages don't pollute salience ranking before the cycle has run.

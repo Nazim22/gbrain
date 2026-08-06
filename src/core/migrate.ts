@@ -5754,6 +5754,90 @@ export const MIGRATIONS: Migration[] = [
         WHERE NOT dead_letter;
     `,
   },
+  {
+    version: 127,
+    name: 'page_lifecycle_contract',
+    // S409 §1: frontmatter remains the authoring source, but retrieval must
+    // not reinterpret free-form JSON at rank time. Normalize lifecycle once,
+    // constrain the vocabulary, and resolve successor/canonical references as
+    // same-source typed FKs. The temporary parser makes malformed legacy dates
+    // NULL instead of aborting the census backfill.
+    idempotent: true,
+    sql: `
+      ALTER TABLE pages
+        ADD COLUMN IF NOT EXISTS lifecycle_status TEXT NOT NULL DEFAULT 'current',
+        ADD COLUMN IF NOT EXISTS superseded_by_page_id INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS canonical_page_id INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS authored_at TIMESTAMPTZ;
+
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'pages_lifecycle_status_check'
+        ) THEN
+          ALTER TABLE pages ADD CONSTRAINT pages_lifecycle_status_check
+            CHECK (lifecycle_status IN ('current', 'superseded', 'historical', 'draft'));
+        END IF;
+      END $$;
+
+      CREATE OR REPLACE FUNCTION gbrain_try_timestamptz(value TEXT)
+      RETURNS TIMESTAMPTZ
+      LANGUAGE plpgsql
+      SET search_path = pg_catalog, public
+      AS $fn$
+      BEGIN
+        IF value IS NULL OR btrim(value) = '' THEN RETURN NULL; END IF;
+        RETURN value::timestamptz;
+      EXCEPTION WHEN OTHERS THEN
+        RETURN NULL;
+      END;
+      $fn$;
+
+      UPDATE pages p
+         SET lifecycle_status = CASE
+               WHEN lower(p.frontmatter ->> 'status') = 'draft' THEN 'draft'
+               WHEN lower(p.frontmatter ->> 'status') = 'historical' THEN 'historical'
+               WHEN lower(p.frontmatter ->> 'status') IN ('superseded', 'deprecated', 'retired')
+                 OR NULLIF(btrim(p.frontmatter ->> 'superseded_by'), '') IS NOT NULL
+                 OR lower(p.frontmatter ->> 'freshness') = 'stale'
+                 THEN 'superseded'
+               ELSE 'current'
+             END,
+             valid_from = gbrain_try_timestamptz(p.frontmatter ->> 'valid_from'),
+             valid_until = gbrain_try_timestamptz(p.frontmatter ->> 'valid_until'),
+             authored_at = gbrain_try_timestamptz(p.frontmatter ->> 'authored_at');
+
+      UPDATE pages p
+         SET superseded_by_page_id = target.id
+        FROM pages target
+       WHERE target.source_id = p.source_id
+         AND target.slug = regexp_replace(
+           regexp_replace(btrim(p.frontmatter ->> 'superseded_by'), '^\\[\\[', ''),
+           '\\]\\]$', ''
+         )
+         AND target.id <> p.id;
+
+      UPDATE pages p
+         SET canonical_page_id = target.id
+        FROM pages target
+       WHERE target.source_id = p.source_id
+         AND target.slug = regexp_replace(
+           regexp_replace(btrim(p.frontmatter ->> 'canonical_page'), '^\\[\\[', ''),
+           '\\]\\]$', ''
+         )
+         AND target.id <> p.id;
+
+      DROP FUNCTION gbrain_try_timestamptz(TEXT);
+
+      CREATE INDEX IF NOT EXISTS pages_lifecycle_status_idx
+        ON pages (source_id, lifecycle_status);
+      CREATE INDEX IF NOT EXISTS pages_superseded_by_page_id_idx
+        ON pages (superseded_by_page_id) WHERE superseded_by_page_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS pages_canonical_page_id_idx
+        ON pages (canonical_page_id) WHERE canonical_page_id IS NOT NULL;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

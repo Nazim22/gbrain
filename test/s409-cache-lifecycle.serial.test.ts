@@ -106,15 +106,30 @@ describe('S409 cache-hit lifecycle revalidation', () => {
     expect(hit[0]?.slug).toBe('quantum-widget-guide');
     expect(hitMeta?.reranker?.status).toBe('bypassed');
 
-    // 3. Supersede the page AFTER the cache write.
+    // 3. Supersede the page AFTER the cache write and point at a typed
+    // successor. The normalized columns are authoritative; frontmatter stays
+    // only as the import source/back-compat record.
+    const successor = await engine.putPage('quantum-widget-guide-v2', {
+      type: 'note', title: 'Quantum Widget Guide v2',
+      compiled_truth: 'Current quantum widget deployment guide.',
+      frontmatter: { status: 'current' },
+      lifecycle_status: 'current',
+    });
+    await engine.upsertChunks('quantum-widget-guide-v2', [
+      { chunk_index: 0, chunk_text: 'Current quantum widget deployment guide.', chunk_source: 'compiled_truth' },
+    ]);
     await engine.executeRaw(
-      `UPDATE pages SET frontmatter = frontmatter || '{"status":"superseded"}'::text::jsonb
+      `UPDATE pages
+          SET frontmatter = frontmatter || '{"status":"superseded","superseded_by":"quantum-widget-guide-v2"}'::text::jsonb,
+              lifecycle_status = 'superseded',
+              superseded_by_page_id = $1
         WHERE slug = 'quantum-widget-guide'`,
+      [successor.id],
     );
 
     // 4. Same query again: the poisoned cache row must NOT be served as
-    // current — the lookup falls through to a fresh search whose results
-    // carry the demote + honest staleness.
+    // current. The mandatory cache-read policy resolves it to the live
+    // successor and never returns the retired row.
     let afterMeta: import('../src/core/types.ts').HybridSearchMeta | undefined;
     const after = await hybridSearchCached(engine, 'quantum widget deployment', {
       limit: 5,
@@ -122,11 +137,11 @@ describe('S409 cache-hit lifecycle revalidation', () => {
       onMeta: (m) => { afterMeta = m; },
     });
     expect(afterMeta?.cache?.status).not.toBe('hit');
-    const page = after.find((r) => r.slug === 'quantum-widget-guide');
-    if (page) {
-      expect(page.stale).toBe(true);
-      expect(page.lifecycle_status).toBe('superseded');
-      expect(page.superseded_demote).toBeDefined();
-    }
+    expect(after.some((r) => r.slug === 'quantum-widget-guide')).toBe(false);
+    expect(after[0]).toMatchObject({
+      slug: 'quantum-widget-guide-v2',
+      page_id: successor.id,
+      lifecycle_status: 'current',
+    });
   }, 30_000);
 });

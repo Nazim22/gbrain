@@ -1,5 +1,5 @@
 import type {
-  Page, PageInput, PageFilters, GetPageOpts,
+  Page, PageInput, PageFilters, GetPageOpts, PageLifecycle,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath, RelationalFanoutRow, RelationalFanoutOpts,
@@ -1343,6 +1343,8 @@ export interface BrainEngine {
    * Single SQL query, not N+1. Empty input → empty set (no query).
    */
   getSupersededPageIds(pageIds: number[]): Promise<Set<number>>;
+  /** v127: normalized typed lifecycle rows for mandatory post-rank policy. */
+  getPageLifecycles?(pageIds: number[]): Promise<Map<number, PageLifecycle>>;
   /**
    * v0.27.0: for a list of slugs, return their updated_at timestamps (or created_at fallback).
    * Used by hybrid search recency boost. Single SQL query, not N+1.

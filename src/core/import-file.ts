@@ -39,6 +39,7 @@ import { normalizeAliasList } from './search/alias-normalize.ts';
 import { isUndefinedTableError, warnOncePerProcess, validateSlug } from './utils.ts';
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { runGuardrails } from './guardrails.ts';
+import { normalizeLifecycle } from './lifecycle.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -791,6 +792,7 @@ export async function importFromContent(
       timeline: parsed.timeline || '',
       frontmatter: parsed.frontmatter,
       content_hash: hash,
+      ...normalizeLifecycle(parsed.frontmatter),
       effective_date: effectiveDate,
       effective_date_source: effectiveDateSource,
       import_filename: filenameForChain,
