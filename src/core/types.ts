@@ -27,6 +27,24 @@
 // - `synthesis` (v0.28): think-generated provenance pages.
 export type PageType = string;
 
+/** v127 normalized lifecycle vocabulary. */
+export type LifecycleStatus = 'current' | 'superseded' | 'historical' | 'draft';
+
+/** Batched lifecycle row used by every retrieval return path. */
+export interface PageLifecycle {
+  page_id: number;
+  source_id: string;
+  slug: string;
+  lifecycle_status: LifecycleStatus;
+  superseded_by_page_id: number | null;
+  superseded_by: string | null;
+  canonical_page_id: number | null;
+  canonical_slug: string | null;
+  valid_from: Date | null;
+  valid_until: Date | null;
+  authored_at: Date | null;
+}
+
 /**
  * v0.38: Seed list of types declared by the built-in `gbrain-base` schema
  * pack. NO LONGER exhaustive — schema packs add their own types via manifest.
@@ -91,6 +109,15 @@ export interface Page {
   timeline: string;
   frontmatter: Record<string, unknown>;
   content_hash?: string;
+  lifecycle_status?: LifecycleStatus;
+  superseded_by_page_id?: number | null;
+  canonical_page_id?: number | null;
+  valid_from?: Date | null;
+  valid_until?: Date | null;
+  authored_at?: Date | null;
+  /** Joined typed targets returned by getPage. */
+  superseded_by_slug?: string | null;
+  canonical_slug?: string | null;
   /** v0.29 — deterministic 0..1 score; populated by the recompute_emotional_weight cycle phase. */
   emotional_weight?: number;
   created_at: Date;
@@ -215,6 +242,13 @@ export interface PageInput {
   timeline?: string;
   frontmatter?: Record<string, unknown>;
   content_hash?: string;
+  /** v127 normalized lifecycle columns; importFromContent owns derivation. */
+  lifecycle_status?: LifecycleStatus;
+  superseded_by_slug?: string | null;
+  canonical_slug?: string | null;
+  valid_from?: Date | null;
+  valid_until?: Date | null;
+  authored_at?: Date | null;
   /**
    * v0.19.0: distinguishes markdown vs code pages at the DB level. Defaults
    * to 'markdown' when omitted so existing callers work unchanged. Set to
@@ -700,17 +734,14 @@ export interface SearchResult {
    * it is stale (S399).
    */
   updated_at?: string;
-  /**
-   * S409 lifecycle status derived from frontmatter: 'superseded' |
-   * 'deprecated' | 'retired' | 'stale' | 'current'. Stamped post-fusion by
-   * `stampPageDates` (which also backfills the v0.34 effective_date /
-   * effective_date_source fields below for paths whose SQL didn't project
-   * them). Anything non-current also forces `stale: true` — a page that
-   * names its own replacement must never render as fresh.
-   */
-  lifecycle_status?: string;
-  /** Successor slug from `frontmatter.superseded_by`, wikilink-stripped. */
+  /** v127 normalized lifecycle status stamped after ranking. */
+  lifecycle_status?: LifecycleStatus | 'unknown';
+  /** Typed successor slug joined from pages.superseded_by_page_id. */
   superseded_by?: string;
+  /** Typed successor identity from pages.superseded_by_page_id. */
+  superseded_by_page_id?: number;
+  /** Set when current-state retrieval replaced this result with its successor. */
+  lifecycle_redirected_from?: string;
   /**
    * v0.42 (issue #1699) content-quality gate agent-warning channel. Set
    * when the result's page carries a `frontmatter.content_flag` marker

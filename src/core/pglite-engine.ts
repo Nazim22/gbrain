@@ -27,7 +27,7 @@ import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
 import { getFtsLanguage } from './fts-language.ts';
 import type {
-  Page, PageInput, PageFilters, PageType,
+  Page, PageInput, PageFilters, PageType, PageLifecycle,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
@@ -976,6 +976,9 @@ export class PGLiteEngine implements BrainEngine {
     }
     const { rows } = await this.db.query(
       `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+              lifecycle_status, superseded_by_page_id, canonical_page_id, valid_from, valid_until, authored_at,
+              (SELECT slug FROM pages target WHERE target.id = pages.superseded_by_page_id) AS superseded_by_slug,
+              (SELECT slug FROM pages target WHERE target.id = pages.canonical_page_id) AS canonical_slug,
               effective_date, effective_date_source,
               source_kind, source_uri, ingested_via, ingested_at
        FROM pages WHERE ${where.join(' AND ')} LIMIT 1`,
@@ -1062,6 +1065,43 @@ export class PGLiteEngine implements BrainEngine {
        RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
       [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
     );
+
+    if (page.lifecycle_status !== undefined) {
+      const validFrom = page.valid_from instanceof Date ? page.valid_from.toISOString() : null;
+      const validUntil = page.valid_until instanceof Date ? page.valid_until.toISOString() : null;
+      const authoredAt = page.authored_at instanceof Date ? page.authored_at.toISOString() : null;
+      await this.db.query(
+        `UPDATE pages p
+            SET lifecycle_status = $1,
+                superseded_by_page_id = (SELECT target.id FROM pages target WHERE target.source_id = p.source_id AND target.slug = $2 LIMIT 1),
+                canonical_page_id = (SELECT target.id FROM pages target WHERE target.source_id = p.source_id AND target.slug = $3 LIMIT 1),
+                valid_from = $4::timestamptz,
+                valid_until = $5::timestamptz,
+                authored_at = $6::timestamptz
+          WHERE p.source_id = $7 AND p.slug = $8`,
+        [page.lifecycle_status, page.superseded_by_slug, page.canonical_slug, validFrom, validUntil, authoredAt, sourceId, slug],
+      );
+      // Resolve predecessor-before-successor imports without cross-source links.
+      await this.db.query(
+        `UPDATE pages p SET superseded_by_page_id = target.id
+           FROM pages target
+          WHERE target.source_id = p.source_id AND target.slug = $1
+            AND p.source_id = $2 AND p.id <> target.id
+            AND NULLIF(btrim(regexp_replace(COALESCE(p.frontmatter->>'superseded_by', p.frontmatter->>'replaced_by'), '^\\[\\[|\\]\\]$', '', 'g')), '') = target.slug`,
+        [slug, sourceId],
+      );
+      await this.db.query(
+        `UPDATE pages p SET canonical_page_id = target.id
+           FROM pages target
+          WHERE target.source_id = p.source_id AND target.slug = $1
+            AND p.source_id = $2 AND p.id <> target.id
+            AND NULLIF(btrim(regexp_replace(p.frontmatter->>'canonical_page', '^\\[\\[|\\]\\]$', '', 'g')), '') = target.slug`,
+        [slug, sourceId],
+      );
+      const lifecyclePage = await this.getPage(slug, { sourceId });
+      if (lifecyclePage) return lifecyclePage;
+    }
+
     // PGLite can return zero rows from INSERT ... ON CONFLICT DO UPDATE ...
     // RETURNING in no-op/trigger edge cases, which made rowToPage(undefined)
     // throw "undefined is not an object (evaluating 'row.deleted_at')" and
@@ -3410,20 +3450,47 @@ export class PGLiteEngine implements BrainEngine {
   async getSupersededPageIds(pageIds: number[]): Promise<Set<number>> {
     const result = new Set<number>();
     if (pageIds.length === 0) return result;
-    // Parity with PostgresEngine.getSupersededPageIds (S393; S409 lifecycle
-    // widening — superseded/deprecated/retired status, superseded_by,
-    // freshness:stale all demote).
+    // v127 normalized lifecycle columns are authoritative for ranking.
     const { rows } = await this.db.query(
       `SELECT id FROM pages
         WHERE id = ANY($1::int[])
-          AND (
-            lower(frontmatter ->> 'status') IN ('superseded', 'deprecated', 'retired')
-            OR frontmatter ? 'superseded_by'
-            OR lower(frontmatter ->> 'freshness') = 'stale'
-          )`,
+          AND lifecycle_status <> 'current'`,
       [pageIds]
     );
     for (const r of rows as { id: number }[]) result.add(Number(r.id));
+    return result;
+  }
+
+  async getPageLifecycles(pageIds: number[]): Promise<Map<number, PageLifecycle>> {
+    const result = new Map<number, PageLifecycle>();
+    if (pageIds.length === 0) return result;
+    const { rows } = await this.db.query(
+      `SELECT p.id AS page_id, p.source_id, p.slug, p.lifecycle_status,
+              p.superseded_by_page_id, successor.slug AS superseded_by,
+              p.canonical_page_id, canonical.slug AS canonical_slug,
+              p.valid_from, p.valid_until, p.authored_at
+         FROM pages p
+         LEFT JOIN pages successor ON successor.id = p.superseded_by_page_id
+         LEFT JOIN pages canonical ON canonical.id = p.canonical_page_id
+        WHERE p.id = ANY($1::int[])`,
+      [pageIds],
+    );
+    for (const row of rows as Array<Record<string, unknown>>) {
+      const id = Number(row.page_id);
+      result.set(id, {
+        page_id: id,
+        source_id: String(row.source_id),
+        slug: String(row.slug),
+        lifecycle_status: row.lifecycle_status as PageLifecycle['lifecycle_status'],
+        superseded_by_page_id: row.superseded_by_page_id == null ? null : Number(row.superseded_by_page_id),
+        superseded_by: row.superseded_by == null ? null : String(row.superseded_by),
+        canonical_page_id: row.canonical_page_id == null ? null : Number(row.canonical_page_id),
+        canonical_slug: row.canonical_slug == null ? null : String(row.canonical_slug),
+        valid_from: row.valid_from == null ? null : new Date(String(row.valid_from)),
+        valid_until: row.valid_until == null ? null : new Date(String(row.valid_until)),
+        authored_at: row.authored_at == null ? null : new Date(String(row.authored_at)),
+      });
+    }
     return result;
   }
 

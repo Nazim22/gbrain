@@ -35,6 +35,8 @@ import { stampEvidence } from './evidence.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
 import { enforceTokenBudget } from './token-budget.ts';
 import { warnOncePerProcess } from '../utils.ts';
+import { applyLifecyclePolicy, hasHistoricalIntent } from '../lifecycle.ts';
+export { applyLifecyclePolicy, hasHistoricalIntent as isHistoricalLifecycleIntent } from '../lifecycle.ts';
 import { recordSearchTelemetry } from './telemetry.ts';
 import {
   weightsForIntent,
@@ -86,12 +88,8 @@ export async function stampPageDates(engine: BrainEngine, results: SearchResult[
     const rows = await engine.executeRaw<{
       id: number; created_at: string | Date | null; updated_at: string | Date | null;
       effective_date: string | Date | null; effective_date_source: string | null;
-      fm_status: string | null; fm_freshness: string | null; fm_superseded_by: string | null;
     }>(
-      `SELECT id, created_at, updated_at, effective_date, effective_date_source,
-              lower(frontmatter ->> 'status') AS fm_status,
-              lower(frontmatter ->> 'freshness') AS fm_freshness,
-              frontmatter ->> 'superseded_by' AS fm_superseded_by
+      `SELECT id, created_at, updated_at, effective_date, effective_date_source
          FROM pages WHERE id = ANY($1::int[])`,
       [ids],
     );
@@ -101,72 +99,31 @@ export async function stampPageDates(engine: BrainEngine, results: SearchResult[
       return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
     };
     const byId = new Map<number, string>();
-    // S409 — current-truth metadata rides the same lookup: effective date +
-    // its source (fallback = "this is really updated_at"), and a lifecycle
-    // verdict from frontmatter. A page carrying superseded/deprecated/
-    // retired status, a superseded_by pointer, or freshness:stale must
-    // never reach the caller as `stale: false` (the live S409 failure:
-    // a month-stale overview rendered stale:false with a 1.74× boost).
-    const metaById = new Map<number, {
-      effective_date?: string; effective_date_source?: string;
-      lifecycle_status: string; superseded_by?: string;
-    }>();
+    const effectiveById = new Map<number, { date?: string; source?: string }>();
     for (const row of rows ?? []) {
-      const status = row.fm_status ?? '';
-      const successor = (row.fm_superseded_by ?? '').replace(/^\[\[|\]\]$/g, '').trim();
-      const lifecycle =
-        status === 'superseded' || status === 'deprecated' || status === 'retired' ? status
-        : successor ? 'superseded'
-        : (row.fm_freshness ?? '') === 'stale' ? 'stale'
-        : 'current';
-      metaById.set(row.id, {
-        effective_date: day(row.effective_date) ?? undefined,
-        effective_date_source: row.effective_date_source ?? undefined,
-        lifecycle_status: lifecycle,
-        superseded_by: successor || undefined,
-      });
       const created = day(row.created_at);
       const updated = day(row.updated_at);
-      if (!created) { if (updated) byId.set(row.id, updated); continue; }
-      // `updated_at` ALONE is actively misleading: a vault re-sync touches it
-      // without changing a word, so months-old knowledge renders as fresh.
-      // Measured 2026-08-01: 2,644 of 15,811 pages (17%) carry that gap — and
-      // the S300 page that wrongly claimed `synthesize_concepts` was "dead"
-      // was written 06-20 but stamped 07-28. Showing only the touch date
-      // would have made the day's most misleading page look current.
-      //
-      // So: authored date first (how old is this CLAIM), arrow to the revision
-      // date only when they differ. `2026-06-20→07-28` reads as "written June,
-      // touched July" — enough to judge without a second lookup.
-      byId.set(row.id, updated && updated !== created
-        ? `${created}→${updated.slice(5)}`
-        : created);
+      if (!created) { if (updated) byId.set(row.id, updated); }
+      else {
+        byId.set(row.id, updated && updated !== created
+          ? `${created}→${updated.slice(5)}`
+          : created);
+      }
+      effectiveById.set(row.id, {
+        date: day(row.effective_date) ?? undefined,
+        source: row.effective_date_source ?? undefined,
+      });
     }
-    for (const r of results) {
-      const d = byId.get(r.page_id);
-      if (d) r.updated_at = d;
-      const m = metaById.get(r.page_id);
-      if (!m) continue;
-      if (m.effective_date) r.effective_date = m.effective_date;
-      if (m.effective_date_source) r.effective_date_source = m.effective_date_source;
-      r.lifecycle_status = m.lifecycle_status;
-      if (m.superseded_by) r.superseded_by = m.superseded_by;
-      // One-way: lifecycle can force stale=true, never clear a SQL-computed true.
-      if (m.lifecycle_status !== 'current') r.stale = true;
+    for (const result of results) {
+      const updated = byId.get(result.page_id);
+      if (updated) result.updated_at = updated;
+      const effective = effectiveById.get(result.page_id);
+      if (effective?.date) result.effective_date = effective.date;
+      if (effective?.source) result.effective_date_source = effective.source;
     }
   } catch {
-    // Best-effort for retrieval availability — but never SILENT and never
-    // internally contradictory (S409 Dae review R1): 'unknown' alone left
-    // the SQL-hardcoded `stale:false` standing next to it. While `stale`
-    // is a required boolean, the ONLY fail-closed representation is
-    // stale:true — an unverified page must render with the warning, not as
-    // fresh. lifecycle_status='unknown' tells callers WHY it is flagged.
-    for (const r of results) {
-      if (r.lifecycle_status === undefined) {
-        r.lifecycle_status = 'unknown';
-        r.stale = true;
-      }
-    }
+    // Date display metadata is best-effort. Lifecycle authority is enforced
+    // separately by applyLifecyclePolicy from normalized v127 columns.
   }
 }
 
@@ -1460,8 +1417,9 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(noEmbedHopped);
-    const noEmbedSliced = noEmbedHopped.slice(offset, offset + limit);
+    const noEmbedPolicy = await applyLifecyclePolicy(engine, noEmbedHopped, query);
+    stampEvidence(noEmbedPolicy);
+    const noEmbedSliced = noEmbedPolicy.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
@@ -1694,8 +1652,9 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(kwHopped);
-    const kwSliced = kwHopped.slice(offset, offset + limit);
+    const kwPolicy = await applyLifecyclePolicy(engine, kwHopped, query);
+    stampEvidence(kwPolicy);
+    const kwSliced = kwPolicy.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
@@ -1905,12 +1864,13 @@ export async function hybridSearch(
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
   });
+  const lifecycleFiltered = await applyLifecyclePolicy(engine, aliasHopped, query);
 
   // T4 — stamp evidence + create_safety so the agent's don't-duplicate
   // decision keys off WHY a page matched, not a raw blended score. Stamp on
   // the full alias-hopped set before any adaptive trim so the kept results
   // carry evidence regardless of where the cap lands.
-  stampEvidence(aliasHopped);
+  stampEvidence(lifecycleFiltered);
 
   // v0.42 — intent-aware adaptive return-sizing (opt-in, default off). Trim
   // the ranked candidate set to an intent-driven cap BEFORE the limit slice,
@@ -1922,10 +1882,10 @@ export async function hybridSearch(
     opts?.adaptiveReturn,
     adaptiveReturnFromConfig(cfgForColumn as Record<string, unknown> | null),
   );
-  let returnPool = aliasHopped;
+  let returnPool = lifecycleFiltered;
   let adaptiveDecision: AdaptiveReturnDecision | undefined;
   if (adaptiveCfg.enabled && offset === 0) {
-    const r = applyAdaptiveReturn(aliasHopped, suggestions.intent, adaptiveCfg);
+    const r = applyAdaptiveReturn(lifecycleFiltered, suggestions.intent, adaptiveCfg);
     returnPool = r.kept;
     adaptiveDecision = r.decision;
   }
@@ -2106,7 +2066,8 @@ export async function hybridSearchCached(
     (opts?.walkDepth ?? 0) > 0 ||
     Boolean(opts?.nearSymbol) ||
     isNonDefaultColumn ||
-    adaptiveReturnOn;
+    adaptiveReturnOn ||
+    hasHistoricalIntent(query);
 
   let cacheStatus: 'hit' | 'miss' | 'disabled' = skipCache ? 'disabled' : 'miss';
   let cacheSimilarity: number | undefined;
@@ -2151,28 +2112,26 @@ export async function hybridSearchCached(
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
     const hit = await cache.lookup(queryEmbedding, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash });
-    // S409 (Dae review P0) — lifecycle revalidation at cache-READ time. A
-    // cache row written while a page was current kept serving it as current
-    // rank-1 (stale:false) after the page was superseded, until TTL expiry —
-    // bypassing the whole Slice A containment. Policy: if ANY cached hit
-    // page is lifecycle-demoted NOW, or the check itself fails, the row is
-    // NOT served (fail-closed for current truth) and the lookup falls
-    // through to a fresh search, whose ranking applies the demotes and
-    // whose writeback re-caches a clean row. Clean rows get their
-    // date/lifecycle stamps refreshed so cached metadata can't rot either.
+    // S409 — replay cached rows through the same normalized-column lifecycle
+    // policy as uncached results. Historical-intent queries bypass cache above;
+    // a current-truth hit is servable only when policy preserves every row and
+    // identity. A redirect/drop/unknown lifecycle invalidates the row and
+    // falls through to a fresh search.
     let cacheRowServable = false;
     if (hit.hit && hit.results) {
       try {
-        const cachedIds = [...new Set(hit.results
-          .map((r) => r.page_id)
-          .filter((n): n is number => typeof n === 'number' && Number.isFinite(n)))];
-        const demotedNow = await engine.getSupersededPageIds(cachedIds);
-        if (demotedNow.size === 0) {
+        const validated = await applyLifecyclePolicy(engine, hit.results, query);
+        cacheRowServable =
+          validated.length === hit.results.length &&
+          validated.every((result, index) =>
+            result.page_id === hit.results![index]?.page_id &&
+            result.lifecycle_status === 'current');
+        if (cacheRowServable) {
+          hit.results = validated;
           await stampPageDates(engine, hit.results);
-          cacheRowServable = true;
         }
       } catch {
-        cacheRowServable = false; // unverified lifecycle: never serve as current
+        cacheRowServable = false;
       }
     }
     if (hit.hit && hit.results && cacheRowServable) {

@@ -37,7 +37,7 @@ import {
 import { getFtsLanguage } from './fts-language.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import type {
-  Page, PageInput, PageFilters, PageType,
+  Page, PageInput, PageFilters, PageType, PageLifecycle,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
@@ -1028,6 +1028,9 @@ export class PostgresEngine implements BrainEngine {
       const deletedCondition = includeDeleted ? tx`` : tx`AND deleted_at IS NULL`;
       const rows = await tx`
         SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+               lifecycle_status, superseded_by_page_id, canonical_page_id, valid_from, valid_until, authored_at,
+               (SELECT slug FROM pages target WHERE target.id = pages.superseded_by_page_id) AS superseded_by_slug,
+               (SELECT slug FROM pages target WHERE target.id = pages.canonical_page_id) AS canonical_slug,
                effective_date, effective_date_source,
                source_kind, source_uri, ingested_via, ingested_at
         FROM pages
@@ -1123,6 +1126,34 @@ export class PostgresEngine implements BrainEngine {
         ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at
     `;
+    if (page.lifecycle_status !== undefined) {
+      await sql`
+        UPDATE pages p
+           SET lifecycle_status = ${page.lifecycle_status},
+               superseded_by_page_id = (SELECT target.id FROM pages target WHERE target.source_id = p.source_id AND target.slug = ${page.superseded_by_slug ?? null} LIMIT 1),
+               canonical_page_id = (SELECT target.id FROM pages target WHERE target.source_id = p.source_id AND target.slug = ${page.canonical_slug ?? null} LIMIT 1),
+               valid_from = ${page.valid_from ?? null},
+               valid_until = ${page.valid_until ?? null},
+               authored_at = ${page.authored_at ?? null}
+         WHERE p.source_id = ${sourceId} AND p.slug = ${slug}
+      `;
+      await sql`
+        UPDATE pages p SET superseded_by_page_id = target.id
+          FROM pages target
+         WHERE target.source_id = p.source_id AND target.slug = ${slug}
+           AND p.source_id = ${sourceId} AND p.id <> target.id
+           AND NULLIF(btrim(regexp_replace(COALESCE(p.frontmatter->>'superseded_by', p.frontmatter->>'replaced_by'), '^\\[\\[|\\]\\]$', '', 'g')), '') = target.slug
+      `;
+      await sql`
+        UPDATE pages p SET canonical_page_id = target.id
+          FROM pages target
+         WHERE target.source_id = p.source_id AND target.slug = ${slug}
+           AND p.source_id = ${sourceId} AND p.id <> target.id
+           AND NULLIF(btrim(regexp_replace(p.frontmatter->>'canonical_page', '^\\[\\[|\\]\\]$', '', 'g')), '') = target.slug
+      `;
+      const lifecyclePage = await this.getPage(slug, { sourceId });
+      if (lifecyclePage) return lifecyclePage;
+    }
     return rowToPage(rows[0]);
   }
 
@@ -3578,21 +3609,46 @@ export class PostgresEngine implements BrainEngine {
     const result = new Set<number>();
     if (pageIds.length === 0) return result;
     const sql = this.sql;
-    // S409 lifecycle widening: exact `status: superseded` was the ONLY demote
-    // trigger, so `deprecated`/`retired`, an explicit `superseded_by`, and
-    // `freshness: stale` pages ranked as current — the S409 audit's stale
-    // c-store overview outranked its own named successor. All four signals
-    // now demote (same 0.45 factor; still a demote, not an exclude).
+    // v127 normalized lifecycle columns are authoritative for ranking.
     const rows = await sql`
       SELECT id FROM pages
        WHERE id = ANY(${pageIds}::int[])
-         AND (
-           lower(frontmatter ->> 'status') IN ('superseded', 'deprecated', 'retired')
-           OR frontmatter ? 'superseded_by'
-           OR lower(frontmatter ->> 'freshness') = 'stale'
-         )
+         AND lifecycle_status <> 'current'
     `;
     for (const r of rows as unknown as { id: number }[]) result.add(Number(r.id));
+    return result;
+  }
+
+  async getPageLifecycles(pageIds: number[]): Promise<Map<number, PageLifecycle>> {
+    const result = new Map<number, PageLifecycle>();
+    if (pageIds.length === 0) return result;
+    const sql = this.sql;
+    const rows = await sql`
+      SELECT p.id AS page_id, p.source_id, p.slug, p.lifecycle_status,
+             p.superseded_by_page_id, successor.slug AS superseded_by,
+             p.canonical_page_id, canonical.slug AS canonical_slug,
+             p.valid_from, p.valid_until, p.authored_at
+        FROM pages p
+        LEFT JOIN pages successor ON successor.id = p.superseded_by_page_id
+        LEFT JOIN pages canonical ON canonical.id = p.canonical_page_id
+       WHERE p.id = ANY(${pageIds}::int[])
+    `;
+    for (const row of rows as unknown as Array<Record<string, unknown>>) {
+      const id = Number(row.page_id);
+      result.set(id, {
+        page_id: id,
+        source_id: String(row.source_id),
+        slug: String(row.slug),
+        lifecycle_status: row.lifecycle_status as PageLifecycle['lifecycle_status'],
+        superseded_by_page_id: row.superseded_by_page_id == null ? null : Number(row.superseded_by_page_id),
+        superseded_by: row.superseded_by == null ? null : String(row.superseded_by),
+        canonical_page_id: row.canonical_page_id == null ? null : Number(row.canonical_page_id),
+        canonical_slug: row.canonical_slug == null ? null : String(row.canonical_slug),
+        valid_from: row.valid_from == null ? null : new Date(String(row.valid_from)),
+        valid_until: row.valid_until == null ? null : new Date(String(row.valid_until)),
+        authored_at: row.authored_at == null ? null : new Date(String(row.authored_at)),
+      });
+    }
     return result;
   }
 
