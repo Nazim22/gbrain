@@ -321,6 +321,41 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
 const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
 
 /**
+ * S411 request sizing (Mnemo escalation 2026-08-06: a 17,063-token request
+ * exceeded the effective 16,384-token context; the phase treated the
+ * deterministic overflow as transient and retried it toward dead-letter,
+ * burning the LLM-work window). A page body that cannot fit MUST be
+ * truncated to fit — retrying an oversized request can never succeed.
+ * Budget is in chars (~4 chars/token heuristic): 40k chars ≈ 10k tokens,
+ * leaving headroom inside a 16k context for the prompt scaffold, the fence
+ * rows, and maxTokens=2048 output. Same defect class + remedy as the S409
+ * reranker per-doc cap.
+ */
+export const MAX_PAGE_BODY_CHARS = Math.max(
+  4_000,
+  Number(process.env.GBRAIN_PROPOSE_TAKES_MAX_BODY_CHARS ?? 40_000) || 40_000,
+);
+/** Fence rows are dedup CONTEXT, not the work product — cap them too. */
+export const MAX_FENCE_ROWS_FOR_DEDUP = 50;
+const TRUNCATION_MARKER =
+  '\n\n[TRUNCATED by gbrain: page exceeds the extractor context budget; prose beyond this point was not scanned this run]';
+
+/**
+ * Build the extractor prompt with hard request-sizing caps. Exported so
+ * tests can assert the bound without a gateway call.
+ */
+export function buildExtractorPrompt(input: Parameters<ProposeTakesExtractor>[0]): string {
+  const body =
+    input.pageBody.length > MAX_PAGE_BODY_CHARS
+      ? input.pageBody.slice(0, MAX_PAGE_BODY_CHARS) + TRUNCATION_MARKER
+      : input.pageBody;
+  const fenceRows = input.existingTakes.slice(0, MAX_FENCE_ROWS_FOR_DEDUP);
+  return EXTRACT_TAKES_PROMPT
+    .replace('{EXISTING_TAKES_JSON}', JSON.stringify(fenceRows, null, 2))
+    .replace('{PAGE_BODY}', body);
+}
+
+/**
  * Production extractor — calls gateway.chat with the EXTRACT_TAKES_PROMPT
  * and parses the JSON array output. Returns [] on parse failure (logged as
  * warning, not thrown — one bad page must not abort the phase).
@@ -333,9 +368,7 @@ const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
 export async function defaultExtractor(
   input: Parameters<ProposeTakesExtractor>[0],
 ): Promise<ProposedTake[]> {
-  const prompt = EXTRACT_TAKES_PROMPT
-    .replace('{EXISTING_TAKES_JSON}', JSON.stringify(input.existingTakes, null, 2))
-    .replace('{PAGE_BODY}', input.pageBody);
+  const prompt = buildExtractorPrompt(input);
 
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
