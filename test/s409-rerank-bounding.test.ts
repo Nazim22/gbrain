@@ -34,7 +34,8 @@ describe('S409 reranker input bounding', () => {
       },
     });
     expect(sentDocs[0]!.length).toBe(MAX_RERANK_DOC_CHARS);
-    expect(sentDocs[1]).toBe('small');
+    expect(sentDocs[0]).toStartWith('Title: a\n\n');
+    expect(sentDocs[1]).toBe('Title: b\n\nsmall');
     expect(status?.status).toBe('applied');
     expect(status?.docs).toBe(2);
     expect(status?.truncated_docs).toBe(1);

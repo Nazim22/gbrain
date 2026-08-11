@@ -99,14 +99,18 @@ export async function applyReranker(
   const head = results.slice(0, opts.topNIn);
   const tail = results.slice(opts.topNIn);
 
-  // Document text — chunk_text is the matched span. Fall back to title if
-  // empty (shouldn't happen in practice; defensive). Empty docs would
-  // confuse the reranker, but we still send them — the upstream model decides.
-  // S409: bound each document (see MAX_RERANK_DOC_CHARS) so one oversized
-  // chunk cannot capacity-fail the whole batch.
+  // Reranker input must retain page identity. Passing only the matched span turns
+  // a canonical named page into an orphaned paragraph and systematically favors
+  // terse generated derivatives whose whole claim fits in one chunk. The title
+  // is retrieval evidence, not a rank boost: the cross-encoder still decides
+  // relevance from the query + bounded document text.
   let truncatedDocs = 0;
   const documents = head.map(r => {
-    const text = r.chunk_text || r.title || '';
+    const title = r.title?.trim() ?? '';
+    const body = r.chunk_text || '';
+    const text = title
+      ? (body ? `Title: ${title}\n\n${body}` : `Title: ${title}`)
+      : body;
     if (text.length > MAX_RERANK_DOC_CHARS) {
       truncatedDocs += 1;
       return text.slice(0, MAX_RERANK_DOC_CHARS);
