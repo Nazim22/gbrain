@@ -127,7 +127,7 @@ describe('applyReranker — happy path', () => {
     });
 
     expect(sentDocument).toBe(
-      'Title: ADR-005: Tenancy — Silo (one database per store)\n\nLong-form rationale body.',
+      'Long-form rationale body.\n\nTitle: ADR-005: Tenancy — Silo (one database per store)',
     );
   });
 
@@ -143,8 +143,8 @@ describe('applyReranker — happy path', () => {
       topNOut: null,
       rerankerFn: async (input) => {
         expect(input.documents).toEqual([
-          'Title: CStoreGenie Register Write Programme\n\nCanonical programme detail.',
-          'Title: Register write review summary\n\nGenerated restatement.',
+          'Canonical programme detail.\n\nTitle: CStoreGenie Register Write Programme',
+          'Generated restatement.\n\nTitle: Register write review summary',
         ]);
         return [
           { index: 1, relevanceScore: 0.9 },

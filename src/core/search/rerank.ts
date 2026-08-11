@@ -69,6 +69,7 @@ export interface RerankCallStatus {
 // ponytail: fixed char cap, not a tokenizer — swap for real token counting
 // if truncation shows up in relevance evals.
 export const MAX_RERANK_DOC_CHARS = 2000;
+const MAX_RERANK_TITLE_CHARS = 256;
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
 function hashQuery(query: string): string {
@@ -99,21 +100,23 @@ export async function applyReranker(
   const head = results.slice(0, opts.topNIn);
   const tail = results.slice(opts.topNIn);
 
-  // Reranker input must retain page identity. Passing only the matched span turns
-  // a canonical named page into an orphaned paragraph and systematically favors
-  // terse generated derivatives whose whole claim fits in one chunk. The title
-  // is retrieval evidence, not a rank boost: the cross-encoder still decides
-  // relevance from the query + bounded document text.
+  // Reranker input must retain page identity, but the matched passage remains
+  // primary. Suffixing the title gives the cross-encoder identity context without
+  // letting a descriptive title displace a more relevant passage merely because
+  // it occupies the highest-attention prefix. Reserve suffix space when bounding
+  // so oversized passages do not silently erase that identity context.
   let truncatedDocs = 0;
   const documents = head.map(r => {
     const title = r.title?.trim() ?? '';
     const body = r.chunk_text || '';
-    const text = title
-      ? (body ? `Title: ${title}\n\n${body}` : `Title: ${title}`)
-      : body;
+    const titleContext = title ? `Title: ${title.slice(0, MAX_RERANK_TITLE_CHARS)}` : '';
+    const suffix = body && titleContext ? `\n\n${titleContext}` : titleContext;
+    const text = `${body}${suffix}`;
     if (text.length > MAX_RERANK_DOC_CHARS) {
       truncatedDocs += 1;
-      return text.slice(0, MAX_RERANK_DOC_CHARS);
+      if (!suffix) return body.slice(0, MAX_RERANK_DOC_CHARS);
+      if (!body) return titleContext;
+      return `${body.slice(0, MAX_RERANK_DOC_CHARS - suffix.length)}${suffix}`;
     }
     return text;
   });
@@ -174,10 +177,6 @@ export async function applyReranker(
       // (telemetry, debug, autocut) can see the new ordering signal. Doesn't
       // replace `score` — that's RRF and other consumers may depend on it.
       item.rerank_score = r.relevanceScore;
-      // v0.40.4 attribution stamp (D12=A) — rank delta. Positive means
-      // rank improved (moved closer to top). new_index is the next
-      // push position in reorderedHead; original index was r.index.
-      item.reranker_delta = r.index - reorderedHead.length;
       reorderedHead.push(item);
     }
   }
@@ -186,6 +185,30 @@ export async function applyReranker(
   // of the head section so we don't silently lose recall.
   for (let i = 0; i < head.length; i++) {
     if (!seen.has(i)) reorderedHead.push(head[i]!);
+  }
+
+  // A deterministic exact-title winner at incoming rank 1 is named-page
+  // identity evidence, not a weak semantic suggestion. Preserve that one winner
+  // while leaving every ordinary result — and lower-ranked title matches — fully
+  // rerankable. This prevents the cross-encoder from erasing a canonical page in
+  // favor of richer derivatives that merely discuss it.
+  const protectedWinner = head[0]?.title_match_boost ? head[0] : undefined;
+  if (protectedWinner) {
+    const winnerIndex = reorderedHead.indexOf(protectedWinner);
+    if (winnerIndex > 0) {
+      const [winner] = reorderedHead.splice(winnerIndex, 1);
+      reorderedHead.unshift(winner!);
+    }
+  }
+
+  // v0.40.4 attribution stamp (D12=A) — rank delta after every ordering
+  // constraint. Positive means improved (moved closer to top).
+  for (let newIndex = 0; newIndex < reorderedHead.length; newIndex++) {
+    const item = reorderedHead[newIndex]!;
+    const originalIndex = head.indexOf(item);
+    if (originalIndex >= 0 && (seen.has(originalIndex) || item === protectedWinner)) {
+      item.reranker_delta = originalIndex - newIndex;
+    }
   }
 
   const combined = [...reorderedHead, ...tail];
