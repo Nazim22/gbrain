@@ -38,8 +38,8 @@ beforeAll(async () => {
 
   // Seed 5 pages sharing a keyword so the candidate pool is 5 deep.
   const pages: Array<[string, PageInput, string]> = [
-    ['notes/a', { type: 'note', title: 'A', compiled_truth: 'alpha keyword one' }, 'alpha keyword one chunk'],
-    ['notes/b', { type: 'note', title: 'B', compiled_truth: 'alpha keyword two' }, 'alpha keyword two chunk'],
+    ['notes/a', { type: 'note', title: 'Alpha Keyword Canonical', compiled_truth: 'alpha keyword one' }, 'alpha keyword one chunk'],
+    ['notes/b', { type: 'note', title: 'Alpha Keyword Secondary', compiled_truth: 'alpha keyword two' }, 'alpha keyword two chunk'],
     ['notes/c', { type: 'note', title: 'C', compiled_truth: 'alpha keyword three' }, 'alpha keyword three chunk'],
     ['notes/d', { type: 'note', title: 'D', compiled_truth: 'alpha keyword four' }, 'alpha keyword four chunk'],
     ['notes/e', { type: 'note', title: 'E', compiled_truth: 'alpha keyword five' }, 'alpha keyword five chunk'],
@@ -100,6 +100,56 @@ describe('autocut — fires on a real cliff', () => {
       reranker: rerankerOpts([0.98, 0.12, 0.1, 0.08, 0.05]),
     });
     expect(out.length).toBe(1);
+  });
+});
+
+describe('autocut — preserves the deterministic rank-1 title winner', () => {
+  test('keeps a scored title winner below the autocut threshold', async () => {
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      reranker: rerankerOpts([0.01, 0.95, 0.9, 0.1, 0.08]),
+    });
+
+    expect(out[0]!.slug).toBe('notes/a');
+    expect(out[0]!.title_match_boost).toBeGreaterThan(1);
+    expect(out[0]!.rerank_score).toBe(0.01);
+  });
+
+  test('does not preserve a lower-ranked title match below the autocut threshold', async () => {
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      reranker: rerankerOpts([0.01, 0.02, 0.95, 0.9, 0.1]),
+    });
+
+    expect(out[0]!.slug).toBe('notes/a');
+    expect(out.some((result) => result.slug === 'notes/b')).toBe(false);
+  });
+
+  test('keeps an omitted title winner when autocut trims scored results', async () => {
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      reranker: {
+        enabled: true,
+        topNIn: 30,
+        topNOut: null,
+        rerankerFn: async (input) => {
+          const titleWinnerIndex = input.documents.findIndex((document) =>
+            document.includes('Title: Alpha Keyword Canonical'));
+          return input.documents
+            .map((_, index) => ({
+              index,
+              relevanceScore: index === titleWinnerIndex
+                ? 0.01
+                : [0.95, 0.9, 0.1, 0.08][index] ?? 0.01,
+            }))
+            .filter(({ index }) => index !== titleWinnerIndex);
+        },
+      },
+    });
+
+    expect(out[0]!.slug).toBe('notes/a');
+    expect(out[0]!.title_match_boost).toBeGreaterThan(1);
+    expect(out[0]!.rerank_score).toBeUndefined();
   });
 });
 

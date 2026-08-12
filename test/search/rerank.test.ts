@@ -110,6 +110,54 @@ describe('applyReranker — happy path', () => {
     const out = await applyReranker('q', results, opts);
     expect((out[0] as any).rerank_score).toBe(0.42);
   });
+
+  test('reranks with page identity, not an orphaned chunk body', async () => {
+    const result = makeResult('projects/c-store/adr-005', 1.0, 'Long-form rationale body.');
+    result.title = 'ADR-005: Tenancy — Silo (one database per store)';
+    let sentDocument = '';
+
+    await applyReranker('why database per store', [result], {
+      enabled: true,
+      topNIn: 1,
+      topNOut: null,
+      rerankerFn: async (input) => {
+        sentDocument = input.documents[0]!;
+        return [{ index: 0, relevanceScore: 1 }];
+      },
+    });
+
+    expect(sentDocument).toBe(
+      'Long-form rationale body.\n\nTitle: ADR-005: Tenancy — Silo (one database per store)',
+    );
+  });
+
+  test('title framing does not force a canonical page above a higher-scored derivative', async () => {
+    const canonical = makeResult('projects/c-store/register-write-programme', 1.0, 'Canonical programme detail.');
+    canonical.title = 'CStoreGenie Register Write Programme';
+    const derivative = makeResult('atoms/derived-register-write-summary', 0.9, 'Generated restatement.');
+    derivative.title = 'Register write review summary';
+
+    const out = await applyReranker('which documents cover the register write programme', [canonical, derivative], {
+      enabled: true,
+      topNIn: 2,
+      topNOut: null,
+      rerankerFn: async (input) => {
+        expect(input.documents).toEqual([
+          'Canonical programme detail.\n\nTitle: CStoreGenie Register Write Programme',
+          'Generated restatement.\n\nTitle: Register write review summary',
+        ]);
+        return [
+          { index: 1, relevanceScore: 0.9 },
+          { index: 0, relevanceScore: 0.4 },
+        ];
+      },
+    });
+
+    expect(out.map(r => r.slug)).toEqual([
+      'atoms/derived-register-write-summary',
+      'projects/c-store/register-write-programme',
+    ]);
+  });
 });
 
 describe('applyReranker — CDX2-F16 null vs undefined semantics', () => {

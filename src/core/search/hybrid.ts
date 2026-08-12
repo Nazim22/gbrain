@@ -338,19 +338,26 @@ export function applySupersededDemote(
  * re-applied to the ordering signal the final ranking actually uses.
  *
  * Scales `rerank_score` by the same factor and re-sorts the reranked head
- * (the contiguous leading run of results carrying `rerank_score`) in place.
- * The un-reranked remainder keeps its order. Stable sort keeps ties fair.
+ * (the contiguous run of results carrying `rerank_score`) in place. A single
+ * leading unscored `title_match_boost` winner may precede that run when a
+ * partial reranker response omits the protected title winner; it stays fixed
+ * at index 0 while lifecycle demotion still applies behind it. The un-reranked
+ * remainder keeps its order. Stable sort keeps ties fair.
  */
 export function applySupersededDemotePostRerank(
   results: SearchResult[],
   supersededPageIds: Set<number>,
 ): void {
   if (supersededPageIds.size === 0) return;
-  let headEnd = 0;
+  const headStart = results[0]?.title_match_boost
+    && typeof results[0].rerank_score !== 'number'
+    ? 1
+    : 0;
+  let headEnd = headStart;
   while (headEnd < results.length && typeof results[headEnd]!.rerank_score === 'number') headEnd++;
-  if (headEnd === 0) return;
+  if (headEnd === headStart) return;
   let touched = false;
-  for (let i = 0; i < headEnd; i++) {
+  for (let i = headStart; i < headEnd; i++) {
     const r = results[i]!;
     if (!supersededPageIds.has(r.page_id)) continue;
     r.rerank_score = (r.rerank_score as number) * SUPERSEDED_DEMOTE_FACTOR;
@@ -359,9 +366,9 @@ export function applySupersededDemotePostRerank(
   }
   if (!touched) return;
   const head = results
-    .slice(0, headEnd)
+    .slice(headStart, headEnd)
     .sort((a, b) => (b.rerank_score as number) - (a.rerank_score as number));
-  for (let i = 0; i < headEnd; i++) results[i] = head[i]!;
+  for (let i = headStart; i < headEnd; i++) results[i] = head[i - headStart]!;
 }
 
 /**
@@ -1875,6 +1882,10 @@ export async function hybridSearch(
     ...(rerankerOpts as Record<string, unknown>),
     onStatus: (s: import('./rerank.ts').RerankCallStatus) => { rerankStatus = s; },
   };
+  // Capture the one deterministic title winner before reranking. applyReranker
+  // protects this exact incoming rank-1 object; downstream trimmers must preserve
+  // the same object rather than every result carrying a title-match stamp.
+  const protectedTitleWinner = deduped[0]?.title_match_boost ? deduped[0] : undefined;
   const reranked = rerankerOpts.enabled
     ? await applyReranker(query, deduped, rerankerOptsWithStatus as any)
     : deduped;
@@ -1947,10 +1958,11 @@ export async function hybridSearch(
       returnPool,
       (x) => x.rerank_score,
       { enabled: true, jumpRatio: resolvedMode.autocut_jump, minKeep: 1 },
-      // Preserve alias-hop exact matches: applyAliasHop injects the canonical
-      // page AFTER reranking, so it has no rerank_score. Without this it would
-      // be dropped whenever autocut cuts on the scored set (Codex P1).
-      (x) => x.alias_hit === true,
+      // Preserve exact structural winners. Alias hop runs after reranking and
+      // may inject an unscored canonical page. The deterministic title winner
+      // is captured by identity before reranking so lower-ranked title matches
+      // remain cuttable.
+      (x) => x.alias_hit === true || x === protectedTitleWinner,
     );
     returnPool = r.kept;
     autocutDecision = r.decision;

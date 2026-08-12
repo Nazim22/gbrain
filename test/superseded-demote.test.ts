@@ -107,6 +107,27 @@ describe('applySupersededDemotePostRerank', () => {
     expect(retired.superseded_demote).toBe(SUPERSEDED_DEMOTE_FACTOR);
   });
 
+  test('demotes the scored head behind an omitted protected title winner', () => {
+    const protectedWinner = rr('title-winner', 10);
+    protectedWinner.title_match_boost = 1.8;
+    const retired = rr('retired-scored', 1, 0.95);
+    const current = rr('current-scored', 2, 0.9);
+    const tail = rr('unreranked-tail', 3);
+    const results = [protectedWinner, retired, current, tail];
+
+    applySupersededDemotePostRerank(results, new Set([1]));
+
+    expect(results.map((result) => result.slug)).toEqual([
+      'title-winner',
+      'current-scored',
+      'retired-scored',
+      'unreranked-tail',
+    ]);
+    expect(protectedWinner.rerank_score).toBeUndefined();
+    expect(retired.rerank_score).toBeCloseTo(0.95 * SUPERSEDED_DEMOTE_FACTOR, 10);
+    expect(retired.superseded_demote).toBe(SUPERSEDED_DEMOTE_FACTOR);
+  });
+
   test('only the reranked head is touched — un-reranked tail keeps order and scores', () => {
     const headLive = rr('live-head', 1, 3.0);
     const headRetired = rr('retired-head', 2, 2.5);

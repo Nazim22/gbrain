@@ -16,7 +16,36 @@ import {
   runRetrievalQuality,
   evaluateGate,
   type SearchFn,
+  type NamedThingQuestion,
+  type QuestionResult,
 } from '../eval/retrieval-quality/harness.ts';
+
+/**
+ * Positional score companion for the existing PQ row. Position is load-bearing:
+ * fixture query text is not unique, so a query-keyed join can silently collapse
+ * duplicate questions. PQ retains the full ranked list; PQS adds fixture truth.
+ */
+export function formatQuestionScoreLine(
+  position: number,
+  question: NamedThingQuestion,
+  result: QuestionResult,
+): string {
+  const rank = question.family === 'hard-negative' || result.reciprocal_rank <= 0
+    ? '-'
+    : String(Math.round(1 / result.reciprocal_rank));
+  const relevant = question.relevant?.join(',') || '-';
+  const forbidden = question.forbidden?.join(',') || '-';
+  return [
+    'PQS',
+    String(position + 1),
+    question.family,
+    `hit1=${result.hit_at_1 ? 1 : 0}`,
+    `hit3=${result.hit_at_3 ? 1 : 0}`,
+    `rank=${rank}`,
+    `relevant=${relevant}`,
+    `forbidden=${forbidden}`,
+  ].join('\t');
+}
 
 export async function runEvalRetrievalQuality(engine: BrainEngine, args: string[]): Promise<void> {
   const json = args.includes('--json');
@@ -45,6 +74,9 @@ export async function runEvalRetrievalQuality(engine: BrainEngine, args: string[
       limit: 10,
       ...(sourceId ? { sourceId } : {}),
     });
+    // Stable artifact contract: one stderr row per fixture position with the
+    // complete ranked list. fixture-nightly.sh preserves evaluator stderr.
+    console.error(`PQ\t${q}\t${results.length}\t${results.map(r => r.slug).join(',')}`);
     return results.map(r => r.slug);
   };
 
@@ -92,6 +124,12 @@ export async function runEvalRetrievalQuality(engine: BrainEngine, args: string[
 
   const report = await runRetrievalQuality(questions, searchFn);
   const gate = evaluateGate(report);
+
+  // Join the existing PQ rows to fixture truth positionally. Do not key by
+  // query text: the fixture intentionally contains duplicate query strings.
+  report.questions.forEach((result, position) => {
+    console.error(formatQuestionScoreLine(position, questions[position]!, result));
+  });
 
   if (json) {
     console.log(JSON.stringify({ schema_version: 1, report, gate }, null, 2));
