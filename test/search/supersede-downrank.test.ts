@@ -25,6 +25,7 @@ import {
   SUPERSEDE_PENALTY,
   _resetSupersedeProbeForTests,
 } from '../../src/core/search/hybrid.ts';
+import { applyReranker } from '../../src/core/search/rerank.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { SearchResult } from '../../src/core/types.ts';
 
@@ -212,5 +213,54 @@ describe('applySupersedeDownrank', () => {
     expect(results[0]!.slug).toBe('notes/current');
     expect(retired.rerank_score).toBeCloseTo(2.4 * SUPERSEDE_PENALTY, 6);
     expect(retired.supersede_penalty).toBe(SUPERSEDE_PENALTY);
+  });
+
+  test('post-rerank supersession demotion preserves the protected title winner', async () => {
+    const canonical = res('notes/canonical', 1);
+    canonical.title_match_boost = 1.25;
+    const derivative = res('notes/derivative', 2);
+    const retired = res('notes/retired', 3);
+    retired.superseded = true;
+
+    const reranked = await applyReranker('canonical', [canonical, derivative, retired], {
+      enabled: true,
+      topNIn: 3,
+      topNOut: null,
+      rerankerFn: async () => [
+        { index: 1, relevanceScore: 0.9 },
+        { index: 2, relevanceScore: 0.8 },
+        { index: 0, relevanceScore: 0.1 },
+      ],
+    });
+    expect(reranked.map((r) => r.slug)).toEqual([
+      'notes/canonical',
+      'notes/derivative',
+      'notes/retired',
+    ]);
+
+    applySupersedeDownrankPostRerank(reranked);
+
+    expect(reranked.map((r) => r.slug)).toEqual([
+      'notes/canonical',
+      'notes/derivative',
+      'notes/retired',
+    ]);
+  });
+
+  test('signed reranker scores demote superseded rows downward', () => {
+    const current = res('notes/current-negative', 1);
+    current.rerank_score = -1;
+    const retired = res('notes/retired-negative', 2);
+    retired.superseded = true;
+    retired.rerank_score = -1.5;
+    const results = [current, retired];
+
+    applySupersedeDownrankPostRerank(results);
+
+    expect(results.map((r) => r.slug)).toEqual([
+      'notes/current-negative',
+      'notes/retired-negative',
+    ]);
+    expect(retired.rerank_score).toBeLessThan(-1.5);
   });
 });

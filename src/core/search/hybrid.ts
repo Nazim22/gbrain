@@ -845,22 +845,22 @@ export async function applySupersedeDownrank(
 
 /** Re-apply lifecycle authority to the reranker's ordering signal. */
 export function applySupersedeDownrankPostRerank(results: SearchResult[]): void {
-  const headEnd = results.findIndex((r) => typeof r.rerank_score !== 'number');
-  const end = headEnd === -1 ? results.length : headEnd;
+  const headEnd = results.findIndex((r) => typeof r.rerank_score !== 'number'), end = headEnd === -1 ? results.length : headEnd;
   if (end === 0) return;
-  let touched = false;
+  const protectedPrefix = results[0]?.title_match_boost && results[0]?.superseded !== true ? 1 : 0;
+  const touched: SearchResult[] = [];
   for (let i = 0; i < end; i++) {
     const r = results[i]!;
     if (r.superseded !== true || !Number.isFinite(r.rerank_score)) continue;
-    r.rerank_score = (r.rerank_score as number) * SUPERSEDE_PENALTY;
-    r.supersede_penalty = SUPERSEDE_PENALTY;
-    touched = true;
+    const score = r.rerank_score as number; r.rerank_score = score > 0 ? score * SUPERSEDE_PENALTY : score < 0 ? score / SUPERSEDE_PENALTY : -Number.EPSILON;
+    r.supersede_penalty = SUPERSEDE_PENALTY; touched.push(r);
   }
-  if (!touched) return;
-  const reordered = results
-    .slice(0, end)
-    .sort((a, b) => (b.rerank_score as number) - (a.rerank_score as number));
-  for (let i = 0; i < end; i++) results[i] = reordered[i]!;
+  for (const r of touched) {
+    const from = results.indexOf(r); results.splice(from, 1);
+    let to = protectedPrefix;
+    while (to < end - 1 && (results[to]!.rerank_score as number) >= (r.rerank_score as number)) to++;
+    results.splice(to, 0, r);
+  }
 }
 
 /**
