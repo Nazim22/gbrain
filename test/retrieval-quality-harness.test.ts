@@ -78,6 +78,19 @@ describe('evaluateGate', () => {
     expect(gate.breaches[0].metric).toBe('hit_at_1');
   });
 
+  test('fails when generic-to-named Hit@3 regresses below the 0.60 ratchet', async () => {
+    const qs: NamedThingQuestion[] = [
+      { family: 'generic-to-named', query: 'g1', relevant: ['p'] },
+      { family: 'generic-to-named', query: 'g2', relevant: ['p'] },
+    ];
+    const report = await reportFor(qs, { g1: ['p'], g2: ['x', 'y', 'z', 'p'] });
+    const gate = evaluateGate(report);
+    expect(gate.pass).toBe(false);
+    expect(gate.breaches).toContainEqual({
+      family: 'generic-to-named', metric: 'hit_at_3', got: 0.5, floor: 0.6,
+    });
+  });
+
   test('soft family low score is a warning, not a breach', async () => {
     const qs: NamedThingQuestion[] = [
       { family: 'graph-relationship', query: 'g', relevant: ['p'] },

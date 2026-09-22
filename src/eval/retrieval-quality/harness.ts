@@ -163,8 +163,11 @@ export const DEFAULT_GATE: GateOpts = {
     'title-substring': { hit_at_1: floorEnv('GBRAIN_NTB_TITLE_HIT1', 0.95) },
     'multi-chunk-dilution': { hit_at_3: floorEnv('GBRAIN_NTB_DILUTION_HIT3', 1.0) },
     'alias-synonym': { hit_at_1: floorEnv('GBRAIN_NTB_ALIAS_HIT1', 0.98) },
+    // S393 local ratchet: measured at 0.65 Hit@3 when established. Keep the
+    // regression floor below that baseline; raise it only with paired evidence.
+    'generic-to-named': { hit_at_3: floorEnv('GBRAIN_NTB_GENERIC_HIT3', 0.6) },
   },
-  softFamilies: ['generic-to-named', 'short-vs-rich', 'graph-relationship', 'concept-paraphrase', 'hard-negative'],
+  softFamilies: ['short-vs-rich', 'graph-relationship', 'concept-paraphrase', 'hard-negative'],
 };
 
 function floorEnv(name: string, dflt: number): number {
