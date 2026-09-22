@@ -98,7 +98,7 @@ import { salienceOperations } from './ops/salience.ts';
 // canonical `operations` array below at the clusters' original positions
 // (order is contractual — docs/TOOL_CATALOG.md is generated from it).
 
-import { volunteer_context, find_experts, find_contradictions, find_trajectory } from './ops/insights.ts';
+import { reflex_pointers, volunteer_context, find_experts, find_contradictions, find_trajectory } from './ops/insights.ts';
 import { transcriptsOperations } from './ops/transcripts.ts';
 import { connectorsOperations } from './ops/connectors.ts';
 import { sourcesOperations } from './ops/sources.ts';
@@ -185,7 +185,7 @@ export const operations: Operation[] = [
   // volunteer_chronicle/backfill — ops/chronicle.ts
   ...chronicleOperations,
   // v0.43 (#2095): push-based context — ops/insights.ts
-  volunteer_context,
+  reflex_pointers, volunteer_context,
   // Extraction quarantine lane (#160): gated entity extraction + review
   // queue — ops/extraction.ts
   ...extractionOperations,
@@ -300,7 +300,7 @@ const OP_AREAS: Record<string, string> = {
   get_recent_salience: 'insights', find_anomalies: 'insights',
   find_contradictions: 'insights', find_experts: 'insights',
   find_trajectory: 'insights', get_calibration_profile: 'insights',
-  volunteer_context: 'insights', get_recent_transcripts: 'insights',
+  reflex_pointers: 'insights', volunteer_context: 'insights', get_recent_transcripts: 'insights',
   // code intelligence
   code_callers: 'code', code_callees: 'code', code_def: 'code',
   code_refs: 'code', code_blast: 'code', code_flow: 'code',

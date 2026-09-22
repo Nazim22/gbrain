@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 125 tools across 23 areas. **Starter** marks membership in the ~29-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 126 tools across 23 areas. **Starter** marks membership in the ~29-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -84,6 +84,7 @@ Every non-localOnly operation on the MCP surface: 125 tools across 23 areas. **S
 | `find_trajectory` | v0.35.4 — return the chronological claim trajectory for an entity (typed metric values over time, plus auto-detected regressions and narrative drift). | read |  |  |
 | `get_calibration_profile` | Read the active calibration profile for a holder. | read |  |  |
 | `get_recent_salience` | Returns readable pages recently touched and ranked by activity salience and recency. | read | yes |  |
+| `reflex_pointers` | Retrieval Reflex (#1981) over an op transport: extract salient entities from a turn of user text and resolve them to compact page pointers. | read |  |  |
 | `volunteer_context` | Push-based context: volunteer brain pages relevant to a rolling conversation window WITHOUT being asked. | read |  |  |
 
 ## jobs

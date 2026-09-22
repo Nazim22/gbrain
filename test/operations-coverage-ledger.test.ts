@@ -123,6 +123,7 @@ const LEDGER: Record<string, string> = {
   ontology_conflicts: 'test/chronicle-advisor.test.ts',
   chronicle_backfill: 'test/chronicle-backfill.test.ts',
   volunteer_context: 'test/cli-format-volunteer.test.ts',
+  reflex_pointers: 'test/reflex-pointers-op.test.ts',
   extract_entities: 'test/extraction-review.test.ts',
   extraction_pending: 'test/extraction-review.test.ts',
   extraction_review: 'test/extraction-review.test.ts',
