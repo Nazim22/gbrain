@@ -15,7 +15,7 @@ Base audited: `origin/backup/local-patches` @ `255117e9`; candidate upstream: `u
 | 9 | `66698c3d` | DROP-UPSTREAM-HAS-IT | Candidate server has `GBRAIN_DRAIN_TIMEOUT_MS`, bounded drain, and forced socket teardown. |
 | 10 | `03de3246` | DROP-UPSTREAM-HAS-IT | Candidate model pricing recognizes local providers as zero-cost and bypasses paid-provider budget enforcement. |
 | 11 | `b039cb29` | KEEP-REBASED | Candidate still ships the tweet/virality atom prompt; retain the measured local durable-engineering prompt with an unchanged output schema. |
-| 12 | `1422baed` | DROP-UPSTREAM-HAS-IT | Candidate exact-lookup and alias tiers run after retrieval/rerank and preserve promoted exact hits explicitly. |
+| 12 | `1422baed` | KEEP-REBASED | Paired scratch evidence disproved the original drop: alias-synonym Hit@1 fell from pin 100% to candidate 0%. Retain `1cdd1785` semantics so an exact human-authored alias promotes an already-present canonical to top-of-organic, matching the absent-injection branch. |
 | 13 | `7622b265` | DROP-OBSOLETE | This was an intentionally negative measured knob; its own disposition says leave the default unchanged. |
 | 14 | `9df9a586` | DROP-UPSTREAM-HAS-IT | Candidate context/retrieval-reflex resolver and transcript handling include the upstream retry/alias-resolution rebuild. |
 | 15 | `23f7c999` | DROP-UPSTREAM-HAS-IT | Candidate doctor and reranker readiness are model-scoped and encoding-safe in the newer modular health implementation. |
@@ -29,7 +29,7 @@ Base audited: `origin/backup/local-patches` @ `255117e9`; candidate upstream: `u
 | 23 | `6fe6a512` | KEEP-REBASED | Candidate still leaves `generic-to-named` soft; retain the measured 0.60 Hit@3 regression floor used by the nightly gate. |
 | 24 | `647daf50` | DROP-UPSTREAM-HAS-IT | Candidate zero-cost local embedding/chat providers do not consume the paid budget tracker. |
 | 25 | `726c69d1` | DROP-UPSTREAM-HAS-IT | Candidate retrieval results carry effective/source dates through current result metadata and chronology-aware ranking. |
-| 26 | `e5b29e6b` | DROP-UPSTREAM-HAS-IT | Candidate exact-lookup, lifecycle status, and supersession filtering replace the old two-stage demotion implementation. |
+| 26 | `e5b29e6b` | KEEP-REBASED | Paired scratch evidence disproved the original drop: hard-negative fell from pin 100% to candidate 88% because local `status: superseded` / `superseded_by` markers were ignored and the reranker erased pre-rerank penalties. Retain the marker-aware demotion and post-rerank ordering semantics of `b426184f` + `9ac7d5fb`. |
 | 27 | `409bb756` | KEEP-REBASED | Candidate still renders unqualified nearest neighbors without an all-weak warning; retain the CLI-only UNKNOWN signal without changing result shape/ranking. |
 | 28 | `9a196bce` | DROP-UPSTREAM-HAS-IT | Candidate graph health and traversal use typed live edges in both directions; the old one-direction raw-link count is superseded. |
 | 29 | `424a01dd` | DROP-UPSTREAM-HAS-IT | Candidate minion write paths preserve job/source attribution in current operation receipts and progress metadata. |

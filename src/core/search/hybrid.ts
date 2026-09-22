@@ -181,8 +181,8 @@ export async function stampContentFlags(engine: BrainEngine, results: SearchResu
  * applies, but the SQL-side source-boost guard still holds.
  *
  * #4220: the same batched query now surfaces the page's raw
- * `frontmatter.status` value, stamped on `SearchResult.status` for EVERY
- * result whose page carries one (draft/superseded/restricted/verified/...).
+ * `frontmatter.status` and `frontmatter.superseded_by` values, stamped on
+ * `SearchResult` for EVERY result whose page carries either lifecycle marker.
  * `unverified` remains the special case requiring the full quarantine pair.
  */
 export async function stampUnverifiedExtractions(
@@ -201,7 +201,8 @@ export async function stampUnverifiedExtractions(
     for (const r of results) {
       const m = marks.get(r.page_id);
       if (!m) continue;
-      r.status = m.status;
+      if (m.status) r.status = m.status;
+      if (m.superseded_by) r.superseded_by = m.superseded_by;
       if (m.unverified) r.unverified = true;
     }
   } catch {
@@ -767,7 +768,8 @@ async function hasAnySupersedeEdges(
  * the SUPERSEDED annotation.
  *
  * A page X is "superseded" when it is the `to_page_id` of a `supersedes` link
- * (`A supersedes B` → from=A canon, to=B stale). This is the page-level
+ * (`A supersedes B` → from=A canon, to=B stale), or when its local frontmatter
+ * carries `status: superseded` / `superseded_by`. This is the page-level
  * analogue of the `superseded_by`/`expired_at` awareness recall.ts already
  * applies to the facts table. Stamps `superseded=true`, `superseded_by` (the
  * superseding page's slug), and multiplies score by SUPERSEDE_PENALTY so
@@ -796,44 +798,69 @@ export async function applySupersedeDownrank(
     new Set(results.map(r => r.page_id).filter((id): id is number => typeof id === 'number')),
   );
   if (pageIds.length === 0) return;
-  if (!(await hasAnySupersedeEdges(engine))) return;
+  const hasLocalMarker = results.some(
+    (r) => r.status?.toLowerCase() === 'superseded' || Boolean(r.superseded_by),
+  );
+  const hasEdges = await hasAnySupersedeEdges(engine);
+  if (!hasEdges && !hasLocalMarker) return;
   const params: unknown[] = [pageIds];
   const fromFilter = pageReadFilter('pf', policy, params, !!policy);
   const toFilter = pageReadFilter('pt', policy, params, !!policy);
   const originFilter = policy ? `(l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM pages origin WHERE origin.id = l.origin_page_id AND ${pageReadFilter('origin', policy, params, true)}))` : 'TRUE';
   let rows: Array<{ to_page_id: number; by_slug: string }> = [];
-  try {
-    rows = await engine.executeRaw<{ to_page_id: number; by_slug: string }>(
-      `SELECT DISTINCT l.to_page_id, pf.slug AS by_slug
-         FROM links l
-         JOIN pages pf ON pf.id = l.from_page_id
-         JOIN pages pt ON pt.id = l.to_page_id
-        WHERE l.link_type = 'supersedes'
-          AND pf.deleted_at IS NULL
-          AND pf.source_id = pt.source_id
-          AND l.to_page_id = ANY($1::bigint[])
-          AND ${fromFilter} AND ${toFilter} AND ${originFilter}`,
-      params,
-    );
-  } catch {
-    // Pre-links schema or SQL miss; no-op.
-    return;
+  if (hasEdges) {
+    try {
+      rows = await engine.executeRaw<{ to_page_id: number; by_slug: string }>(
+        `SELECT DISTINCT l.to_page_id, pf.slug AS by_slug
+           FROM links l
+           JOIN pages pf ON pf.id = l.from_page_id
+           JOIN pages pt ON pt.id = l.to_page_id
+          WHERE l.link_type = 'supersedes'
+            AND pf.deleted_at IS NULL
+            AND pf.source_id = pt.source_id
+            AND l.to_page_id = ANY($1::bigint[])
+            AND ${fromFilter} AND ${toFilter} AND ${originFilter}`,
+        params,
+      );
+    } catch {
+      // Pre-links schema or SQL miss; local frontmatter markers still apply.
+      if (!hasLocalMarker) return;
+    }
   }
-  if (rows.length === 0) return;
   const supersededBy = new Map<number, string>();
   for (const row of rows) {
     const id = Number(row.to_page_id);
     if (!supersededBy.has(id)) supersededBy.set(id, row.by_slug);
   }
   for (const r of results) {
-    const by = supersededBy.get(r.page_id);
-    if (by !== undefined) {
+    const by = r.superseded_by ?? supersededBy.get(r.page_id);
+    if (r.status?.toLowerCase() === 'superseded' || by !== undefined) {
       r.score *= SUPERSEDE_PENALTY;
       r.superseded = true;
-      r.superseded_by = by;
+      if (by !== undefined) r.superseded_by = by;
       r.supersede_penalty = SUPERSEDE_PENALTY;
     }
   }
+}
+
+/** Re-apply lifecycle authority to the reranker's ordering signal. */
+export function applySupersedeDownrankPostRerank(results: SearchResult[]): void {
+  const headEnd = results.findIndex((r) => typeof r.rerank_score !== 'number');
+  const end = headEnd === -1 ? results.length : headEnd;
+  if (end === 0) return;
+  let touched = false;
+  for (let i = 0; i < end; i++) {
+    const r = results[i]!;
+    if (r.superseded !== true || !Number.isFinite(r.rerank_score)) continue;
+    r.rerank_score = (r.rerank_score as number) * SUPERSEDE_PENALTY;
+    r.supersede_penalty = SUPERSEDE_PENALTY;
+    touched = true;
+  }
+  if (!touched) return;
+  const reordered = results
+    .slice(0, end)
+    .sort((a, b) => (b.rerank_score as number) - (a.rerank_score as number));
+  for (let i = 0; i < end; i++) results[i] = reordered[i]!;
 }
 
 /**
@@ -914,8 +941,9 @@ const MAX_ALIAS_INJECT = 3;           // cap injected pages per query (collision
  *   - FULL normalized-query exact match only (not substring / not n-grams) —
  *     "light" won't fire unless the whole query normalizes to a stored alias.
  *   - skip queries longer than MAX_ALIAS_QUERY_TOKENS (clearly prose, not a name).
- *   - bounded: present-boost is 1.10x; inject score is top-of-organic + ε,
- *     never an absolute 1.0 (D3 — aliases are not a ranking sledgehammer).
+ *   - an exact human-authored alias promotes an already-present canonical to
+ *     the same top-of-organic + ε position used by the absent-injection branch;
+ *     1.10x remains a monotonic lower bound when the page already ranks higher.
  *   - collisions (two pages claim one alias): deterministic alpha order, capped.
  *
  * Fail-open: pre-v110 brains (no page_aliases table) and any lookup error
@@ -953,7 +981,10 @@ export async function applyAliasHop(
   for (const ref of ordered) {
     const idx = out.findIndex(r => r.slug === ref.slug && (r.source_id ?? 'default') === ref.source_id);
     if (idx >= 0) {
-      if (Number.isFinite(out[idx].score)) out[idx].score *= ALIAS_HOP_PRESENT_BOOST;
+      if (Number.isFinite(out[idx].score)) {
+        injectScore += 1e-6;
+        out[idx].score = Math.max(out[idx].score * ALIAS_HOP_PRESENT_BOOST, injectScore);
+      }
       out[idx].alias_hit = true;
       continue;
     }
@@ -2334,6 +2365,11 @@ export async function hybridSearch(
         },
       })
     : deduped;
+
+  // A cross-encoder ranks by rerank_score and would otherwise erase the
+  // pre-rerank lifecycle penalty. Keep the penalty on the signal that owns
+  // final head ordering before relational pins and exact identity tiers run.
+  applySupersedeDownrankPostRerank(reranked);
 
   // Ranker wave (R1 receipt) — relational-arm rows bypass reranker DEMOTION:
   // re-pinned above the reranked text rows in fused order, bounded by
