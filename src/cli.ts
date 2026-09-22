@@ -1767,9 +1767,13 @@ export function formatResult(
         // (autocut decision, `degraded: reranker_skipped (no_key)`) render.
         return formatResultsExplain(results, lastRetrievalMeta ?? undefined);
       }
-      return results.map(r =>
+      const body = results.map(r =>
         `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
+      const allWeak = results.every(r => r.evidence === 'weak_semantic');
+      return allWeak
+        ? body + '⚠ all hits are weak_semantic — no alias/title/keyword/vector-strong evidence; the brain likely has no page on this. Treat as UNKNOWN, not as the nearest neighbors above.\n'
+        : body;
     }
     case 'get_tags': {
       const tags = result as string[];
