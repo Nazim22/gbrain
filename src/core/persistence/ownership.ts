@@ -76,6 +76,9 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
         throw new OperationError('writer_transfer_required', 'This source already has an owner or a different binding.', 'Use a verified source writer transfer.');
       }
       assertPhysicalRoot(root, { worktreeId: current.worktree_id, coordinationPath: current.coordination_path });
+      const manifest = worktreeManifest(root);
+      await tx.executeRaw("UPDATE persistence_worktrees SET manifest=$2::text::jsonb WHERE id=$1::uuid AND (manifest IS NULL OR NOT (manifest ? 'digest') OR NOT (manifest ? 'files'))",
+        [current.worktree_id, JSON.stringify(manifest)]);
       await refreshManagedFilesystemRoots(tx, managedFilesystemDatastorePath(engine));
       return;
     }
@@ -90,9 +93,16 @@ export async function claimWorktree(engine: BrainEngine, sourceId: string, path:
     } else {
       const physical = await claimPhysicalRoot(tx, root, { hostId, worktreeId: candidateId, coordinationPath: lockPath });
       id = physical.worktreeId;
-      await tx.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id,owner_epoch) VALUES($1::uuid,$2::uuid,1)', [id, hostId]);
+      const manifest = worktreeManifest(root);
+      await tx.executeRaw('INSERT INTO persistence_worktrees(id,owner_host_id,owner_epoch,manifest) VALUES($1::uuid,$2::uuid,1,$3::text::jsonb)',
+        [id, hostId, JSON.stringify(manifest)]);
       await tx.executeRaw(`INSERT INTO persistence_host_bindings(worktree_id,host_id,local_path,coordination_path)
         VALUES($1::uuid,$2::uuid,$3,$4)`, [id, hostId, root, physical.coordinationPath]);
+    }
+    if (overlap) {
+      const manifest = worktreeManifest(root);
+      await tx.executeRaw("UPDATE persistence_worktrees SET manifest=$2::text::jsonb WHERE id=$1::uuid AND (manifest IS NULL OR NOT (manifest ? 'digest') OR NOT (manifest ? 'files'))",
+        [id, JSON.stringify(manifest)]);
     }
     await tx.executeRaw(`INSERT INTO persistence_source_bindings(source_id,source_incarnation,worktree_id,relative_path)
       VALUES($1,$2::uuid,$3::uuid,$4)`, [sourceId, source.incarnation, id, relative(root, sourceRoot).split(sep).join('/')]);

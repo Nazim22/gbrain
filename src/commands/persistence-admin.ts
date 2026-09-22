@@ -39,6 +39,11 @@ in private local files. CLI is the trusted administration lane; stdio stays remo
 A revoked CLI cannot replace itself through a running owner. Stop that owner and
 explicitly register --replace locally to authorize a new principal.`;
 
+/** PostgreSQL and filesystem identity fields may reach the CLI as bigint. */
+export function stringifyPersistenceAdminResult(result: unknown): string {
+  return JSON.stringify(result, (_key, value) => typeof value === 'bigint' ? value.toString() : value, 2) + '\n';
+}
+
 type Group = 'writer' | 'local-writer';
 export function parsePersistenceAdminArgs(group: Group, args: string[]): {
   operation: PersistenceAdminOperation; params: Record<string, unknown>; brain?: string; json: boolean;
@@ -125,7 +130,7 @@ export async function runPersistenceAdminCli(group: Group, args: string[], conne
       }
       result = await runPersistenceAdministration(connected ?? owned!, parsed.operation, parsed.params);
     }
-    await writeStdoutFinal(JSON.stringify(result, null, 2) + '\n');
+    await writeStdoutFinal(stringifyPersistenceAdminResult(result));
   } catch (error) {
     if (!await reportPersistenceCliError(error, args.includes('--json'))) {
       console.error(error instanceof Error ? error.message : String(error));
