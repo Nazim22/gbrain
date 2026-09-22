@@ -80,6 +80,9 @@ import { normalizeForGrounding } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
+const DEFAULT_EXTRACT_PHASE_BUDGET_MS = Number(
+  process.env.GBRAIN_EXTRACT_PHASE_BUDGET_MS ?? 900_000,
+);
 // #4529 + #4540: per-item extractor caps, overridable via
 // cycle.extract_atoms.* config keys (max_input_chars — with the #4529
 // legacy alias max_source_chars — plus max_output_tokens / pacing_ms).
@@ -196,6 +199,10 @@ export interface ExtractAtomsOpts {
    * after the v0.41.19.0 TTL drop 30→5min.
    */
   yieldDuringPhase?: () => Promise<void>;
+  /** Wall-clock bound for the resumable work loop (default 15 minutes). */
+  phaseBudgetMs?: number;
+  /** Cooperative cancellation checked before each new work item. */
+  signal?: AbortSignal;
   /**
    * v0.41.19.0 (T4): progress reporter for in-phase ticks. Cycle.ts
    * passes the SAME reporter (not a child — codex caught the path-
@@ -1083,9 +1090,19 @@ export async function runPhaseExtractAtoms(
     }
   }
 
+  const phaseBudgetMs = opts.phaseBudgetMs ?? DEFAULT_EXTRACT_PHASE_BUDGET_MS;
+  const phaseDeadline = Date.now() + phaseBudgetMs;
+  let deadlineHit = false;
+
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
     await maybeYield();
+    if (Date.now() >= phaseDeadline || opts.signal?.aborted) {
+      deadlineHit = true;
+      if (item.kind === 'transcript') transcriptsSkipped++;
+      else pagesSkipped++;
+      continue;
+    }
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
       if (item.kind === 'transcript') transcriptsSkipped++;
       else pagesSkipped++;
@@ -1423,9 +1440,13 @@ export async function runPhaseExtractAtoms(
       `${pagesProcessed}/${pages.length} pages` +
       (failures.length > 0 ? ` (${failures.length} failed)` : '') +
       (transcriptsSkipped + pagesSkipped > 0
-        ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
+        ? deadlineHit
+          ? ` — PARTIAL: ${transcriptsSkipped + pagesSkipped} item(s) left for the next cycle (phase budget reached)`
+          : ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : ''),
     details: {
+      partial: deadlineHit,
+      phase_budget_ms: phaseBudgetMs,
       atoms_extracted: totalAtomsExtracted,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
