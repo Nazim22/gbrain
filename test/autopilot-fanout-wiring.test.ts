@@ -55,11 +55,11 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
     expect(Math.abs(dispatchIdx - fullCycleIdx)).toBeLessThan(3000);
   });
 
-  test('applies the 30-minute timeout floor only to full-cycle dispatch', () => {
+  test('applies the 60-minute timeout floor only to full-cycle dispatch', () => {
     const baseIntervalSeconds = 60;
     const intervalDerivedTimeoutMs = Math.max(baseIntervalSeconds * 2 * 1000, 300_000);
 
-    expect(resolveAutopilotDispatchTimeoutMs(baseIntervalSeconds, true)).toBeGreaterThanOrEqual(30 * 60_000);
+    expect(resolveAutopilotDispatchTimeoutMs(baseIntervalSeconds, true)).toBe(60 * 60_000);
     expect(resolveAutopilotDispatchTimeoutMs(baseIntervalSeconds, false)).toBe(intervalDerivedTimeoutMs);
 
     expect(AUTOPILOT_SRC).toContain(
