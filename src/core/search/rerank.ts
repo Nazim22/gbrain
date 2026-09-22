@@ -254,6 +254,29 @@ export async function applyReranker(
     if (!seen.has(i)) reorderedHead.push(head[i]!);
   }
 
+  // Preserve exactly one deterministic identity signal: an incoming rank-1
+  // title winner. The reranker remains authoritative for every ordinary row
+  // and every lower-ranked title match, but cannot replace the canonical page
+  // with a richer derivative that merely discusses it.
+  const protectedWinner = head[0]?.title_match_boost ? head[0] : undefined;
+  if (protectedWinner) {
+    const winnerIndex = reorderedHead.indexOf(protectedWinner);
+    if (winnerIndex > 0) {
+      const [winner] = reorderedHead.splice(winnerIndex, 1);
+      reorderedHead.unshift(winner!);
+    }
+  }
+
+  // Stamp rank movement after all ordering constraints so attribution reports
+  // the actual returned order rather than the reranker's intermediate order.
+  for (let newIndex = 0; newIndex < reorderedHead.length; newIndex++) {
+    const item = reorderedHead[newIndex]!;
+    const originalIndex = head.indexOf(item);
+    if (originalIndex >= 0 && (seen.has(originalIndex) || item === protectedWinner)) {
+      item.reranker_delta = originalIndex - newIndex;
+    }
+  }
+
   const combined = [...reorderedHead, ...tail];
   return opts.topNOut !== null && opts.topNOut > 0
     ? combined.slice(0, opts.topNOut)

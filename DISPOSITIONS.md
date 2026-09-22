@@ -59,7 +59,7 @@ Base audited: `origin/backup/local-patches` @ `255117e9`; candidate upstream: `u
 | 53 | `09a02cf6` | DROP-OBSOLETE | S409 eval expectation patch is tied to the retired experiment, not the candidate’s current retrieval contract. |
 | 54 | `b1fd37ff` | DROP-OBSOLETE | S409 migration/schema addition belonged to the retired experiment; carrying it would violate the no-search-redesign boundary. |
 | 55 | `7b60f119` | DROP-UPSTREAM-HAS-IT | Candidate propose-takes has configurable input/output caps, truncation retry, and bounded per-call timeouts. |
-| 56 | `c2268d2e` | DROP-UPSTREAM-HAS-IT | Candidate rerank pipeline preserves full `SearchResult` identity/metadata while applying rerank scores/order. |
+| 56 | `c2268d2e` | KEEP-REBASED | R2 keeps result metadata but paired pin/R2 stage evidence showed the reranker can erase an incoming rank-1 title winner: named pages fell to ranks 2–10 despite strong pre-rerank identity signals. Retain only the bounded `f79de448` semantic—protect the single incoming rank-1 `title_match_boost` object; ordinary rows and lower title matches remain fully rerankable. |
 | 57 | `f436ad14` | KEEP-REBASED | Candidate JSON has aggregate/question scores but nightly stderr lacks stable ranked-list + fixture-truth rows; retain PQ/PQS evidence. |
 | 58 | `c2e62408` | DROP-UPSTREAM-HAS-IT | Candidate structural exact-lookup promotes normalized exact title/slug matches after fusion and preserves them through autocut. |
 | 59 | `4ad3d30e` | DROP-UPSTREAM-HAS-IT | Candidate lockfile/package set is newer and already contains post-patch dependency resolutions; do not regress pins. |
