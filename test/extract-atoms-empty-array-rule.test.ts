@@ -65,6 +65,8 @@ describe('extract_atoms prompt — content-free transcript rule', () => {
     expect(capturedSystem).toMatch(/no extractable idea[\s\S]*output exactly \[\]/);
     expect(capturedSystem).toMatch(/never invent an atom/);
     expect(capturedSystem).toMatch(/never explain in prose/);
+    expect(capturedSystem).toMatch(/STILL BE\s+TRUE AND USEFUL IN SIX MONTHS/);
+    expect(capturedSystem).toContain('durable, not a status report');
   });
 
   test('[] is an honest zero-yield, not a parse failure (the path the rule steers into)', () => {

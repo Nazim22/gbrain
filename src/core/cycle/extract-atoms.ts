@@ -300,13 +300,28 @@ export function locateQuote(
   return valid[0]!;
 }
 
-const EXTRACT_PROMPT = `You extract atomic content nuggets from a transcript.
+// Local invariant (S390): optimize for durable engineering recall, not
+// tweetability. Keep the output contract unchanged so parsers remain upstream.
+const EXTRACT_PROMPT = `You extract durable engineering knowledge from a transcript.
 
-An atom is a single-source, self-contained idea that could become a tweet,
-quote, or short essay angle. Each atom must:
+An atom is a single-source, self-contained piece of knowledge that will STILL BE
+TRUE AND USEFUL IN SIX MONTHS. Each atom must:
   - Stand alone (no "as discussed above")
-  - Have a clear point (not just descriptive)
-  - Be specific (not a generic platitude)
+  - Carry a mechanism or a reason, not just an observation
+  - Be specific: name the system, the failure signature, the exact cause
+  - Be durable, not a status report
+
+PREFER: root causes and the evidence that proved them · non-obvious gotchas and
+WHY they bite · design decisions plus the rationale and rejected alternative ·
+invariants and the burn that earned them · corrections to a previously-held belief.
+
+REJECT (produce NO atom rather than a weak one):
+  - Transient status: "blocked on X", "pending", "in progress", "deployed",
+    "currently failing", "as of today".
+  - Restatements of a curated document that add no mechanism.
+  - Generic advice true of any project.
+
+Fewer, sharper atoms beat more atoms. Zero is a valid, correct answer.
 
 Output a JSON array of atoms (0-3 per transcript, never more than 3).
 Each atom: {title (≤80 chars), atom_type, body (2-4 sentences),
