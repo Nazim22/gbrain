@@ -545,6 +545,30 @@ async function gatherReflections(
 
 // ── Prompt ────────────────────────────────────────────────────────────
 
+export const PATTERNS_CORPUS_CHAR_BUDGET = 32_000;
+
+export function buildPatternsCorpus(
+  reflections: Array<{ slug: string; title: string; excerpt: string }>,
+): string {
+  const kept: string[] = [];
+  let used = 0;
+  let dropped = 0;
+  for (const [i, reflection] of reflections.entries()) {
+    const block = `### ${i + 1}. [[${reflection.slug}]] — ${reflection.title}\n${reflection.excerpt}`;
+    const separatorChars = kept.length === 0 ? 0 : 7;
+    if (used + separatorChars + block.length > PATTERNS_CORPUS_CHAR_BUDGET) {
+      dropped = reflections.length - i;
+      break;
+    }
+    kept.push(block);
+    used += separatorChars + block.length;
+  }
+  const corpus = kept.join('\n\n---\n\n');
+  return dropped > 0
+    ? `${corpus}\n\n---\n\n(+${dropped} older reflection(s) omitted for context budget; they surface in later cycles)`
+    : corpus;
+}
+
 function buildPatternsPrompt(
   reflections: ReflectionRef[],
   minEvidence: number,
@@ -552,9 +576,7 @@ function buildPatternsPrompt(
   outputSlugPrefix = 'wiki/personal/patterns',
 ): string {
   const today = new Date().toISOString().slice(0, 10);
-  const corpus = reflections
-    .map((r, i) => `### ${i + 1}. [[${r.slug}]] — ${r.title}\n${r.excerpt}`)
-    .join('\n\n---\n\n');
+  const corpus = buildPatternsCorpus(reflections);
 
   return `You are surfacing recurring themes across the user's recent reflections.
 
