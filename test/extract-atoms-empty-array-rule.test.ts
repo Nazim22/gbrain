@@ -50,12 +50,14 @@ function okChatResult(text: string): ChatResult {
 describe('extract_atoms prompt — content-free transcript rule', () => {
   test('the system prompt tells the model to output exactly [] when nothing is extractable', async () => {
     let capturedSystem = '';
+    let capturedMaxTokens = 0;
     await runPhaseExtractAtoms(engine, {
       sourceId: 'default',
       _transcripts: [],
       _pages: [{ slug: 'documents/connector-row', content: 'status: open\nowner: alice-example\n', contentHash: 'b'.repeat(16) }],
       _chat: async (opts: ChatOpts) => {
         capturedSystem = String(opts.system ?? '');
+        capturedMaxTokens = opts.maxTokens ?? 0;
         return okChatResult('[]');
       },
     });
@@ -67,6 +69,8 @@ describe('extract_atoms prompt — content-free transcript rule', () => {
     expect(capturedSystem).toMatch(/never explain in prose/);
     expect(capturedSystem).toMatch(/STILL BE\s+TRUE AND USEFUL IN SIX MONTHS/);
     expect(capturedSystem).toContain('durable, not a status report');
+    expect(capturedSystem).toContain('0-8 per transcript, never more than 8');
+    expect(capturedMaxTokens).toBe(8192);
   });
 
   test('[] is an honest zero-yield, not a parse failure (the path the rule steers into)', () => {

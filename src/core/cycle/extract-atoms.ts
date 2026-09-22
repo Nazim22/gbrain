@@ -88,7 +88,7 @@ const DEFAULT_EXTRACT_PHASE_BUDGET_MS = Number(
 // legacy alias max_source_chars — plus max_output_tokens / pacing_ms).
 // Exported so tests pin the defaults instead of re-hardcoding the literals.
 export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 50_000;
-export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096;
+export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 8192;
 
 /**
  * gbrain#4148: consecutive same-content failures of a content-deterministic
@@ -330,7 +330,7 @@ REJECT (produce NO atom rather than a weak one):
 
 Fewer, sharper atoms beat more atoms. Zero is a valid, correct answer.
 
-Output a JSON array of atoms (0-3 per transcript, never more than 3).
+Output a JSON array of atoms (0-8 per transcript, never more than 8).
 Each atom: {title (≤80 chars), atom_type, body (2-4 sentences),
 source_quote (verbatim ≤200 chars), lesson (one sentence), concepts
 (1-3 topic labels), virality_score (0-100), emotional_register (one of:
