@@ -2524,6 +2524,7 @@ export async function runCycle(
           // any brain without a source literally named 'default'.
           sourceId: cycleSourceId,
           dryRun,
+          signal: cycleSignal,
           // v0.41.19.0 (T3): closure refreshes cycle lock + fires outer hook.
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase, onStolen),
           // v0.41.19.0 (T4): pass same reporter (not a child).

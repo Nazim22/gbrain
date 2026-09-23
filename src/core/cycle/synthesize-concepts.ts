@@ -317,8 +317,13 @@ export async function runPhaseSynthesizeConcepts(
         synthesisMode = 'budget_fallback';
       } else {
         try {
+          const remainingMs = Math.max(1, deadline - Date.now());
+          const abortSignal = opts.signal
+            ? AbortSignal.any([opts.signal, AbortSignal.timeout(remainingMs)])
+            : AbortSignal.timeout(remainingMs);
           const result = await chat({
             model: synthModel,
+            abortSignal,
             system: SYNTH_PROMPT,
             messages: [
               {
@@ -358,6 +363,10 @@ export async function runPhaseSynthesizeConcepts(
             synthesisMode = 'error_fallback';
           }
         } catch (err) {
+          if (Date.now() >= deadline || opts.signal?.aborted) {
+            groupsSkipped = Math.max(1, atomGroups.length - conceptsWritten);
+            break;
+          }
           const msg = err instanceof Error ? err.message : String(err);
           // #3044 adoption: a whole-run LLM outage must not overwrite
           // existing concept pages with error_fallback stub narratives.
@@ -384,6 +393,11 @@ export async function runPhaseSynthesizeConcepts(
       narrative = deterministicNarrative(group);
       synthesisMode = 'deterministic_tier';
     }
+    // A provider may return after cancellation; never publish its late reply.
+    if (Date.now() >= deadline || opts.signal?.aborted) {
+      groupsSkipped = Math.max(1, atomGroups.length - conceptsWritten);
+      break;
+    }
     synthesisModeCounts[synthesisMode]++;
 
     if (!opts.dryRun) {
@@ -405,6 +419,10 @@ export async function runPhaseSynthesizeConcepts(
         { type: 'concept', title: title.replace(/-/g, ' '), tags: [] },
       );
       const conceptSlug = `concepts/${title}`;
+      if (Date.now() >= deadline || opts.signal?.aborted) {
+        groupsSkipped = Math.max(1, atomGroups.length - conceptsWritten);
+        break;
+      }
       await importFromContent(engine, conceptSlug, md, {
         noEmbed: !isAvailable('embedding'),
         // #4416: target the cycle's resolved source, not the 'default' literal.

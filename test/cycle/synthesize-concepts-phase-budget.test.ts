@@ -105,6 +105,38 @@ describe('synthesize_concepts wall-clock bound', () => {
     expect((result.details as Record<string, unknown>).concepts_written).toBe(0);
   }, 30000);
 
+  test('abort during chat reaches the provider and publishes no concept', async () => {
+    const ac = new AbortController();
+    let received: AbortSignal | undefined;
+    const result = await runPhaseSynthesizeConcepts(engine, {
+      _atoms: atomsForGroups(1), signal: ac.signal,
+      _chat: async (o) => {
+        received = o.abortSignal;
+        await new Promise((r) => setTimeout(r, 20));
+        ac.abort();
+        return localChat()(o);
+      },
+    });
+    expect(received?.aborted).toBe(true);
+    expect((result.details as Record<string, unknown>).concepts_written).toBe(0);
+    expect((await engine.getPage('concepts/c0'))).toBeNull();
+  }, 30000);
+
+  test('deadline during delayed chat aborts the call and publishes no concept', async () => {
+    let received: AbortSignal | undefined;
+    const result = await runPhaseSynthesizeConcepts(engine, {
+      _atoms: atomsForGroups(1), phaseBudgetMs: 30,
+      _chat: async (o) => {
+        received = o.abortSignal;
+        await new Promise((r) => setTimeout(r, 80));
+        return localChat()(o);
+      },
+    });
+    expect(received?.aborted).toBe(true);
+    expect((result.details as Record<string, unknown>).concepts_written).toBe(0);
+    expect((await engine.getPage('concepts/c0'))).toBeNull();
+  }, 30000);
+
   test('within budget, nothing is skipped and it is not marked partial', async () => {
     const result = await runPhaseSynthesizeConcepts(engine, {
       _atoms: atomsForGroups(3),
