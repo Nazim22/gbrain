@@ -475,7 +475,9 @@ export async function runPhaseSynthesizeConcepts(
         console.error(`[synthesize_concepts] provenance links failed for ${conceptSlug} (non-fatal): ${msg}`);
       }
     }
-    if (pageWritten) conceptsWritten++;
+    // Dry-run preserves its historic "would synthesize" count without writing;
+    // live runs count only pages actually imported.
+    if (opts.dryRun || pageWritten) conceptsWritten++;
     // v0.41.19.0 (T4): one tick per concept group with running count.
     opts.progress?.tick(1, `${conceptsWritten} concepts`);
 
