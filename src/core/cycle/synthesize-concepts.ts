@@ -63,6 +63,12 @@ const TIER_T3_MIN = 2;
  * `tier: 'reasoning'`, so a thinking model here is the expected case.
  */
 const DEFAULT_SYNTH_MAX_OUTPUT_TOKENS = 500;
+// A read-only :8084 probe with the real concept prompt shape returned
+// finish_reason=length, 500/500 output tokens, reasoning_content but no content.
+// At 1536 the same three complex synthetic groups finished with visible text
+// (796–1169 tokens, 16.6–24.2s). Restrict this cap to the measured alias:
+// llama-server is user-provided and may host non-reasoning models.
+const GEMMA4_SYNTH_MAX_OUTPUT_TOKENS = 1536;
 
 /**
  * Narrative output cap for the resolved model. `isThinkingModel` is the
@@ -75,6 +81,7 @@ const DEFAULT_SYNTH_MAX_OUTPUT_TOKENS = 500;
  * answer text.
  */
 export function resolveSynthMaxOutputTokens(modelStr: string): number {
+  if (modelStr === 'llama-server:gemma-4-12b-qat') return GEMMA4_SYNTH_MAX_OUTPUT_TOKENS;
   return isThinkingModel(modelStr) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_SYNTH_MAX_OUTPUT_TOKENS;
 }
 
