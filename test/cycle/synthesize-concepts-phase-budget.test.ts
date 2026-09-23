@@ -137,6 +137,31 @@ describe('synthesize_concepts wall-clock bound', () => {
     expect((await engine.getPage('concepts/c0'))).toBeNull();
   }, 30000);
 
+  test('repeating an unchanged T1 group writes no second concept page', async () => {
+    const atoms = atomsForGroups(1);
+    const first = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: localChat() });
+    expect((first.details as Record<string, unknown>).concepts_written).toBe(1);
+    const page = await engine.getPage('concepts/c0');
+    expect(page).not.toBeNull();
+
+    const second = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: localChat() });
+    expect((second.details as Record<string, unknown>).concepts_written).toBe(0);
+    expect((await engine.getPage('concepts/c0'))?.knowledge_revision).toBe(page?.knowledge_revision);
+  }, 30000);
+
+  test('a changed narrative or mention count still writes a new concept', async () => {
+    const atoms = atomsForGroups(1);
+    await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: localChat() });
+    const newText = async (o: ChatOpts) => ({ ...(await localChat()(o)), text: 'new narrative text' });
+    const changed = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: newText });
+    expect((changed.details as Record<string, unknown>).concepts_written).toBe(1);
+    const more = await runPhaseSynthesizeConcepts(engine, {
+      _atoms: [...atoms, { slug: 'atoms/new', concept_refs: ['concepts/c0'], body: 'new body', title: 'New' }],
+      _chat: newText,
+    });
+    expect((more.details as Record<string, unknown>).concepts_written).toBe(1);
+  }, 30000);
+
   test('within budget, nothing is skipped and it is not marked partial', async () => {
     const result = await runPhaseSynthesizeConcepts(engine, {
       _atoms: atomsForGroups(3),

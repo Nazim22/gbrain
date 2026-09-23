@@ -364,7 +364,7 @@ export async function runPhaseSynthesizeConcepts(
           }
         } catch (err) {
           if (Date.now() >= deadline || opts.signal?.aborted) {
-            groupsSkipped = Math.max(1, atomGroups.length - conceptsWritten);
+            groupsSkipped = Math.max(1, atomGroups.length - tierCounts.T1 - tierCounts.T2 - tierCounts.T3 - tierCounts.T4 + 1);
             break;
           }
           const msg = err instanceof Error ? err.message : String(err);
@@ -395,11 +395,12 @@ export async function runPhaseSynthesizeConcepts(
     }
     // A provider may return after cancellation; never publish its late reply.
     if (Date.now() >= deadline || opts.signal?.aborted) {
-      groupsSkipped = Math.max(1, atomGroups.length - conceptsWritten);
+      groupsSkipped = Math.max(1, atomGroups.length - tierCounts.T1 - tierCounts.T2 - tierCounts.T3 - tierCounts.T4 + 1);
       break;
     }
     synthesisModeCounts[synthesisMode]++;
 
+    let pageWritten = false;
     if (!opts.dryRun) {
       const title = group.conceptSlug.split('/').pop() ?? group.conceptSlug;
       // #2163: serialize to markdown and import via the canonical pipeline so
@@ -420,14 +421,21 @@ export async function runPhaseSynthesizeConcepts(
       );
       const conceptSlug = `concepts/${title}`;
       if (Date.now() >= deadline || opts.signal?.aborted) {
-        groupsSkipped = Math.max(1, atomGroups.length - conceptsWritten);
+        groupsSkipped = Math.max(1, atomGroups.length - tierCounts.T1 - tierCounts.T2 - tierCounts.T3 - tierCounts.T4 + 1);
         break;
       }
-      await importFromContent(engine, conceptSlug, md, {
-        noEmbed: !isAvailable('embedding'),
-        // #4416: target the cycle's resolved source, not the 'default' literal.
-        sourceId: opts.sourceId,
-      });
+      const existing = await engine.getPage(conceptSlug, { sourceId: opts.sourceId ?? 'default' });
+      const unchanged = existing?.frontmatter.tier === group.tier &&
+        existing.frontmatter.mention_count === group.atomTitles.length &&
+        existing.compiled_truth.trim() === narrative.trim();
+      if (!unchanged) {
+        await importFromContent(engine, conceptSlug, md, {
+          noEmbed: !isAvailable('embedding'),
+          // #4416: target the cycle's resolved source, not the 'default' literal.
+          sourceId: opts.sourceId,
+        });
+        pageWritten = true;
+      }
       // #4589: bank concept<->member-atom provenance edges. The prompt forbids
       // enumerating atoms in the body and no frontmatter field maps to a link
       // verb, so without this every concept page lands with zero edges (graph
@@ -460,7 +468,7 @@ export async function runPhaseSynthesizeConcepts(
         console.error(`[synthesize_concepts] provenance links failed for ${conceptSlug} (non-fatal): ${msg}`);
       }
     }
-    conceptsWritten++;
+    if (pageWritten) conceptsWritten++;
     // v0.41.19.0 (T4): one tick per concept group with running count.
     opts.progress?.tick(1, `${conceptsWritten} concepts`);
 
