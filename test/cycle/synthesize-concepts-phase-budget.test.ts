@@ -137,6 +137,57 @@ describe('synthesize_concepts wall-clock bound', () => {
     expect((await engine.getPage('concepts/c0'))).toBeNull();
   }, 30000);
 
+  test('abort during idempotence lookup publishes no concept', async () => {
+    const ac = new AbortController();
+    const originalGetPage = engine.getPage.bind(engine);
+    let lookupReached = false;
+    engine.getPage = (async (...args: Parameters<typeof engine.getPage>) => {
+      if (args[0] === 'concepts/c0' && !lookupReached) {
+        lookupReached = true;
+        ac.abort();
+        return null;
+      }
+      return originalGetPage(...args);
+    }) as typeof engine.getPage;
+    try {
+      const result = await runPhaseSynthesizeConcepts(engine, {
+        _atoms: atomsForGroups(1), signal: ac.signal, _chat: localChat(),
+      });
+      expect(lookupReached).toBe(true);
+      expect((result.details as Record<string, unknown>).concepts_written).toBe(0);
+      expect((result.details as Record<string, unknown>).partial).toBe(true);
+      expect((result.details as Record<string, unknown>).groups_skipped).toBe(1);
+    } finally {
+      delete (engine as any).getPage;
+    }
+    expect(await engine.getPage('concepts/c0')).toBeNull();
+  }, 30000);
+
+  test('deadline expiring during idempotence lookup publishes no concept', async () => {
+    const originalGetPage = engine.getPage.bind(engine);
+    let lookupReached = false;
+    engine.getPage = (async (...args: Parameters<typeof engine.getPage>) => {
+      if (args[0] === 'concepts/c0' && !lookupReached) {
+        lookupReached = true;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        return null;
+      }
+      return originalGetPage(...args);
+    }) as typeof engine.getPage;
+    try {
+      const result = await runPhaseSynthesizeConcepts(engine, {
+        _atoms: atomsForGroups(1), phaseBudgetMs: 200, _chat: localChat(),
+      });
+      expect(lookupReached).toBe(true);
+      expect((result.details as Record<string, unknown>).concepts_written).toBe(0);
+      expect((result.details as Record<string, unknown>).partial).toBe(true);
+      expect((result.details as Record<string, unknown>).groups_skipped).toBe(1);
+    } finally {
+      delete (engine as any).getPage;
+    }
+    expect(await engine.getPage('concepts/c0')).toBeNull();
+  }, 30000);
+
   test('repeating an unchanged T1 group writes no second concept page', async () => {
     const atoms = atomsForGroups(1);
     const first = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: localChat() });

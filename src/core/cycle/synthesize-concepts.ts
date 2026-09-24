@@ -432,6 +432,12 @@ export async function runPhaseSynthesizeConcepts(
         break;
       }
       const existing = await engine.getPage(conceptSlug, { sourceId: opts.sourceId ?? 'default' });
+      // The lookup may finish after cancellation; never start an import or
+      // provenance write from that stale result.
+      if (Date.now() >= deadline || opts.signal?.aborted) {
+        groupsSkipped = Math.max(1, atomGroups.length - tierCounts.T1 - tierCounts.T2 - tierCounts.T3 - tierCounts.T4 + 1);
+        break;
+      }
       const unchanged = existing?.frontmatter.tier === group.tier &&
         existing.frontmatter.mention_count === group.atomTitles.length &&
         existing.compiled_truth.trim() === narrative.trim();
