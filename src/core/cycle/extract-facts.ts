@@ -274,6 +274,7 @@ export interface ExtractFactsResult {
   phantomsRedirected: number;
   phantomsAmbiguous: number;
   phantomsSkippedDrift: number;
+  phantomsSkippedDisabled: boolean;
   phantomsLockBusy: boolean;
   phantomsMorePending: boolean;
 }
@@ -369,6 +370,7 @@ export async function runExtractFacts(
     phantomsRedirected: 0,
     phantomsAmbiguous: 0,
     phantomsSkippedDrift: 0,
+    phantomsSkippedDisabled: false,
     phantomsLockBusy: false,
     phantomsMorePending: false,
   };
@@ -481,7 +483,11 @@ export async function runExtractFacts(
   // IS NOT NULL` so a half-redirected page (soft-deleted, .md still on
   // disk) won't be re-redirected.
   let phantomResult: PhantomPassResult = emptyPhantomPassResult();
-  if (opts.brainDir) {
+  // The DB config plane is authoritative; only an explicit false disables
+  // this pre-pass. A read failure must stop extraction, not run a file writer.
+  const phantomEnabled = !opts.brainDir || await engine.getConfig('cycle.extract_facts.phantom_redirect') !== 'false';
+  result.phantomsSkippedDisabled = !!opts.brainDir && !phantomEnabled;
+  if (opts.brainDir && phantomEnabled) {
     try {
       phantomResult = await runPhantomRedirectPass(
         engine,

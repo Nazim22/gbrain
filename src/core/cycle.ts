@@ -1531,6 +1531,7 @@ async function runPhaseExtractFacts(
         phantoms_redirected: result.phantomsRedirected,
         phantoms_ambiguous: result.phantomsAmbiguous,
         phantoms_skipped_drift: result.phantomsSkippedDrift,
+        phantoms_skipped_disabled: result.phantomsSkippedDisabled,
         phantoms_lock_busy: result.phantomsLockBusy,
         phantoms_more_pending: result.phantomsMorePending,
       },
