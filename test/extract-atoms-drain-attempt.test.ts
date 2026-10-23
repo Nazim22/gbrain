@@ -31,6 +31,8 @@ test('a three-batch drain attempt stops at its per-run cap (one BudgetTracker pe
   // tokens) and records $0.015 (15,000 input tokens): one call fits the
   // $0.03 cap, a second reservation on the same tracker does not.
   await engine.setConfig('cycle.extract_atoms.budget_usd', '0.03');
+  // The cap arithmetic assumes a 4,096-token reservation; pin it (the local default is 8,192).
+  await engine.setConfig('cycle.extract_atoms.max_output_tokens', '4096');
   let calls = 0;
   __setChatTransportForTests(async (opts) => {
     calls++;
@@ -63,6 +65,8 @@ test('each drain attempt starts a fresh budget: the next attempt extracts the ne
   await engine.setConfig('cycle.extract_atoms.page_discovery_budget', '1');
   await engine.setConfig('models.dream.extract_atoms', 'anthropic:claude-haiku-4-5');
   await engine.setConfig('cycle.extract_atoms.budget_usd', '0.03');
+  // The cap arithmetic assumes a 4,096-token reservation; pin it (the local default is 8,192).
+  await engine.setConfig('cycle.extract_atoms.max_output_tokens', '4096');
   let calls = 0;
   __setChatTransportForTests(async (opts) => {
     calls++;

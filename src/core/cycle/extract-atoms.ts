@@ -118,7 +118,7 @@ function phaseBudgetSummary(itemsLeft: number): string {
 // Exported so tests pin the defaults instead of re-hardcoding the literals.
 // The input cap and the cut live in extract-atoms-input.ts (#6503).
 export { DEFAULT_EXTRACT_MAX_INPUT_CHARS };
-export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 4096;
+export const DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 8192;
 
 export { MAX_DETERMINISTIC_FAILURES };
 
@@ -386,7 +386,7 @@ REJECT (produce NO atom rather than a weak one):
 
 Fewer, sharper atoms beat more atoms. Zero is a valid, correct answer.
 
-Output a JSON object with an "atoms" array (0-3 per transcript, never more than 3).
+Output a JSON object with an "atoms" array (0-8 per transcript, never more than 8).
 Each atom: {title (≤80 chars), atom_type, body (2-4 sentences),
 source_quote (verbatim ≤200 chars), lesson (one sentence), concepts
 (1-3 topic labels), virality_score (0-100), emotional_register (one of:
