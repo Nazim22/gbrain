@@ -22,9 +22,32 @@ import {
   runRetrievalQuality,
   evaluateGate,
   type SearchFn,
+  type NamedThingQuestion,
+  type QuestionResult,
 } from '../eval/retrieval-quality/harness.ts';
 
 const USAGE = 'Usage: gbrain eval retrieval-quality <fixture.jsonl> [--json] [--source <id>] [--ab-relational] [--decide <slot>=<off|on|shadow> ...] [--decide-provider <id>] [--decide-dataset <jsonl>]';
+
+/** Stable per-question nightly evidence row (stderr): fixture position, family, hits, rank, truth. */
+export function formatQuestionScoreLine(
+  position: number,
+  question: NamedThingQuestion,
+  result: QuestionResult,
+): string {
+  const rank = question.family === 'hard-negative' || result.reciprocal_rank <= 0
+    ? '-'
+    : String(Math.round(1 / result.reciprocal_rank));
+  return [
+    'PQS',
+    String(position + 1),
+    question.family,
+    `hit1=${result.hit_at_1 ? 1 : 0}`,
+    `hit3=${result.hit_at_3 ? 1 : 0}`,
+    `rank=${rank}`,
+    `relevant=${question.relevant?.join(',') || '-'}`,
+    `forbidden=${question.forbidden?.join(',') || '-'}`,
+  ].join('\t');
+}
 
 export async function runEvalRetrievalQuality(engine: BrainEngine, argv: string[]): Promise<void> {
   if (argv.includes('--help') || argv.includes('-h')) {
@@ -79,6 +102,7 @@ export async function runEvalRetrievalQuality(engine: BrainEngine, argv: string[
       ...(decideRun ? { onMeta: (m) => { meta = m; } } : {}),
     });
     if (decideRun && before) decideRows.push({ query: q, decide: decideRowReceipt(decideRun, meta?.decide, spendDelta(before, await decideSpendTotals(engine))) });
+    console.error(`PQ\t${q}\t${results.length}\t${results.map(r => r.slug).join(',')}`);
     return results.map(r => r.slug);
   };
 
@@ -126,6 +150,10 @@ export async function runEvalRetrievalQuality(engine: BrainEngine, argv: string[
 
   const report = await runRetrievalQuality(questions, searchFn);
   const gate = evaluateGate(report);
+
+  report.questions.forEach((result, position) => {
+    console.error(formatQuestionScoreLine(position, questions[position]!, result));
+  });
 
   const decide = decideRun ? { ...decideRun.runConfig, summary: summarizeDecideReceipts(decideRows.map((r) => r.decide)), queries: decideRows } : undefined;
   if (json) {
