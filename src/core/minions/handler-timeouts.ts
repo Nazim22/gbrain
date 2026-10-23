@@ -58,10 +58,11 @@ export const HANDLER_DEFAULT_TIMEOUT_MS: Readonly<Record<string, number>> = {
   subagent_aggregator: THIRTY_MIN_MS,
   'embed-backfill': THIRTY_MIN_MS,
   'connector-sync': THIRTY_MIN_MS,
-  'autopilot-cycle': THIRTY_MIN_MS,
-  // #2194 fix #3: brain-wide maintenance (embed-all/orphans/purge/…) can run
-  // longer than a single source cycle; give it the same 30-min budget.
-  'autopilot-global-maintenance': THIRTY_MIN_MS,
+  // Local production envelope (S400): 30 minutes repeatedly killed full cycles
+  // during content-writing phases on local models. Keep both full-cycle
+  // anchors aligned (#2194 fix #3: global maintenance gets the cycle budget).
+  'autopilot-cycle': SIXTY_MIN_MS,
+  'autopilot-global-maintenance': SIXTY_MIN_MS,
   // #5761: a brain-wide `extract --stale` pass (the remediation plan submits it
   // without --timeout-ms) walks every stale page; same 30-min budget.
   extract: THIRTY_MIN_MS,

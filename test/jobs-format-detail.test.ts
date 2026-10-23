@@ -74,7 +74,7 @@ describe('formatJobDetail timeout/deadline lines', () => {
 
   test('unset budget + mapped handler: names the claim-time default', () => {
     const out = formatJobDetail(job({ name: 'autopilot-cycle', timeout_ms: null }));
-    expect(out).toContain('Timeout: (unset) — handler default 1800000ms stamps at claim');
+    expect(out).toContain('Timeout: (unset) — handler default 3600000ms stamps at claim');
   });
 
   test('unset budget + unmapped handler: names the null-default sweep', () => {
