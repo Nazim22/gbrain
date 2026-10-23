@@ -26,6 +26,57 @@ import {
 
 // --- v0.43 (#2095): push-based context — the brain volunteers pages ---
 
+const reflex_pointers: Operation = {
+  name: 'reflex_pointers',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
+  description:
+    'Retrieval Reflex (#1981) over an op transport: extract salient entities from a turn of ' +
+    'user text and resolve them to compact page pointers. Same pipeline, gate, timeout and ' +
+    'heartbeat as the context-engine layer — for hosts (per-prompt hooks, non-context-engine ' +
+    'agents) that consume the brain over MCP instead of assemble().',
+  scope: 'read',
+  params: {
+    text: {
+      type: 'string',
+      required: true,
+      description: 'Current user turn whose salient entities should be resolved to brain pointers.',
+    },
+    prior_context: {
+      type: 'string',
+      description: 'Previously assembled context used to suppress already-surfaced pointers.',
+    },
+    max_pointers: {
+      type: 'number',
+      description: 'Maximum compact pointers to return (default and hard cap follow the reflex pipeline).',
+    },
+    min_trust: MIN_TRUST_PARAM,
+  },
+  handler: async (ctx, p) => {
+    const { buildReflexAddition } = await import('../context/reflex.ts');
+    const { resolveEntitiesToPointers } = await import('../context/retrieval-reflex.ts');
+    const maxPointers =
+      typeof p.max_pointers === 'number' && p.max_pointers > 0 ? p.max_pointers : undefined;
+    const scope = sourceScopeOpts(ctx);
+    const sourceIds = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : ['default']);
+    const eligibility = await proactiveEligibility(ctx, 'retrieval_reflex', { minTrust: p.min_trust });
+    const text = await buildReflexAddition({
+      workspaceDir: process.cwd(),
+      currentUserText: p.text as string,
+      priorContextText: typeof p.prior_context === 'string' ? p.prior_context : '',
+      resolveEntities: (candidates, opts) =>
+        resolveEntitiesToPointers(ctx.engine, sourceIds[0], candidates, {
+          ...opts,
+          sourceIds,
+          eligibility,
+          maxPointers: maxPointers ?? opts.maxPointers,
+        }),
+    });
+    return { text };
+  },
+};
+
 const volunteer_context: Operation = {
   name: 'volunteer_context',
   mutating: false,
@@ -379,4 +430,4 @@ const find_trajectory: Operation = {
   cliHints: { name: 'find-trajectory' },
 };
 
-export { volunteer_context, find_experts, find_contradictions, find_trajectory };
+export { reflex_pointers, volunteer_context, find_experts, find_contradictions, find_trajectory };

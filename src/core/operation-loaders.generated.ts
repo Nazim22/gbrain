@@ -194,6 +194,7 @@ export const OPERATION_LOADERS: Record<string, readonly [() => Promise<Record<st
   "ontology_conflicts": [load_chronicle, "chronicleOperations"],
   "volunteer_chronicle": [load_chronicle, "chronicleOperations"],
   "chronicle_backfill": [load_chronicle, "chronicleOperations"],
+  "reflex_pointers": [load_insights, "reflex_pointers"],
   "volunteer_context": [load_insights, "volunteer_context"],
   "extract_entities": [load_extraction, "extractionOperations"],
   "extraction_pending": [load_extraction, "extractionOperations"],

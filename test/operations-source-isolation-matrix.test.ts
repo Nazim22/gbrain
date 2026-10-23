@@ -107,6 +107,7 @@ const MATRIX: Row[] = [
   { name: 'think', mode: 'skip', reason: 'LLM-dependent; think-source-isolation-pglite e2e owns its scoping' },
   { name: 'list_write_conflicts', mode: 'skip', reason: 'needs source_changed conflict receipts from a bound canonical checkout; test/maintenance-file-drift-6643.test.ts owns its out-of-grant refusal, source-scoped window and slug-fence filtering' },
   { name: 'search_by_image', mode: 'skip', reason: 'needs image-embedding infra; cross-modal suites own it' },
+  { name: 'reflex_pointers', mode: 'skip', reason: 'retrieval-reflex operation contract suite owns resolver scoping' },
   { name: 'volunteer_context', mode: 'skip', reason: 'session/reflex machinery; volunteer-context suites own scoping' },
   { name: 'context_pack', mode: 'skip', reason: 'verbs conformance owns it; budget-packed composite of scoped reads' },
   { name: 'delta', mode: 'skip', reason: 'session-cursor verb; conformance suite owns it — page-delta arm is session-coupled (probe: fresh writes not listed)' },

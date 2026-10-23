@@ -164,6 +164,7 @@ const SWEEP: Record<string, Row> = {
   ontology_get: { args: { entity: 'people/alice-example', include_quarantined: true } },
   ontology_conflicts: { args: {}, content: false },
   volunteer_chronicle: { args: { days: 30, limit: 50 } },
+  reflex_pointers: { args: { text: 'What do we know about people/alice-example?' }, content: false },
   volunteer_context: { args: { window: 'What do we know about people/alice-example?' }, content: false },
   extraction_pending: { args: { limit: 50 } },
   recall: { args: { query: 'PLANTMARK note body', entity: 'people/alice-example' } },

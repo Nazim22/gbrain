@@ -5363,6 +5363,43 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "area": "chronicle"
   },
   {
+    "name": "reflex_pointers",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": "retrieval",
+    "description": "Retrieval Reflex (#1981) over an op transport: extract salient entities from a turn of user text and resolve them to compact page pointers. Same pipeline, gate, timeout and heartbeat as the context-engine layer — for hosts (per-prompt hooks, non-context-engine agents) that consume the brain over MCP instead of assemble().",
+    "scope": "read",
+    "params": {
+      "text": {
+        "type": "string",
+        "required": true,
+        "description": "Current user turn whose salient entities should be resolved to brain pointers."
+      },
+      "prior_context": {
+        "type": "string",
+        "description": "Previously assembled context used to suppress already-surfaced pointers."
+      },
+      "max_pointers": {
+        "type": "number",
+        "description": "Maximum compact pointers to return (default and hard cap follow the reflex pipeline)."
+      },
+      "min_trust": {
+        "type": "string",
+        "enum": [
+          "user_confirmed",
+          "operator_curated",
+          "tool_observed",
+          "agent_written",
+          "unknown",
+          "external_untrusted"
+        ],
+        "description": "Lowest trust tier to return (the connection floor still applies).",
+        "fullSurfaceOnly": true
+      }
+    },
+    "area": "insights"
+  },
+  {
     "name": "volunteer_context",
     "mutating": false,
     "idempotent": true,

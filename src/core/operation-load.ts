@@ -102,7 +102,7 @@ const OP_AREAS: Record<string, string> = {
   get_recent_salience: 'insights', find_anomalies: 'insights',
   find_contradictions: 'insights', find_experts: 'insights',
   find_trajectory: 'insights', get_calibration_profile: 'insights',
-  volunteer_context: 'insights', get_recent_transcripts: 'insights',
+  reflex_pointers: 'insights', volunteer_context: 'insights', get_recent_transcripts: 'insights',
   // code intelligence
   code_callers: 'code', code_callees: 'code', code_def: 'code',
   code_refs: 'code', code_blast: 'code', code_flow: 'code',
