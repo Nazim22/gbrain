@@ -861,9 +861,18 @@ function isLocallySuperseded(r: SearchResult): boolean {
  * title winner (applyReranker's protected row) stays first.
  */
 export function applySupersedeDownrankPostRerank(results: SearchResult[]): void {
-  const headEnd = results.findIndex((r) => typeof r.rerank_score !== 'number');
+  // applyReranker restores an omitted (unscored) rank-1 title winner to index 0,
+  // ahead of the scored head; it must not be read as the head's end.
+  const lead = results[0]?.title_match_boost && typeof results[0].rerank_score !== 'number' ? 1 : 0;
+  const headEnd = results.findIndex((r, i) => i >= lead && typeof r.rerank_score !== 'number');
   const end = headEnd === -1 ? results.length : headEnd;
-  if (end === 0) return;
+  if (end === lead) return;
+  if (lead && results[0]!.superseded === true) {
+    // A superseded winner loses its protection; with no score to compare, it drops to the head's end.
+    const [winner] = results.splice(0, 1);
+    winner!.supersede_penalty = SUPERSEDE_PENALTY;
+    results.splice(end - 1, 0, winner!);
+  }
   const protectedPrefix = results[0]?.title_match_boost && results[0]?.superseded !== true ? 1 : 0;
   const touched: SearchResult[] = [];
   for (let i = 0; i < end; i++) {

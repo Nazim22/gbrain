@@ -247,6 +247,60 @@ describe('applySupersedeDownrank', () => {
     ]);
   });
 
+  test('partial reranker response: an omitted title winner does not end the scored head', async () => {
+    const canonical = res('notes/canonical', 1);
+    canonical.title_match_boost = 1.25;
+    const retired = res('notes/retired', 2);
+    retired.superseded = true;
+    const current = res('notes/current', 3);
+
+    const reranked = await applyReranker('canonical', [canonical, retired, current], {
+      enabled: true,
+      topNIn: 3,
+      topNOut: null,
+      // index 0 (the title winner) omitted: applyReranker restores it, unscored, to index 0.
+      rerankerFn: async () => [
+        { index: 1, relevanceScore: 0.9 },
+        { index: 2, relevanceScore: 0.8 },
+      ],
+    });
+    expect(reranked.map((r) => r.slug)).toEqual(['notes/canonical', 'notes/retired', 'notes/current']);
+    expect(canonical.rerank_score).toBeUndefined();
+
+    applySupersedeDownrankPostRerank(reranked);
+
+    expect(reranked.map((r) => r.slug)).toEqual(['notes/canonical', 'notes/current', 'notes/retired']);
+    expect(retired.rerank_score).toBeCloseTo(0.9 * SUPERSEDE_PENALTY, 6);
+    expect(retired.supersede_penalty).toBe(SUPERSEDE_PENALTY);
+    expect(current.rerank_score).toBe(0.8);
+  });
+
+  test('partial reranker response: an omitted superseded title winner loses its protection', async () => {
+    const winner = res('notes/old-winner', 1);
+    winner.title_match_boost = 1.25;
+    winner.superseded = true;
+    const retired = res('notes/retired', 2);
+    retired.superseded = true;
+    const current = res('notes/current', 3);
+
+    const reranked = await applyReranker('old winner', [winner, retired, current], {
+      enabled: true,
+      topNIn: 3,
+      topNOut: null,
+      rerankerFn: async () => [
+        { index: 1, relevanceScore: 0.9 },
+        { index: 2, relevanceScore: 0.8 },
+      ],
+    });
+    expect(reranked.map((r) => r.slug)).toEqual(['notes/old-winner', 'notes/retired', 'notes/current']);
+
+    applySupersedeDownrankPostRerank(reranked);
+
+    expect(reranked.map((r) => r.slug)).toEqual(['notes/current', 'notes/retired', 'notes/old-winner']);
+    expect(winner.supersede_penalty).toBe(SUPERSEDE_PENALTY);
+    expect(retired.rerank_score).toBeCloseTo(0.9 * SUPERSEDE_PENALTY, 6);
+  });
+
   test('signed reranker scores demote superseded rows downward', () => {
     const current = res('notes/current-negative', 1);
     current.rerank_score = -1;
