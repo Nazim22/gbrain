@@ -103,6 +103,15 @@ import { parseAtomsOutcome } from './extract-atoms-parse.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
+// Local invariant: the routine cycle's extract_atoms has no wall-clock bound
+// upstream, and on local models the dollar cap never binds. Stop starting new
+// items after this budget (default 15 minutes); the rest resume next cycle.
+const DEFAULT_EXTRACT_PHASE_BUDGET_MS = Number(
+  process.env.GBRAIN_EXTRACT_PHASE_BUDGET_MS ?? 900_000,
+);
+function phaseBudgetSummary(itemsLeft: number): string {
+  return itemsLeft > 0 ? ` — PARTIAL: ${itemsLeft} item(s) left for the next cycle (phase budget reached)` : '';
+}
 // #4529 + #4540: per-item extractor caps, overridable via
 // cycle.extract_atoms.* config keys (max_input_chars — with the #4529
 // legacy alias max_source_chars — plus max_output_tokens / pacing_ms).
@@ -251,6 +260,8 @@ export interface ExtractAtomsOpts {
    * limit in the rollup, like a budget stop.
    */
   stopSignal?: AbortSignal;
+  /** Wall-clock bound for starting new work items (default 15 minutes); a soft stop like `stopSignal`. */
+  phaseBudgetMs?: number;
   /** #5856/#5854: one drain attempt's state shared by its batches: the first batch's BudgetTracker (one cap per attempt) and one publish wait. */
   attempt?: { budgetTracker?: BudgetTracker; writeWait?: MaintenanceWriteWait };
 }
@@ -1100,10 +1111,12 @@ export async function runPhaseExtractAtoms(
     }
   }
 
-  let stoppedEarly = false;
+  let stoppedEarly = false, phaseBudgetLeft = 0; // phaseBudgetLeft: items never started (phase budget ran out)
+  const phaseBudgetMs = opts.phaseBudgetMs ?? DEFAULT_EXTRACT_PHASE_BUDGET_MS, phaseDeadline = Date.now() + phaseBudgetMs;
   await withBudgetTracker(budgetTracker, async () => {
-  for (const item of work) {
+  for (const [index, item] of work.entries()) {
     if (opts.signal?.aborted || opts.stopSignal?.aborted) { stoppedEarly = true; break; }
+    if (Date.now() >= phaseDeadline) { stoppedEarly = true; phaseBudgetLeft = work.length - index; break; }
     await maybeYield();
     if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
       if (item.kind === 'transcript') transcriptsSkipped++;
@@ -1461,8 +1474,9 @@ export async function runPhaseExtractAtoms(
       (transcriptsSkipped + pagesSkipped > 0
         ? ` (${transcriptsSkipped + pagesSkipped} budget-skipped)`
         : '') +
-      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : ''),
+      (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : '') + phaseBudgetSummary(phaseBudgetLeft),
     details: {
+      partial: stoppedEarly, phase_budget_ms: phaseBudgetMs, phase_budget_left: phaseBudgetLeft,
       atoms_extracted: totalAtomsExtracted,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,
