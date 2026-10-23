@@ -37,6 +37,12 @@ describe('resolveSynthMaxOutputTokens', () => {
     expect(resolveSynthMaxOutputTokens('anthropic:claude-sonnet-5')).toBe(THINKING_MODEL_MAX_OUTPUT_TOKENS);
   });
 
+  test('Gemma 4 on llama-server gets a bounded, model-specific reasoning budget', () => {
+    expect(resolveSynthMaxOutputTokens('llama-server:gemma-4-12b-qat')).toBe(1536);
+    expect(resolveSynthMaxOutputTokens('llama-server:other-model')).toBe(500);
+    expect(resolveSynthMaxOutputTokens('other-provider:gemma-4-12b-qat')).toBe(500);
+  });
+
   test('keeps the 500 default for a non-thinking model', () => {
     expect(getProviderCapabilities('groq:qwen/qwen3.8-27b').supportsThinking).toBe(false);
     expect(resolveSynthMaxOutputTokens('groq:qwen/qwen3.8-27b')).toBe(500);
@@ -88,6 +94,31 @@ describe('synthesize_concepts wires the cap into the narrative call', () => {
       };
     };
   }
+
+  test('a reasoning-exhausted 500-token Gemma call produces a narrative at the bounded cap', async () => {
+    await engine.setConfig('models.dream.synthesize', 'llama-server:gemma-4-12b-qat');
+    const caps: number[] = [];
+    const result = await runPhaseSynthesizeConcepts(engine, {
+      dryRun: true,
+      _atoms: Array.from({ length: 10 }, (_, i) => ({
+        slug: `atoms/a${i}`, concept_refs: ['concepts/x'], body: `body ${i}`, title: `A${i}`,
+      })),
+      _chat: async (o: ChatOpts) => {
+        caps.push(o.maxTokens ?? 0);
+        const text = (o.maxTokens ?? 0) >= 1536 ? 'A synthesized concept narrative.' : '';
+        return {
+          text,
+          blocks: text ? [{ type: 'text', text }] : [],
+          stopReason: text ? 'end' : 'length',
+          usage: { input_tokens: 500, output_tokens: text ? 1003 : 500, cache_read_tokens: 0, cache_creation_tokens: 0 },
+          model: 'llama-server:gemma-4-12b-qat', providerId: 'llama-server',
+        };
+      },
+    });
+    expect(caps).toEqual([1536]);
+    expect((result.details as any).synthesis_mode_counts.llm).toBe(1);
+    expect((result.details as any).synthesis_mode_counts.error_fallback).toBe(0);
+  });
 
   test('a thinking-by-default models.dream.synthesize gets the gateway thinking cap; a non-thinking one keeps 500', async () => {
     await engine.setConfig('models.dream.synthesize', 'deepseek:deepseek-v4-flash');
