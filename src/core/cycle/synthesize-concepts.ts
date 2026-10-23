@@ -518,6 +518,7 @@ export async function runPhaseSynthesizeConcepts(
     if (!opts.dryRun) {
       // #5525: tighten-only — a concept already private stays private.
       const prior = await engine.getPage(conceptSlug, { sourceId: src });
+      if (Date.now() >= deadline || opts.signal?.aborted) { groupsSkipped = atomGroups.length - index; break; } // lookup outlived the cancel
       const visibility = strictestVisibility([group.visibility, prior?.frontmatter?.visibility === 'private' ? 'private' : 'world']);
       // #2163: serialize to markdown and import via the canonical pipeline so
       // the page is chunked (+ embedded when a provider is configured) —
