@@ -123,6 +123,12 @@ export function resolveSynthMaxOutputTokens(modelStr: string): number {
 // cycle re-derives groups and resumes (concept writes are idempotent upserts).
 const DEFAULT_PHASE_BUDGET_MS = Number(process.env.GBRAIN_CONCEPTS_PHASE_BUDGET_MS ?? 240_000);
 
+/** The narrative call's cancel: the caller's signal or the remaining phase deadline, whichever fires first. */
+function conceptCallSignal(deadline: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
 export interface SynthesizeConceptsOpts {
   brainDir?: string;
   /**
@@ -432,6 +438,7 @@ export async function runPhaseSynthesizeConcepts(
         try {
           const result = await chat({
             model: synthModel,
+            abortSignal: conceptCallSignal(deadline, opts.signal),
             system: SYNTH_PROMPT,
             messages: [
               {
@@ -472,6 +479,7 @@ export async function runPhaseSynthesizeConcepts(
             retries.fail(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash);
           }
         } catch (err) {
+          if (Date.now() >= deadline || opts.signal?.aborted) { groupsSkipped = atomGroups.length - index; break; } // cancelled: no strike
           const msg = err instanceof Error ? err.message : String(err);
           // #3044 adoption: a whole-run LLM outage must not overwrite
           // existing concept pages with error_fallback stub narratives.
@@ -499,6 +507,7 @@ export async function runPhaseSynthesizeConcepts(
       narrative = deterministicNarrative(group);
       synthesisMode = 'deterministic_tier';
     }
+    if (Date.now() >= deadline || opts.signal?.aborted) { groupsSkipped = atomGroups.length - index; break; } // never publish a late reply
     // Never replace an LLM narrative with a template stub; the next cycle retries.
     if (priorMode === 'llm' && (synthesisMode === 'budget_fallback' || synthesisMode === 'error_fallback')) {
       keptExistingNarrative.push(conceptSlug);
@@ -540,7 +549,7 @@ export async function runPhaseSynthesizeConcepts(
     // right cadence (30s instead of every-group).
     await maybeYield();
   }
-  if (maintenance) await writer.flush();
+  if (maintenance && groupsSkipped === 0) await writer.flush(); // local: no publication after a deadline/signal cancel; queued concepts re-derive next cycle
 
   // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Receipt/rollup
   // carry the cycle's resolved source (#4416, opts.sourceId); 'default'
