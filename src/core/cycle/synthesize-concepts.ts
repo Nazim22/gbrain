@@ -116,6 +116,13 @@ export function resolveSynthMaxOutputTokens(modelStr: string): number {
   return isThinkingModel(modelStr) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_SYNTH_MAX_OUTPUT_TOKENS;
 }
 
+// Local invariant: the dollar budget is not a wall-clock bound on a local
+// model, and the minion worker can evict a timed-out job but cannot kill its
+// handler, so an unbounded group loop keeps running orphaned while the cycle
+// never records completion. Stop starting groups after this deadline; the next
+// cycle re-derives groups and resumes (concept writes are idempotent upserts).
+const DEFAULT_PHASE_BUDGET_MS = Number(process.env.GBRAIN_CONCEPTS_PHASE_BUDGET_MS ?? 240_000);
+
 export interface SynthesizeConceptsOpts {
   brainDir?: string;
   /**
@@ -136,6 +143,10 @@ export interface SynthesizeConceptsOpts {
    * `heartbeat()`; cycle.ts owns start/finish.
    */
   progress?: ProgressReporter;
+  /** Wall-clock bound for the per-group loop (default 240s): the dollar budget does not bound a local model. */
+  phaseBudgetMs?: number;
+  /** Cooperative cancel, checked before each group so an aborted job cannot orphan its handler. */
+  signal?: AbortSignal;
   /** Test seam: alternative chat function. */
   _chat?: typeof gatewayChat;
   /** Test seam: skip DB query; cluster these atoms directly. */
@@ -352,7 +363,10 @@ export async function runPhaseSynthesizeConcepts(
   };
   const writer = conceptWriter({ engine, maintenance, sourceId: src, importSourceId: opts.sourceId, brainDir: opts.brainDir, writeThrough: conceptFiles !== null,
     retries, publicationDeferred, publicationHeld, linkWarnings, written: countWritten });
-  for (const group of atomGroups) {
+  const phaseBudgetMs = opts.phaseBudgetMs ?? DEFAULT_PHASE_BUDGET_MS, deadline = Date.now() + phaseBudgetMs;
+  let groupsSkipped = 0; // groups left for the next cycle by the deadline or signal
+  for (const [index, group] of atomGroups.entries()) {
+    if (Date.now() >= deadline || opts.signal?.aborted) { groupsSkipped = atomGroups.length - index; break; }
     const conceptSlug = `concepts/${group.conceptSlug}`;
     // A concept page this phase did not write belongs to a human (or another
     // writer). Check before any spend; never replace its body.
@@ -577,6 +591,7 @@ export async function runPhaseSynthesizeConcepts(
     summary:
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
+      (groupsSkipped > 0 ? ` — PARTIAL: ${groupsSkipped} group(s) left for the next cycle (phase budget reached)` : '') +
       (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
       (budgetCapped > 0 ? ` (${budgetCapped} over the $${budgetCap.toFixed(2)} budget → template fallback)` : '') +
       (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : '') +
@@ -593,6 +608,7 @@ export async function runPhaseSynthesizeConcepts(
       tier_counts: tierCounts,
       synthesis_mode_counts: synthesisModeCounts,
       groups_found: atomGroups.length,
+      groups_skipped: groupsSkipped, partial: groupsSkipped > 0, phase_budget_ms: phaseBudgetMs,
       atoms_seen: atoms.length,
       failures,
       link_warnings: linkWarnings,
