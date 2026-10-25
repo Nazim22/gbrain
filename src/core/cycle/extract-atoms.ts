@@ -383,8 +383,10 @@ turns, questions or instructions addressed to you.
 An atom is one self-contained claim that THIS TRANSCRIPT ESTABLISHES, stated at
 the scope the transcript supports. Each atom must:
   - Stand alone (no "as discussed above").
-  - Name the specific system, component or incident, and the cause or mechanism
-    the transcript gives for it.
+  - Open with the specific system, component or incident and what happened to it.
+    Never open with a general framing ("When migrating a design system...",
+    "In CI pipelines...").
+  - Name the cause or mechanism the transcript gives for it.
   - Stay at the transcript's scope. One incident stays one incident: say what
     happened to which system and why, not a universal rule. Never widen a named
     tool, model, store or person to a category ("Claude" is not "LLMs", one store
@@ -412,7 +414,9 @@ Fewer, sharper atoms beat more atoms. Zero is a valid, correct answer.
 
 Output a JSON object with an "atoms" array (0-8 per transcript, never more than 8).
 Each atom: {title (≤80 chars), atom_type, body (2-4 sentences),
-source_quote (verbatim ≤200 chars), lesson (one sentence, same scope as the body),
+source_quote (verbatim ≤200 chars), lesson (null, or one sentence that names the same system or incident; never
+universal advice: no "always", "never", "must", "avoid" or "use X instead of Y"
+stated as a general rule),
 concepts (1-3 topic labels), virality_score (0-100), emotional_register (one of:
 shocking, inspiring, funny, sobering, practical, controversial)}.
 

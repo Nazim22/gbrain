@@ -72,6 +72,9 @@ describe('extract_atoms prompt — content-free transcript rule', () => {
     // widen one incident into a general rule): atoms stay at the transcript's scope and quote it verbatim.
     expect(capturedSystem).toMatch(/THIS TRANSCRIPT ESTABLISHES, stated at\s+the scope the transcript supports/);
     expect(capturedSystem).toContain('One incident stays one incident');
+    // A2: open with the specific system; lesson is null or names the same system, never universal advice
+    expect(capturedSystem).toContain('Open with the specific system, component or incident');
+    expect(capturedSystem).toMatch(/lesson \(null, or one sentence that names the same system or incident/);
     expect(capturedSystem).toMatch(/If no passage supports the claim\s+verbatim, do not output the atom/);
     expect(capturedSystem).toContain('0-8 per transcript, never more than 8');
     expect(capturedMaxTokens).toBe(8192);
