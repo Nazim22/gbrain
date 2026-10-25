@@ -68,8 +68,11 @@ describe('extract_atoms prompt — content-free transcript rule', () => {
     expect(capturedSystem).toMatch(/no extractable idea[\s\S]*output exactly \{"atoms":\[\]\}/);
     expect(capturedSystem).toMatch(/never invent an atom/);
     expect(capturedSystem).toMatch(/never explain in prose/);
-    expect(capturedSystem).toMatch(/STILL BE\s+TRUE AND USEFUL IN SIX MONTHS/);
-    expect(capturedSystem).toContain('durable, not a status report');
+    // S551 (A1 prompt, replaces the S390 "durable / six months" wording, which pushed the model to
+    // widen one incident into a general rule): atoms stay at the transcript's scope and quote it verbatim.
+    expect(capturedSystem).toMatch(/THIS TRANSCRIPT ESTABLISHES, stated at\s+the scope the transcript supports/);
+    expect(capturedSystem).toContain('One incident stays one incident');
+    expect(capturedSystem).toMatch(/If no passage supports the claim\s+verbatim, do not output the atom/);
     expect(capturedSystem).toContain('0-8 per transcript, never more than 8');
     expect(capturedMaxTokens).toBe(8192);
   });
