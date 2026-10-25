@@ -117,9 +117,6 @@ export function thinkingOffControl(modelStr: string): ThinkingOffControl | undef
   if (provider === 'openrouter') return model.startsWith('deepseek/') ? { set: { namespace: provider, options: THINKING_DISABLED }, disables: true } : undefined;
   if (provider === 'google') return googleControl(model);
   if (provider === 'openai') return openaiControl(model);
-  // S551: llama-server applies `chat_template_kwargs` to the model's own jinja template (Gemma 4, Qwen3 honour
-  // enable_thinking); the openai-compatible provider spreads this namespace into the request body.
-  if (provider === 'llama-server') return { set: { namespace: 'llama-server', options: { chat_template_kwargs: { enable_thinking: false } } }, disables: true };
   return undefined;
 }
 

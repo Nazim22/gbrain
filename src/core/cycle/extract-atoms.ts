@@ -338,6 +338,19 @@ export function locateQuote(
   return valid[0]!;
 }
 
+/** S551: `cycle.extract_atoms.provider_options` must be a JSON object of objects (namespace -> options); anything else is ignored with a warning. */
+export function parseExtractProviderOptions(raw: string | null | undefined): Record<string, Record<string, unknown>> | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (v && typeof v === 'object' && !Array.isArray(v) && Object.values(v).every(o => o && typeof o === 'object' && !Array.isArray(o))) {
+      return v as Record<string, Record<string, unknown>>;
+    }
+  } catch { /* fall through */ }
+  console.error('[extract_atoms] ignoring cycle.extract_atoms.provider_options: expected a JSON object of objects');
+  return undefined;
+}
+
 /** #5705: wrap the transcript as data (an inner closing tag is escaped) so a chat export is not read as a turn to answer. */
 /**
  * System prompt + user message for one item. With extraction.date_grounding
@@ -962,7 +975,9 @@ export async function runPhaseExtractAtoms(
   // above (extract-atoms-input.ts).
   let maxOutputTokens = DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS;
   let pacingMs = 0;
-  let thinkingOff = false; // S551: cycle.extract_atoms.thinking=off -> chat({ thinking: 'off' })
+  // S551: operator-set provider options for extraction calls only, e.g.
+  // {"llama-server":{"chat_template_kwargs":{"enable_thinking":false}}}. Other callers are untouched.
+  let extractProviderOptions: Record<string, Record<string, unknown>> | undefined;
   try {
     extractModel = await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
@@ -979,7 +994,7 @@ export async function runPhaseExtractAtoms(
     }
     // Optional per-item pacing sleep (ms) so a large backlog doesn't hammer
     // a local/self-hosted provider back-to-back. 0 (default) = no pacing.
-    thinkingOff = (await engine.getConfig('cycle.extract_atoms.thinking'))?.trim().toLowerCase() === 'off';
+    extractProviderOptions = parseExtractProviderOptions(await engine.getConfig('cycle.extract_atoms.provider_options'));
     const configuredPacing = await engine.getConfig('cycle.extract_atoms.pacing_ms');
     if (configuredPacing) {
       const n = Number(configuredPacing);
@@ -1165,7 +1180,7 @@ export async function runPhaseExtractAtoms(
         model: extractModel,
         ...atomsPrompt(dateGrounding, originLabel, promptContent),
         maxTokens: maxOutputTokens, responseSchema: ATOMS_RESPONSE_SCHEMA,
-        ...(thinkingOff ? { thinking: 'off' as const } : {}),
+        ...(extractProviderOptions ? { providerOptions: extractProviderOptions } : {}),
         abortSignal: opts.signal,
       });
       // Post-await yield: closes the "long LLM call past TTL" hazard

@@ -1463,8 +1463,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'cycle.extract_atoms.max_input_chars',
   'cycle.extract_atoms.max_output_tokens',
   'cycle.extract_atoms.pacing_ms',
-  // S551: 'off' sends the route's thinking-off option on every extraction call (thinking-off.ts); unset = model default.
-  'cycle.extract_atoms.thinking',
+  // S551: JSON object of provider-options namespaces passed on extraction calls only (e.g. llama-server chat_template_kwargs).
+  'cycle.extract_atoms.provider_options',
   'models.dream.patterns',
   'models.dream.synthesize_verdict',
   // #4152: preferred triage-model key (explicit pre-read in loadSynthConfig;
