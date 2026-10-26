@@ -1,0 +1,66 @@
+import { expect, test } from 'bun:test';
+import { lunaBody, parseLuna, gemmaBody, parseGemma, Budget, guardedRequest, encodeLog } from './adapter.ts';
+const event = (type: string, response: unknown = {}) => `event: ${type}\ndata: ${JSON.stringify({ type, response })}\n\n`;
+const done = (text = '[]') => event('response.completed', { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text }] }], usage: { input_tokens: 7, output_tokens: 2 } });
+test('completed valid output alone is accepted', () => {
+  expect(parseLuna(done()).status).toBe('SUCCESS');
+  expect(parseLuna(done('not JSON')).status).toBe('FAILED-SCHEMA');
+});
+test('terminal failures never promote partial content', () => {
+  for (const [wire, status] of [[event('response.failed'), 'FAILED'], [event('response.incomplete'), 'FAILED-TRUNCATED'], ['data: {"type":"response.output_text.delta","delta":"[]"}\n\n', 'UNKNOWN']] as const) {
+    expect(parseLuna(wire).status).toBe(status);
+  }
+});
+test('request bodies pin settings and share exact prompt bytes', () => {
+  const prompt = { system: 'exact system', messages: [{ role: 'user' as const, content: 'exact user' }] };
+  const luna = lunaBody(prompt), gemma = gemmaBody(prompt);
+  expect(luna.instructions).toBe(gemma.messages[0].content);
+  expect(luna.input[0].content).toBe(gemma.messages[1].content);
+  expect(luna.model).toBe('gpt-6-luna'); expect(luna.reasoning.effort).toBe('minimal');
+  expect(gemma.max_tokens).toBe(8192); expect(gemma.chat_template_kwargs.enable_thinking).toBe(false);
+});
+test('guard rejects disallowed parameters before network', async () => {
+  for (const key of ['temperature', 'max_output_tokens', 'metadata', 'text', 'tools']) {
+    let sent = false;
+    await expect(guardedRequest('https://api.openai.com/v1/responses', { ...lunaBody({ system: 's', messages: [{role:'user',content:'u'}] }), [key]: 1 }, async () => { sent = true; throw Error(); })).rejects.toThrow('REQUEST-SHAPE');
+    expect(sent).toBe(false);
+  }
+});
+test('fixed endpoints reject alternate hosts, query strings and redirects', async () => {
+  let sent = 0;
+  for (const url of ['https://elsewhere.invalid/v1/responses','https://api.openai.com/v1/responses?x=1','http://api.openai.com/v1/responses']) {
+    await expect(guardedRequest(url, undefined, async () => { sent++; throw Error(); })).rejects.toThrow('ENDPOINT');
+  }
+  expect(sent).toBe(0);
+  await expect(guardedRequest('https://api.openai.com/v1/models', undefined, async () => ({status:302,raw:Buffer.from('')}))).rejects.toThrow('REDIRECT');
+});
+test('HTTP stop statuses never retry and error text is not exposed', async () => {
+  for (const status of [401,403,429,503]) {
+    let sent = 0;
+    await expect(guardedRequest('https://api.openai.com/v1/models', undefined, async () => { sent++; return {status,raw:Buffer.from('private error body')}; })).rejects.toThrow(`HTTP-${status}`);
+    expect(sent).toBe(1);
+  }
+});
+test('arm and auth counters are separate, wall bounds fail closed', () => {
+  let now = 0; const budget = new Budget(() => now);
+  for(let i=0;i<22;i++) budget.take('luna');
+  expect(() => budget.take('luna')).toThrow('REQUEST-BOUND');
+  for(let i=0;i<20;i++) budget.take('gemma');
+  expect(() => budget.take('gemma')).toThrow('REQUEST-BOUND');
+  budget.take('auth'); expect(budget.counts).toEqual({luna:22,gemma:20,auth:1});
+  for(let i=1;i<12;i++)budget.take('auth');
+  expect(()=>budget.take('auth')).toThrow('REQUEST-BOUND');
+  const cloudExpired = new Budget(() => now); cloudExpired.take('luna'); now=2_700_001;
+  expect(()=>cloudExpired.take('luna')).toThrow('WALL-BOUND');
+  const expired = new Budget(() => now); expired.take('gemma'); now+=3_600_001;
+  expect(() => expired.take('gemma')).toThrow('WALL-BOUND');
+});
+test('Gemma truncation and invalid/absent choice are failures', () => {
+  expect(parseGemma(JSON.stringify({choices:[{message:{content:'[]'},finish_reason:'length'}]})).status).toBe('FAILED-TRUNCATED');
+  expect(parseGemma(JSON.stringify({choices:[{message:{content:'[]'},finish_reason:'stop'}]})).status).toBe('SUCCESS');
+  expect(parseGemma('{}').status).not.toBe('SUCCESS');
+});
+test('log allowlist rejects untrusted strings and excludes secrets/content', () => {
+  const encoded = encodeLog({ arm:'luna', part_id:'p01', terminal_status:'SUCCESS', model:'gpt-6-luna', headers:{Authorization:'private'}, content:'private', error_code:'private arbitrary error', latency_ms:5 });
+  expect(encoded).not.toContain('private'); expect(encoded).not.toContain('headers'); expect(encoded).toContain('SUCCESS');
+});

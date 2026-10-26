@@ -347,7 +347,7 @@ export function locateQuote(
  * date — undated sources say unknown — and the shared relative-date rule
  * joins the system prompt.
  */
-function atomsPrompt(dateGrounding: boolean, originLabel: string, promptContent: string): { system: string; messages: Array<{ role: 'user'; content: string }> } {
+export function atomsPrompt(dateGrounding: boolean, originLabel: string, promptContent: string): { system: string; messages: Array<{ role: 'user'; content: string }> } {
   const observedOn = sourceDate(originLabel, '');
   const dateLine = dateGrounding ? `${observationDateLine(observedOn ? { date: observedOn, source: 'filename' } : null)}\n` : '';
   return {
