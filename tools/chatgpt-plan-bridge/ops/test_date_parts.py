@@ -33,4 +33,17 @@ with tempfile.TemporaryDirectory() as d:
     assert r.returncode == 0 and "already dated" in r.stdout and os.path.exists(pre) and len(open(log).readlines()) == 1, r
     open(pre, "a").write("x"); r = run("rename", man2, "1", "1", log, "--apply")
     assert r.returncode != 0 and "missing or changed" in r.stderr, r
-print("date_parts rename self-test: 7 checks passed")
+    # sessions-check (§3a, Pebble 18:36Z): a member whose session jsonl grew since the freeze baseline is listed (exit 1).
+    src = os.path.join(d, "src"); os.makedirs(src); j = os.path.join(src, f"{sid}.jsonl"); open(j, "w").write('{"a":1}\n')
+    st = os.stat(j); base = os.path.join(d, "run.manifest.sessions"); open(base, "w").write(f"{sid}\t{st.st_size}\t{st.st_mtime_ns}\n")
+    mem = os.path.join(d, "members.tsv"); open(mem, "w").write(f"h0\t{sha[0]}\t{legacy[0]}\t{dated[0]}\t2026-10-13\n")
+    chk = lambda: subprocess.run([sys.executable, "-I", TOOL, "sessions-check", mem, base], capture_output=True, text=True,
+                                 env=dict(os.environ, DATE_PARTS_SRC_DIR=src))
+    r = chk(); assert r.returncode == 0 and "0 member(s)" in r.stdout, r
+    open(j, "a").write('{"b":2}\n'); r = chk()   # the session resumed: its jsonl grew, the part bytes did not change
+    assert r.returncode == 1 and f"session-grew\th0\t{legacy[0]}\t{sid}" in r.stdout, r
+    open(base, "w").write("ffffffff-0000-0000-0000-000000000000\t1\t1\n"); r = chk()
+    assert r.returncode == 2 and "no freeze baseline" in r.stdout, r
+    open(base, "w").write(f"{sid}\t1\t1\n"); os.remove(j); r = chk()
+    assert r.returncode == 2 and "unreadable" in r.stdout, r
+print("date_parts rename + sessions-check self-test: 11 checks passed")

@@ -30,8 +30,8 @@ DB access in every step:
    - The independent live-path count must equal extracted + changed.
 3. Eligible list: `python3 -I -c` prints the `missing` rows (`hash16\tpath`) from `freeze-inventory/inventory.json` into `$RUN/eligible.manifest`.
 4. Plan: `python3 -I $O/date_parts.py plan $RUN/eligible.manifest $RUN/run.manifest $RUN/refused.tsv`.
-   - `chmod 0444 $RUN/run.manifest`.
-   - `sha256sum $RUN/run.manifest` gives `<RUNSHA>`.
+   - `chmod 0444 $RUN/run.manifest $RUN/run.manifest.sessions`.
+   - `sha256sum $RUN/run.manifest` gives `<RUNSHA>`. `run.manifest.sessions` is the freeze baseline of every planned session's jsonl (size, mtime); its sha256 goes in the packet too.
    - Batch count = ceil(rows / 100).
 
 ## 1. Once, after the GO
@@ -44,6 +44,10 @@ DB access in every step:
 
 ## 2. Per batch NN (rows (NN−1)·100+1 … NN·100 of run.manifest), strictly in order
 1. **Slice:** `sed -n "${a},${b}p" $RUN/run.manifest > $RUN/batch-NN.members`.
+   - **Session growth (§3a, drop-only):** `python3 -I $O/date_parts.py sessions-check $RUN/batch-NN.members $RUN/run.manifest.sessions`.
+     - Exit 0: continue.
+     - Exit 1: every listed row's session resumed after the freeze. Move those rows to `$RUN/batch-NN.dropped` (reason `session-grew`) and re-run the check.
+     - Exit 2: STOP.
 2. **Rename:** `python3 -I $O/date_parts.py rename $RUN/batch-NN.members 1 <k> $RUN/renames.tsv --apply`.
    - It prints one line per row: `renamed`, `skip (already dated)` or `skip (already renamed)`.
    - A row that STOPs (bytes changed, or legacy file missing) is **dropped**:
@@ -58,6 +62,8 @@ DB access in every step:
    - Any other refusal is a STOP.
 7. `bash $C/canary.sh F $HEAD`: preflight must be `CLEAN`.
 8. **`bash $C/state_check.sh pre-open`**: must print `STATE pre-open: OK`.
+   - Then **`python3 -I $O/date_parts.py sessions-check $RUN/batch-NN.members $RUN/run.manifest.sessions`** must exit 0, immediately before G.
+   - Any member whose session grew since step 1 is a STOP **before OPEN**: no admission is opened, and the decision follows.
 9. `bash $C/canary.sh G $HEAD`. Whatever its exit status:
    - **`bash $C/state_check.sh post-run`**: admission closed, runners still stopped, no runner process, 0 live locks, bridge latch clear.
    - G rc ≠ 0, or post-run ≠ OK: STOP (unknown outcome). Run "Close by hand" if admission or the corpus key is open. **No rollback without a decision.**

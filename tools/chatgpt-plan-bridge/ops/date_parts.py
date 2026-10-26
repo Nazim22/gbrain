@@ -8,7 +8,9 @@
   date_parts.py rename <run.manifest> <first-row> <last-row> <renames.tsv> [--apply]
       Renames rows first..last (1-based, inclusive) legacy -> dated. Dry run unless --apply. Per row: the legacy file's
       sha256 must equal the manifest's, the dated path must not exist, and after the rename the dated file's sha256 must
-      equal it again; each done rename is appended to renames.tsv. A row already renamed (dated present with the manifest
+      equal it again; each done rename is appended to renames.tsv.
+  date_parts.py sessions-check <members.tsv> <run.manifest.sessions>
+      §3a drop-only check before OPEN: lists members whose session jsonl grew since the freeze (exit 1), else exit 0. A row already renamed (dated present with the manifest
       sha256, legacy absent, recorded in renames.tsv) is skipped. Any other state stops the run with nothing further renamed.
 
 Source date (§1): the UTC date of the part's first complete turn, found by a unique anchor (the turn's text up to the
@@ -18,7 +20,7 @@ valid zoned ISO timestamp and all must give one UTC date. Anything else is refus
 import datetime, glob, hashlib, importlib.util, os, re, sys, time
 
 CONVERTER = "/root/.gbrain/ingest-session-transcript.py"
-SRC_DIR = "/root/.claude/projects/-root"
+SRC_DIR = os.environ.get("DATE_PARTS_SRC_DIR", "/root/.claude/projects/-root")   # override: tests only
 ANCH_MAX, ANCH_MIN, ACTIVE_S = 200, 40, 20 * 60
 TURN_SEP = re.compile(r"\n\n(User|Assistant): ")
 NAME = re.compile(r"^(?:(\d{4}-\d{2}-\d{2})-)?session-([0-9a-f-]{36})((?:\.part\d+)?)\.txt$")  # legacy or already dated
@@ -102,6 +104,11 @@ def plan(eligible, run_manifest, refused_tsv):
         for r in rows: f.write("\t".join(r) + "\n")
     with open(refused_tsv, "w") as f:
         for r in refused: f.write("\t".join(r) + "\n")
+    # §3a: the freeze baseline of every planned session's jsonl (size, mtime_ns). A session that grows after the
+    # freeze has resumed; its members are dropped before OPEN (sessions-check), however unchanged their part bytes.
+    with open(run_manifest + ".sessions", "w") as f:
+        for sid in sorted({NAME.match(os.path.basename(r[2])).group(2) for r in rows}):
+            st = os.stat(f"{SRC_DIR}/{sid}.jsonl"); f.write(f"{sid}\t{st.st_size}\t{st.st_mtime_ns}\n")
     print(f"plan: {len(rows)} dated, {len(refused)} refused, of {len(rows) + len(refused)} eligible rows")
 
 def rename(run_manifest, first, last, renames_tsv, apply):
@@ -122,8 +129,25 @@ def rename(run_manifest, first, last, renames_tsv, apply):
         with open(renames_tsv, "a") as f: f.write("\t".join((legacy, dated, sha, h, day)) + "\n")
         print(f"{n} renamed {os.path.basename(legacy)} -> {os.path.basename(dated)}")
 
+def sessions_check(members, baseline):
+    """Exit 0: no member's session grew since the freeze. Exit 1: the rows whose session grew (drop them before OPEN).
+    Exit 2: evidence missing (a member's session absent from the baseline, or its jsonl unreadable)."""
+    base = {l.split("\t")[0]: tuple(int(x) for x in l.rstrip("\n").split("\t")[1:3]) for l in open(baseline) if l.strip()}
+    grew = []
+    for l in open(members):
+        h, sha, legacy, dated, day = l.rstrip("\n").split("\t")
+        sid = NAME.match(os.path.basename(legacy)).group(2)
+        if sid not in base: print(f"STOP: session {sid} has no freeze baseline"); sys.exit(2)
+        try: st = os.stat(f"{SRC_DIR}/{sid}.jsonl")
+        except OSError as e: print(f"STOP: session {sid} jsonl unreadable: {e}"); sys.exit(2)
+        if (st.st_size, st.st_mtime_ns) != base[sid]: grew.append((h, legacy, sid))
+    for h, legacy, sid in grew: print(f"session-grew\t{h}\t{legacy}\t{sid}")
+    print(f"sessions-check: {len(grew)} member(s) of a session that grew since the freeze")
+    sys.exit(1 if grew else 0)
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["plan"] and len(a) == 4: plan(*a[1:])
     elif a[:1] == ["rename"] and len(a) in (5, 6): rename(a[1], int(a[2]), int(a[3]), a[4], a[5:] == ["--apply"])
+    elif a[:1] == ["sessions-check"] and len(a) == 3: sessions_check(a[1], a[2])
     else: sys.exit(__doc__)
