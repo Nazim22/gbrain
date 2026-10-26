@@ -23,6 +23,22 @@ DB access in every step:
 - `source /root/.gbrain/pg.env`;
 - `export DATABASE_URL=postgres://gbrain:$PASS@127.0.0.1:5432/gbrain_pingu`, environment only and never on argv.
 
+**Stage-2 environment for every `canary.sh` step:**
+```
+export CANARY_STAGE2=1 CANARY_RENAMES=$RUN/renames.tsv CANARY_SESSIONS=$RUN/run.manifest.sessions
+export CANARY_MEMBERS=$RUN/batch-NN.members CANARY_MANIFEST=$RUN/batch-NN.manifest   # per batch
+```
+With `CANARY_STAGE2=1`, `canary.sh` itself enforces:
+- **D:** the corpus key stays ABSENT.
+- **G:**
+  - members must bind the attempt manifest;
+  - member bytes and session growth are checked immediately before OPEN (any change refuses OPEN);
+  - the corpus key exists only from OPEN to CLOSED;
+  - on any failure after OPEN, a trap closes admission and removes the key.
+- **S and resume:** both require `date_gates.py`'s `gates.ok`, bound to the current `plan.json`, `after.json` and members.
+- **S, zero-atom batch:** completes on the gates alone.
+- **resume:** records the batch's atoms in `$D/stage2-kept/` for later batches' checks.
+
 ## 0. Before the GO (read-only; goes into the packet)
 1. `git -C $W rev-parse HEAD` must equal `<HEAD>`; `git -C $W status --porcelain` must be empty.
 2. Inventory: `bun $O/inventory.ts $CORPUS $RUN/freeze-inventory $RUN/renames.tsv > $RUN/freeze-inventory.out`.
@@ -48,6 +64,8 @@ DB access in every step:
      - Exit 0: continue.
      - Exit 1: every listed row's session resumed after the freeze. Move those rows to `$RUN/batch-NN.dropped` (reason `session-grew`) and re-run the check.
      - Exit 2: STOP.
+   - **Eligibility with both aliases (drop-only):** run `bun $O/inventory.ts $CORPUS $RUN/elig-NN $RUN/renames.tsv > $RUN/elig-NN.out`, then `python3 -I $O/date_parts.py eligible-check $RUN/batch-NN.members $RUN/elig-NN/inventory.json`.
+     - Exit 1: move the listed rows (no longer `missing`) to `$RUN/batch-NN.dropped` with their class, then re-run from step 1.
 2. **Rename:** `python3 -I $O/date_parts.py rename $RUN/batch-NN.members 1 <k> $RUN/renames.tsv --apply`.
    - It prints one line per row: `renamed`, `skip (already dated)` or `skip (already renamed)`.
    - A row that STOPs (bytes changed, or legacy file missing) is **dropped**:
@@ -62,22 +80,23 @@ DB access in every step:
    - Any other refusal is a STOP.
 7. `bash $C/canary.sh F $HEAD`: preflight must be `CLEAN`.
 8. **`bash $C/state_check.sh pre-open`**: must print `STATE pre-open: OK`.
-   - Then **`python3 -I $O/date_parts.py sessions-check $RUN/batch-NN.members $RUN/run.manifest.sessions`** must exit 0, immediately before G.
-   - Any member whose session grew since step 1 is a STOP **before OPEN**: no admission is opened, and the decision follows.
+   - Pre-open now requires: corpus key ABSENT in DB and file, admission closed, latch clear, route Luna.
+   - G itself re-checks member bytes and session growth immediately before OPEN. A refusal there is a STOP with nothing opened.
 9. `bash $C/canary.sh G $HEAD`. Whatever its exit status:
    - **`bash $C/state_check.sh post-run`**: admission closed, runners still stopped, no runner process, 0 live locks, bridge latch clear.
    - G rc ≠ 0, or post-run ≠ OK: STOP (unknown outcome). Run "Close by hand" if admission or the corpus key is open. **No rollback without a decision.**
+   - Post-run asserts and prints the corpus key: absent in DB and file.
 10. `bash $C/canary.sh H $HEAD`. The PASS criteria it prints must all hold:
     - 0 atoms without provenance;
     - 0 owner keys with several live generations;
     - every bridge row since T_start `200:stop`;
     - served `gpt-6-luna`.
-11. **`python3 -I $O/date_gates.py <attempt> $RUN/batch-NN.members`** must print `GATES: PASS` (exit 0).
+11. **`python3 -I $O/date_gates.py <attempt> $RUN/batch-NN.members /root/work/dream-s552-luna/canary/stage2-kept`** must print `GATES: PASS` (exit 0). It writes `gates.ok`.
     - Exit 10 (a gate failed on complete evidence) is a STOP. Report and decide; rollback is the expected decision.
     - Exit 2 (evidence missing or unreadable) is a STOP and never a rollback by itself.
 12. `bash $C/canary.sh I $HEAD`, then `bash $C/canary.sh K $HEAD`: the kit covers every atom.
 13. **Blind rating** (the stage-1 procedure, unchanged): R1, an isolated Opus rater, and R2, Pebble, label the kit. Neither sees the other's file.
-14. `bash $C/canary.sh S $HEAD`:
+14. `bash $C/canary.sh S $HEAD` (a zero-atom batch completes here on the gates alone; no labels):
     - PASS (both raters ≥ 0.80 on both metrics) → step 15;
     - FAIL → STOP; rollback on decision;
     - not scored → STOP.
