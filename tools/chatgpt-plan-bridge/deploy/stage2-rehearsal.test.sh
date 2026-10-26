@@ -81,11 +81,12 @@ out=$(CANARY_MEMBERS=$RUN/batch-1.members cs G); expect "G runs (corpus key only
 out=$(st post-run);                       expect "post-run: admission closed and corpus key absent (db+file)" "$out" "STATE post-run: OK"
 cs H >/dev/null
 out=$(python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" 2>&1); expect "date_gates PASS (3 dated atoms, outcomes consistent)" "$out" "GATES: PASS"
+# runbook order: K right after the PASS, from the unchanged sources
+cs I >/dev/null; out=$(cs K); expect "K builds the kit" "$out" "kit/"; labels "$A1/rating"
 f1=$(head -1 "$RUN/batch-1.members" | cut -f4); cp -p "$f1" "$RUN/f1b.bak"; echo "rewritten after OPEN" >> "$f1"
 out=$(python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" 2>&1); rc=$?
 expect "a post-OPEN source rewrite fails the gates (10)" "$rc:$out" "10:"; expect "...naming the rewritten member" "$out" "bytes changed since the freeze"
 expect "the earlier PASS marker is gone" "$(ls "$A1/gates.ok" 2>&1)" "No such file"
-cs I >/dev/null; out=$(cs K); expect "K builds the kit" "$out" "kit/"; labels "$A1/rating"
 out=$(CANARY_MEMBERS=$RUN/batch-1.members cs S); expect "S refuses on the stale (removed) marker" "$out" "no gates.ok"
 cp -p "$RUN/f1b.bak" "$f1"
 out=$(python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" 2>&1); expect "restored bytes: date_gates PASS again" "$out" "GATES: PASS"
