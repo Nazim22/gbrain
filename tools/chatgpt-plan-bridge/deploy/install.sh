@@ -67,8 +67,9 @@ nft list chain inet filter cpbridge_egress | head -14; nft list set inet filter 
 # Health assertions are ENFORCED: 401 without the caller secret, 200 with it (secret via curl -K on stdin, never argv).
 code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/v1/bridge/status)
 [[ $code == 401 ]] || { echo "health FAIL: unauthenticated status=$code (want 401)"; exit 1; }; echo "no-secret status=401 OK"
-body=$(mktemp -p /srv/chatgpt-plan-bridge/tmp); trap 'rm -f "$body"' EXIT
-code=$(printf 'header = "Authorization: Bearer %s"\n' "$(< /etc/chatgpt-plan-bridge/caller.secret)" | curl -sS -K - -o "$body" -w '%{http_code}' http://127.0.0.1:$PORT/v1/bridge/status)
-[[ $code == 200 ]] || { echo "health FAIL: authenticated status=$code (want 200)"; exit 1; }; echo "with-secret status=200 OK"; cat "$body"; echo
-python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("halted") is None, "bridge latch set at install"; print("routes", d["routes"])' "$body"
+# Body stays in memory: root never writes a file in a dir the (now running) bridge user owns — it could swap in a symlink.
+resp=$(printf 'header = "Authorization: Bearer %s"\n' "$(< /etc/chatgpt-plan-bridge/caller.secret)" | curl -sS -K - -w '\n%{http_code}' http://127.0.0.1:$PORT/v1/bridge/status)
+code=${resp##*$'\n'} body=${resp%$'\n'*}
+[[ $code == 200 ]] || { echo "health FAIL: authenticated status=$code (want 200)"; exit 1; }; echo "with-secret status=200 OK"; echo "$body"
+printf '%s' "$body" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); assert d.get("halted") is None, "bridge latch set at install"; print("routes", d["routes"])'
 step "installed $HEAD"
