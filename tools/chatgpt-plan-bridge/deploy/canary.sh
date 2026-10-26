@@ -226,9 +226,12 @@ R) step "retry THIS attempt's malformed-output failures ONCE (stage 2): exclusiv
    admission_is_closed || { echo "REFUSE: admission not closed before the retry"; exit 1; }
    [[ $(db_count dream.synthesize.session_corpus_dir) == 0 && $(file_has_corpus) == 0 ]] || { echo "REFUSE: corpus key present before OPEN"; exit 1; }
    # Eligibility (date_gates is the oracle) + exclusive retry.manifest FIRST: from here on the allowance is consumed.
-   python3 -I "$OPS/retry_plan.py" "$A" "$CANARY_MEMBERS" || { echo "REFUSE (no OPEN): not a bounded malformed-output retry"; exit 1; }
-   python3 -I "$OPS/date_parts.py" bytes-check "$A/retry.members" || { echo "REFUSE (no OPEN): a retry member's bytes changed since the freeze"; exit 1; }
-   python3 -I "$OPS/date_parts.py" sessions-check "$A/retry.members" "$CANARY_SESSIONS" || { echo "REFUSE (no OPEN): a retry member's session grew since the freeze"; exit 1; }
+   # Eligibility uses the runbook's FULL gate context: this attempt + every earlier kept batch (Pebble 22:37Z #2).
+   install -d -m 0700 "$D/stage2-kept"
+   python3 -I "$OPS/retry_plan.py" "$A" "$CANARY_MEMBERS" "$D/stage2-kept" || { echo "REFUSE (no OPEN): not a bounded malformed-output retry"; exit 1; }
+   # Whole-attempt source stability before reopening, not just the retry members (Pebble 22:37Z): G's own checks, again.
+   python3 -I "$OPS/date_parts.py" bytes-check "$CANARY_MEMBERS" || { echo "REFUSE (no OPEN): a member's bytes changed since the freeze"; exit 1; }
+   python3 -I "$OPS/date_parts.py" sessions-check "$CANARY_MEMBERS" "$CANARY_SESSIONS" || { echo "REFUSE (no OPEN): a member's session grew since the freeze"; exit 1; }
    # Keep the G-pass captures byte-for-byte under their own names; H then re-captures after.json/plan.json for the whole
    # attempt (the canonical names every consumer binds, rollback included, so it covers the retry's writes too).
    for f in after plan; do mv -n "$A/$f.json" "$A/$f.g1.json"; chmod 0444 "$A/$f.g1.json"; done
@@ -240,13 +243,16 @@ R) step "retry THIS attempt's malformed-output failures ONCE (stage 2): exclusiv
    gb config set dream.synthesize.session_corpus_dir "$CORPUS"   # the corpus key exists only from OPEN to CLOSED
    if [[ ${CANARY_DRYRUN:-} == 1 && ${CANARY_DRYRUN_FAULT:-} == retry-after-open ]]; then echo "[dry-run] injected failure after retry OPEN"; false; fi
    luna_env; export GBRAIN_EXTRACT_PHASE_BUDGET_MS=3600000
-   set +e; (cd "$W" && set -o noclobber && bun src/cli.ts dream --source default --dir "$A/checkout" --phase extract_atoms --json > "$A/run-retry.json" 2> "$A/run-retry.err"); rc=$?; set -e
+   rdream=(bun src/cli.ts dream --source default --dir "$A/checkout" --phase extract_atoms --json)
+   if [[ ${CANARY_DRYRUN:-} == 1 && ${CANARY_DRYRUN_FAULT:-} == retry-empty-output ]]; then rdream=(true); fi   # rehearsal only: rc 0, no outcome
+   set +e; (cd "$W" && set -o noclobber && "${rdream[@]}" > "$A/run-retry.json" 2> "$A/run-retry.err"); rc=$?; set -e
    gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest"
    admission_is_closed || { echo "ALERT: admission did not close; close it by hand before anything else"; exit 1; }
    disable_extraction; trap - EXIT
    grep -E "admission manifest|\[extract_atoms\]" "$A/run-retry.err" | tail -20 || true
-   python3 -I -c 'import json,sys; sys.path=[]; d=json.load(open(sys.argv[1])); f=[x for p in d.get("phases",[]) for x in (p.get("details") or {}).get("failures",[])]; print("retry failures:", json.dumps(f))' "$A/run-retry.json" || echo "retry failures: unreadable"
    echo "dream rc=$rc"; [[ $rc == 0 ]] || { echo "STOP: retry dream exited $rc (unknown outcome; no second retry)"; exit $rc; }
+   # A missing, unreadable or incomplete outcome is UNKNOWN: STOP here, and date_gates refuses it too (Pebble 22:37Z #1).
+   python3 -I "$OPS/retry_plan.py" --outcome "$A" || { echo "STOP: unknown retry outcome (no second retry)"; exit 1; }
    echo "next: state_check post-run, H (re-capture of the whole attempt), then date_gates" ;;
 H) step "write set AFTER (bound to BEFORE) + checks"
    A=$(attempt); bindings "$A"; [[ -e "$A/run.json" ]] || { echo "REFUSE: G has not run in this attempt"; exit 1; }

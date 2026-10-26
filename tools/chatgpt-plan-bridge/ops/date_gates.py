@@ -24,14 +24,21 @@ from collections import Counter, defaultdict
 
 def kept_check(kept_dir, fails):
     """Earlier KEPT batches (canary.sh resume records <kept_dir>/<attempt>.json = [{id, content_hash}]) must be
-    unchanged in the DB: same ids, same content hashes, still live. Read-only psql (libpq env); a failed query raises."""
-    import glob, subprocess
+    unchanged in the DB: same ids, same content hashes, still live. Read-only psql (libpq env); a failed query raises.
+    The libpq env comes from PG* when set, else from DATABASE_URL (the canary's env, e.g. inside R), never via argv;
+    the query always runs default_transaction_read_only."""
+    import glob, subprocess, urllib.parse
+    env = dict(os.environ, PGOPTIONS='-c default_transaction_read_only=on')
+    if not env.get('PGHOST') and env.get('DATABASE_URL'):
+        u = urllib.parse.urlparse(env['DATABASE_URL'])
+        env.update(PGHOST=u.hostname or '', PGPORT=str(u.port or 5432), PGUSER=urllib.parse.unquote(u.username or ''),
+                   PGPASSWORD=urllib.parse.unquote(u.password or ''), PGDATABASE=u.path.lstrip('/'))
     for k in sorted(glob.glob(os.path.join(kept_dir, '*.json'))):
         kept = json.load(open(k)); ids = [int(r['id']) for r in kept]
         if not ids: continue
         out = subprocess.run(['psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-c',
                               f"select id, content_hash, deleted_at is null from pages where id = any(array{ids}::bigint[]) order by id"],
-                             capture_output=True, text=True, check=True).stdout
+                             capture_output=True, text=True, check=True, env=env).stdout
         now = [(int(i), c, v == 't') for i, c, v in (l.split('|') for l in out.splitlines())]
         want = sorted((int(r['id']), r['content_hash'], True) for r in kept)
         if now != want: fails.append(f'earlier kept batch changed: {os.path.basename(k)} ({len(set(want) ^ set(now))} differing rows)')
@@ -94,6 +101,8 @@ def main(a, members_tsv, kept_dir=None):
         sys.dont_write_bytecode = True   # importing must never leave __pycache__ in the reviewed worktree (canary refuses a dirty tree)
         spec = importlib.util.spec_from_file_location('retry_plan', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'retry_plan.py'))
         rp = importlib.util.module_from_spec(spec); spec.loader.exec_module(rp)
+        rfails = rp.retry_outcome(f'{a}/run-retry.json', retry_paths)   # missing/unreadable/incomplete raises -> exit 2
+        if rfails: fails.append(f'retry run reported {len(rfails)} failure(s): {[os.path.basename(str(f.get("source"))) for f in rfails[:5]]}')
         now = rp.snapshot(after, [p for _, p in man if p not in retry_paths])
         if sorted(snap['pairs']) != sorted(now): raise ValueError('retry-snapshot.json covers different pairs')
         changed = sorted(p for p in now if now[p] != snap['pairs'][p])

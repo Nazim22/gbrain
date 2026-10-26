@@ -17,6 +17,8 @@
 #           -> date_gates PASS (retried 1, completed pairs preserved) -> R re-entry refused -> K S resume
 #  batch 8  malformed again in R -> re-gates FAIL (10) -> R re-entry refused -> rollback on decision
 #  batch 9  failure after R's OPEN -> trap verifies both closures -> post-run OK -> R re-entry refused -> rollback
+#  (Pebble HOLD 22:37Z) batch 7 also: an earlier-kept change refuses R (nothing written); a zero-byte retry outcome -> gates 2
+#  batch 10 R's dream leaves no outcome -> R STOPs (unknown outcome) -> re-entry refused -> gates 2 -> rollback
 # Usage: stage2-rehearsal.test.sh <scratch-db gbrain_s552_*> <source scratch gbrain home> <out dir> <plan run.manifest>
 set -u
 DB=$1 SRCHOME=$2 OUT=$3 PLAN=$4
@@ -165,6 +167,11 @@ out=$(CANARY_MEMBERS=$M7 cs G); expect "G runs batch 7 (one malformed output)" "
 cs H >/dev/null
 out=$(gates "$A7" "$M7"); rc=$?; expect "gates FAIL (10) on the failed pair only" "$rc:$out" "10:"; expect "...naming a failed state row" "$out" "failed state row"
 out=$(st pre-open); expect "pre-open OK before R" "$out" "STATE pre-open: OK"
+kid7=$(python3 -I -c "import json,glob;print(json.load(open(sorted(glob.glob('$CAN/stage2-kept/*.json'))[0]))[0]['id'])")
+korig7=$(psql -XAt -c "select content_hash from pages where id = $kid7"); psql -XAt -c "update pages set content_hash = 'rehearsal-tamper' where id = $kid7" >/dev/null
+out=$(CANARY_MEMBERS=$M7 cs R); expect "R refuses when an earlier kept batch changed (full gate context)" "$out" "not a bounded malformed-output retry"
+expect "...and writes no retry.manifest" "$(ls "$A7/retry.manifest" 2>&1)" "No such file"
+psql -XAt -c "update pages set content_hash = '$korig7' where id = $kid7" >/dev/null
 out=$(CANARY_MEMBERS=$M7 cs R); expect "R plans exactly 1 retry pair" "$out" '"retry_pairs": 1'; expect "R's retry dream rc 0" "$out" "dream rc=0"
 expect "...with no retry failures" "$out" "retry failures: []"
 out=$(st post-run); expect "post-run OK after R" "$out" "STATE post-run: OK"
@@ -178,6 +185,10 @@ json.dump(s, open(sys.argv[1], 'w'))
 PY
 out=$(gates "$A7" "$M7"); rc=$?; expect "control: a changed completed pair fails the gates (10)" "$rc:$out" "10:"; expect "...as 'retry changed'" "$out" "retry changed 1 completed pair"
 cp -p "$RUN/snap7.bak" "$A7/retry-snapshot.json"; out=$(gates "$A7" "$M7"); expect "snapshot restored: PASS again" "$out" "GATES: PASS"
+cp -p "$A7/run-retry.json" "$RUN/rr7.bak"; : > "$A7/run-retry.json"
+out=$(gates "$A7" "$M7"); rc=$?; expect "control: a zero-byte retry outcome is exit 2, never PASS" "$rc:$out" "2:STOP"
+expect "...and leaves no gates.ok" "$(ls "$A7/gates.ok" 2>&1)" "No such file"
+cp -p "$RUN/rr7.bak" "$A7/run-retry.json"; out=$(gates "$A7" "$M7"); expect "outcome restored: PASS again" "$out" "GATES: PASS"
 out=$(CANARY_MEMBERS=$M7 cs R); expect "R re-entry refused (allowance used)" "$out" "retry allowance of this attempt is used"
 cs I >/dev/null; out=$(cs K); expect "K kit after the retry" "$out" "kit/"; labels "$A7/rating"
 out=$(CANARY_MEMBERS=$M7 cs S); expect "S PASS after the retry" "$out" "ACCEPTANCE (rating): PASS"
@@ -209,4 +220,19 @@ out=$(st post-run); expect "post-run OK after R's trap" "$out" "STATE post-run: 
 out=$(CANARY_MEMBERS=$M9 cs R); expect "R re-entry refused after the interruption" "$out" "retry allowance of this attempt is used"
 out=$(cs rollback); expect "rollback on decision (batch 9) verifies DONE" "$out" '"verdict":"DONE"'
 out=$(st post-rollback); expect "post-rollback OK" "$out" "STATE post-rollback: OK"
+
+echo "##### batch 10: R's dream leaves no outcome"
+out=$(slice 10 28 30); expect "slice 10" "$out" "slice 10 ok"
+out=$(prepare 10); expect "E batch 10" "$out" "attempt: $CAN/attempt-"; A10=$(attempt); M10=$RUN/batch-10.members
+echo 1 > "$OUT/ctl/malformed_left"
+out=$(CANARY_MEMBERS=$M10 cs G); expect "G runs batch 10 (one malformed output)" "$out" "dream rc=0"
+cs H >/dev/null; gates "$A10" "$M10" >/dev/null
+out=$(CANARY_DRYRUN_FAULT=retry-empty-output CANARY_MEMBERS=$M10 cs R); rc=$?
+expect "R STOPs on an unknown retry outcome" "$out" "STOP: unknown retry outcome"; expect "...with a failure status" "$([[ $rc != 0 ]] && echo nonzero)" "nonzero"
+out=$(st post-run); expect "post-run OK after the unknown outcome" "$out" "STATE post-run: OK"
+out=$(CANARY_MEMBERS=$M10 cs R); expect "R re-entry refused after the unknown outcome" "$out" "retry allowance of this attempt is used"
+cs H >/dev/null
+out=$(gates "$A10" "$M10"); rc=$?; expect "downstream gates refuse the unknown outcome (2)" "$rc:$out" "2:STOP"
+out=$(cs rollback); expect "rollback on decision (batch 10) verifies DONE" "$out" '"verdict":"DONE"'
+out=$(st post-rollback); expect "post-rollback OK (batch 10)" "$out" "STATE post-rollback: OK"
 echo "RESULT: $FAILS failure(s)"; exit $FAILS

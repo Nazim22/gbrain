@@ -96,10 +96,11 @@ With `CANARY_STAGE2=1`, `canary.sh` itself enforces:
       - **Exception, the bounded retry (once per attempt, Pebble consult 2026-10-26 21:32Z):** when every fail names a failed-state pair from a `malformed model output`, the decision may instead be R:
         1. `bash $C/state_check.sh pre-open` must print `STATE pre-open: OK`.
         2. `CANARY_MEMBERS=$RUN/batch-NN.members bash $C/canary.sh R $HEAD`.
-           - It refuses with nothing opened unless the failures qualify; `date_gates` is its oracle.
+           - It refuses with nothing opened unless the failures qualify. `date_gates` is its oracle, run with the earlier kept batches.
+           - Before OPEN it re-checks the whole attempt's bytes and session growth.
            - It creates `retry.manifest` exclusively before OPEN, so the allowance is used even if R is interrupted.
            - It keeps the G-pass `after.g1.json` and `plan.g1.json` read-only, and runs one dream under G's trap.
-           - Any nonzero exit is a STOP with an unknown outcome. Never run a second retry.
+           - Any nonzero exit is a STOP with an unknown outcome, including a missing, unreadable or incomplete `run-retry.json`. Never run a second retry.
         3. `bash $C/state_check.sh post-run`, then `bash $C/canary.sh H $HEAD`, which re-captures the whole attempt.
         4. Run the date_gates command above again:
            - exit 0 → continue at step 12;
