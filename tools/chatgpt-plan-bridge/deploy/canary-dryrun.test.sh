@@ -11,7 +11,7 @@ run() { bash "$C" "$1" "$HEAD" 2>&1; }
 expect() { if [[ "$2" == *"$3"* ]]; then echo "OK   $1"; else echo "FAIL $1: wanted '$3' in: $(echo "$2" | tail -3)"; FAILS=$((FAILS+1)); fi; }
 mkdir -p "$OUT"
 out=$(run D);      expect "D sets config on the scratch DB" "$out" "cycle.extract_atoms.admit_hashes_file = $OUT/closed.manifest"
-expect "D sets the file-plane base url in the scratch home" "$out" "provider_base_urls.litellm = http://127.0.0.1:18795/v1"
+expect "D points a dry run at a closed port, never the live bridge" "$out" "provider_base_urls.litellm = http://127.0.0.1:1/v1"
 out=$(run E);      expect "E creates a fresh attempt" "$out" "attempt: $OUT/attempt-"
 A=$(cat "$OUT/ATTEMPT")
 sleep 1; out=$(run E); expect "E refuses while the previous attempt is open" "$out" "still open"
@@ -34,5 +34,27 @@ expect "rollback verifies DONE" "$out" '"verdict":"DONE"'
 expect "rollback disables extraction (corpus key absent)" "$out" "extraction disabled"
 expect "rollback restarts autopilot only as a dry-run no-op" "$out" "[dry-run] systemctl start gbrain-autopilot.service"
 expect "attempt marked closed" "$(cat "$A/closed" 2>/dev/null)" "rolled-back"
+# Freshness (DESIGN §8 r5): history is validated fail-closed, and a failed E removes only its own new dir.
+F0="$OUT/attempt-19700101T000000Z"; mkdir "$F0"; printf 'nothex\t/x\n' > "$F0/canary.manifest"; n0=$(ls -d "$OUT"/attempt-* | wc -l)
+sleep 1; out=$(run E); expect "E refuses malformed history" "$out" "malformed history line"
+expect "a refused E removed only its own new dir" "$(ls -d "$OUT"/attempt-* | wc -l)" "$n0"
+rm "$F0/canary.manifest"
+sleep 1; out=$(run E); expect "E refuses a history dir without a manifest" "$out" "REFUSE: E failed"
+tail -n +11 "$A/inventory/missing.manifest" > "$F0/canary.manifest"
+sleep 1; out=$(run E); expect "E refuses fewer than 20 eligible parts" "$out" "eligible parts (need 20)"
+rm -r "$F0"
 sleep 1; out=$(run E); expect "E allows a new attempt after the previous one closed" "$out" "attempt: $OUT/attempt-"
+A2=$(cat "$OUT/ATTEMPT")
+disj=$(python3 -I - "$A/canary.manifest" "$A2/canary.manifest" <<'PY'
+import sys
+a, b = ([l.split('\t') for l in open(f).read().splitlines()] for f in sys.argv[1:3])
+print('DISJOINT' if not ({h for h, _ in a} & {h for h, _ in b} or {p for _, p in a} & {p for _, p in b}) else 'OVERLAP', len(b))
+PY
+)
+expect "the new manifest shares no hash and no path with the earlier one" "$disj" "DISJOINT 20"
+out=$(run S); expect "S refuses without a kit" "$out" "no kit (run K)"
+out=$(run F); expect "F captures before for the new attempt" "$out" '"preflight":"CLEAN"'
+out=$(run K); expect "K refuses before H ran" "$out" "H has not run"
+cp -p "$A2/before.json" "$A2/after.json"   # stand-in AFTER: only to reach resume's rating gate
+out=$(run resume); expect "resume refuses without a rating PASS" "$out" "no rating PASS"
 echo "RESULT: $FAILS failure(s)"; exit $FAILS
