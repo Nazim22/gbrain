@@ -14,3 +14,10 @@ test('sequential requests whose headers arrive after the connect bound still suc
  } finally { server.stop(true); }
 });
 test('every request uses a fresh socket (agent:false)',()=>{for(const m of ['GET','POST'] as const)expect(requestOptions(m,{}).agent).toBe(false);});
+test('transport streams a catalog larger than the answer cap up to the catalog bound',async()=>{
+ const { MAX_BYTES } = await import('./adapter.ts');
+ // the stub URL is not /v1/models, so this pins the transport-side cap to capFor(url): an answer-sized stream still stops
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(){return new Response(Buffer.alloc(MAX_BYTES+10,97));}});
+ try { await expect(transport(`http://127.0.0.1:${server.port}/v1/responses`,undefined,{},{connect:500,request:3000})).rejects.toThrow('OUTPUT-BOUND'); }
+ finally { server.stop(true); }
+});

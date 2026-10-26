@@ -75,3 +75,14 @@ test('per-model effort is frozen: swapped or unknown models are refused before s
  expect(sent).toBe(0);
  expect(JSON.parse(encodeLog({arm:'sol',model:'gpt-6.1-sol',part_id:'p01'}))).toMatchObject({arm:'sol',model:'gpt-6.1-sol',part_id:'p01'});
 });
+test('the model catalog has its own 8 MB bound; model answers keep the 256 KB cap',async()=>{
+ const { guardedRequest, API, GEMMA, capFor, MAX_BYTES, MODELS_MAX_BYTES, cloudBody } = await import('./adapter.ts');
+ expect(capFor(`${API}/models`)).toBe(8*1024*1024);expect(capFor(`${API}/responses`)).toBe(MAX_BYTES);expect(capFor(GEMMA)).toBe(MAX_BYTES);
+ const big=(n:number)=>async()=>({status:200,raw:Buffer.alloc(n,97)});
+ // the P5 case: a ~1 MB catalog must pass; a model answer of the same size must still stop
+ await expect(guardedRequest(`${API}/models`,undefined,big(1_000_000))).resolves.toBeDefined();
+ await expect(guardedRequest(`${API}/models`,undefined,big(MODELS_MAX_BYTES+1))).rejects.toThrow('OUTPUT-BOUND');
+ const p={system:'s',messages:[{role:'user' as const,content:'u'}]};
+ await expect(guardedRequest(`${API}/responses`,cloudBody('luna',p),big(MAX_BYTES+1))).rejects.toThrow('OUTPUT-BOUND');
+ await expect(guardedRequest(GEMMA,{},big(MAX_BYTES+1))).rejects.toThrow('OUTPUT-BOUND');
+});

@@ -21,6 +21,10 @@ export const LIMITS = {
   auth: { requests:12, connect:10_000, request:30_000, wall:900_000 },
 } as const;
 export const MAX_BYTES = 256 * 1024;
+// The /v1/models catalog is ~88 KB per model (S552 run P5: 3 entries filled 251,392 bytes), so the 256 KB answer cap
+// cut it before gpt-6-luna. It gets its own, still hard, bound; model answers keep MAX_BYTES.
+export const MODELS_MAX_BYTES = 8 * 1024 * 1024;
+export function capFor(url:string) { return url===`${API}/models`?MODELS_MAX_BYTES:MAX_BYTES; }
 export type Arm = keyof typeof LIMITS;
 export type Prompt = {system:string; messages:Array<{role:'user';content:string}>};
 export type Wire = {status:number; raw:Buffer};
@@ -62,7 +66,7 @@ export const transport:Sender = (url, body, headers={}, bounds=LIMITS.luna) => n
   const req=(url.startsWith('https:')?httpsRequest:httpRequest)(url,requestOptions(data===undefined?'GET':'POST',{...(data===undefined?{}:{'Content-Type':typeof body==='string'?'application/x-www-form-urlencoded':'application/json'}),...headers}),res=>{
     clearTimeout(connect);
     if((res.statusCode??0)>=300 && (res.statusCode??0)<400) {res.destroy();fail('REDIRECT');return;}
-    res.on('data',(c:Buffer)=>{size+=c.length;if(size>MAX_BYTES){fail('OUTPUT-BOUND');return;}chunks.push(c);});
+    res.on('data',(c:Buffer)=>{size+=c.length;if(size>capFor(url)){fail('OUTPUT-BOUND');return;}chunks.push(c);});
     res.on('aborted',()=>fail('DISCONNECTED'));res.on('error',()=>fail('DISCONNECTED'));
     res.on('end',()=>{if(finished)return;finished=true;clearTimeout(deadline);resolve({status:res.statusCode??0,raw:Buffer.concat(chunks)});});
   });
@@ -76,7 +80,7 @@ export async function guardedRequest(url:string, body:unknown, sender:Sender=sen
   fixedEndpoint(url);
   if(url===`${API}/responses`) validateBody(body);
   const result=await sender(url,body,headers,bounds);
-  if(result.raw.length>MAX_BYTES) throw Error('OUTPUT-BOUND');
+  if(result.raw.length>capFor(url)) throw Error('OUTPUT-BOUND');
   if(result.status>=300 && result.status<400) throw Error('REDIRECT');
   if(result.status!==200) throw Error([401,403,429,503].includes(result.status)?`HTTP-${result.status}`:'HTTP-FAILED');
   return result;
