@@ -2,7 +2,8 @@
 set -euo pipefail
 # S552: own one per-run chain/jump; never flush the shared table or change other UIDs.
 rules() {
-  local uid=$1 resolver=$2 chain=$3 family=ip
+  local uid=$1 resolver=$2 chain=$3 profile=${4:-evaluation} family=ip
+  [[ $profile == evaluation || $profile == consent ]] || return 2
   [[ $uid =~ ^[0-9]+$ && $chain =~ ^s552_[a-zA-Z0-9_]+$ ]] || return 2
   [[ $resolver =~ ^[0-9a-fA-F.:]+$ ]] || return 2
   [[ $resolver != *:* ]] || family=ip6
@@ -11,17 +12,22 @@ rules() {
   printf 'add rule inet filter %s ip daddr 127.0.0.1 tcp dport 8084 accept\n' "$chain"
   printf 'add rule inet filter %s %s daddr %s udp dport 53 accept\n' "$chain" "$family" "$resolver"
   printf 'add rule inet filter %s %s daddr %s tcp dport 53 accept\n' "$chain" "$family" "$resolver"
+  if [[ $profile == consent ]]; then
+    printf 'add rule inet filter %s ip saddr 127.0.0.1 ip daddr 127.0.0.1 tcp sport 1455 ct state established ct direction reply accept\n' "$chain"
+  fi
   printf 'add rule inet filter %s ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } counter drop\n' "$chain"
   printf 'add rule inet filter %s ip6 daddr { ::/128, ::1/128, ::ffff:0:0/96, 100::/64, 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8 } counter drop\n' "$chain"
   printf 'add rule inet filter %s tcp dport 443 accept\n' "$chain"
   printf 'add rule inet filter %s counter drop\n' "$chain"
 }
-if [[ ${1:-} == print-rules ]]; then rules "$2" "$3" "$4"; exit; fi
+if [[ ${1:-} == print-rules ]]; then rules "$2" "$3" "$4" "${5:-evaluation}"; exit; fi
 [[ $(id -u) == 0 ]] || { printf 'root required\n' >&2; exit 1; }
 mode=${1:-}
-[[ $mode == rehearse || $mode == run ]] || { printf 'usage: launch.sh rehearse|run\nConsent provisioning is separate; no credential-copy fallback.\n' >&2; exit 2; }
+[[ $mode == rehearse || $mode == rehearse-consent || $mode == consent || $mode == run ]] || { printf 'usage: launch.sh rehearse|rehearse-consent|consent|run\nReal consent requires separate permission; no credential-copy fallback.\n' >&2; exit 2; }
+profile=evaluation
+[[ $mode != consent && $mode != rehearse-consent ]] || profile=consent
 # This build brief authorizes local rehearsal on 134 only. Runtime on 122 requires its separate GO.
-if [[ $mode == rehearse ]]; then
+if [[ $mode == rehearse* ]]; then
   [[ $(hostname) == daedalus-01 ]] || { printf 'rehearsal is authorized on 134 only\n' >&2; exit 1; }
 fi
 src=$(cd "$(dirname "$0")/../.." && pwd)
@@ -60,7 +66,7 @@ chown -R root:root "$root/code" "$root/corpus"
 chmod -R a-w,a+rX "$root/code" "$root/corpus"
 git -C "$src" rev-parse HEAD > "$root/code/BUILD-HEAD"
 chmod 0444 "$root/code/BUILD-HEAD"
-if [[ $mode == rehearse ]]; then
+if [[ $mode == rehearse* ]]; then
   python3 "$src/eval/chatgpt-plan/rehearsal.py" "$root/out/$run.ready" & stub_pid=$!
   for _ in {1..50}; do [[ -f $root/out/$run.ready ]] && break; kill -0 "$stub_pid"; sleep .1; done
   [[ -f $root/out/$run.ready ]] || { printf 'stub startup failed\n' >&2; exit 1; }
@@ -68,7 +74,7 @@ fi
 resolver=$(python3 -c 'import ipaddress; p=open("/etc/resolv.conf").read().splitlines(); ns=[l.split()[1] for l in p if l.startswith("nameserver ")]; assert len(ns)==1,"one frozen resolver required"; print(ipaddress.ip_address(ns[0]))')
 nft list table inet filter >/dev/null
 installed=1
-rules "$uid" "$resolver" "$run" | nft -f -
+rules "$uid" "$resolver" "$run" "$profile" | nft -f -
 printf 'installed run=%s uid=%s resolver=%s\n' "$run" "$uid" "$resolver"
 nft -a list chain inet filter "$run"
 properties=(--uid=gbrain-eval --gid=gbrain-eval -p ProtectHome=yes -p ProtectSystem=strict
@@ -78,8 +84,14 @@ properties=(--uid=gbrain-eval --gid=gbrain-eval -p ProtectHome=yes -p ProtectSys
 inside() {
  systemd-run --unit="$unit" --wait --pipe --collect "${properties[@]}" /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent TMPDIR="$root/out" /usr/local/bin/bun "$root/code/eval/chatgpt-plan/cli.ts" "$@"
 }
-if [[ $mode == rehearse ]]; then inside probe-rehearsal; else inside probe; fi
+if [[ $mode == rehearse* ]]; then
+  inside probe-rehearsal "$root/out/$run.ready" "$profile"
+elif [[ $mode == consent ]]; then
+  inside login
+else
+  inside probe
+fi
 counter=$(nft -j list chain inet filter "$run" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(e["counter"].get("packets",0) for x in d["nftables"] for e in x.get("rule",{}).get("expr",[]) if "counter" in e))')
 printf 'denial_drop_packets=%s\n' "$counter"
-((counter>0)) || { printf 'drop counter did not rise\n' >&2; exit 1; }
+if [[ $mode != consent ]]; then ((counter>0)) || { printf 'drop counter did not rise\n' >&2; exit 1; }; fi
 if [[ $mode == run ]]; then inside run; fi

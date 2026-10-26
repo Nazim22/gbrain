@@ -83,11 +83,20 @@ audience/expiry validation. Returning login retains the issued client identity.
 Credential files live only under `/srv/gbrain-eval/auth/` (0700/0600); that path
 will be inside 122's nightly vzdump scope. There is no Dae/Pebble token reuse.
 
-**Open design decision:** the frozen eval egress filter blocks TCP replies from
-the OAuth callback listener. A consent-only fixed-port established-loopback reply
-exception has been proposed but is NOT implemented or authorized. The launcher
-therefore deliberately has no consent mode. Do not run login outside its reviewed
-sandbox to bypass this boundary. Consent remains blocked until disposition.
+**Consent-only amendment (Pebble, 2026-10-26):** `launch.sh consent` uses an
+extra rule scoped by the existing `gbrain-eval` UID jump: IPv4 source and
+destination `127.0.0.1`, TCP source port 1455, `ct state established`, and
+`ct direction reply`. The callback listener is explicitly IPv4 loopback, never
+wildcard. There is no general established-traffic exception. Evaluation `run`
+and `rehearse` omit this rule; the rest of their rule bytes/order are unchanged.
+`rehearse-consent` on 134 exercises the same sandbox/listener with a harmless
+local TCP forward, no issuer or credential exchange. A root positive control
+first proves that forward works; consent must return a complete HTTP response,
+while evaluation must deny it. Existing unrelated-new-outbound denial controls
+run in both profiles. This tests the loopback forwarding data path, **not SSH
+authentication**; the actual SSH forward and real consent remain operator proof.
+Real `consent` invocation still requires separate explicit authorization; this
+build neither invokes it nor provisions 122. No credential-copy fallback.
 
 Refresh holds a cross-process flock and writes a durable pending marker before
 one network attempt. Tokens/expiry/scopes rotate together using fsync+rename.

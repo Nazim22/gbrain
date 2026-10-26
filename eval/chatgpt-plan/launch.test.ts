@@ -1,6 +1,16 @@
 import { expect,test } from 'bun:test';
 import { send,MAX_BYTES } from './adapter.ts';
 import { spawnSync } from 'bun';
+import { callbackListener } from './cli.ts';
+test('callback listener binds only IPv4 loopback and drains the successful response',async()=>{
+ let callbacks=0;const server=callbackListener(async()=>{callbacks++;});
+ try {
+  expect(server.hostname).toBe('127.0.0.1');expect(server.port).toBe(1455);
+  const notFound=await fetch('http://127.0.0.1:1455/not-a-callback');expect(notFound.status).toBe(404);expect(callbacks).toBe(0);
+  const response=await fetch('http://127.0.0.1:1455/auth/callback');
+  await server.stop();expect(response.status).toBe(200);expect(await response.text()).toBe('Sign-in completed. Close this window.');expect(callbacks).toBe(1);
+ }finally{await server.stop(true);}
+});
 test('native transport enforces body cap, deadline, and rejects redirects without following',async()=>{
  let requests=0,mode='redirect';
  const server=Bun.serve({hostname:'127.0.0.1',port:8084,fetch(){requests++;if(mode==='redirect')return new Response('',{status:302,headers:{location:'https://api.openai.com/v1/models'}});if(mode==='size')return new Response('x'.repeat(MAX_BYTES+1));return new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('partial'));}}));}});
@@ -17,4 +27,14 @@ test('rules order permits only Gemma/resolver before private ranges then public 
  expect(text.indexOf('ip daddr {')).toBeLessThan(text.indexOf('tcp dport 443 accept'));
  expect(text.indexOf('ip6 daddr {')).toBeLessThan(text.indexOf('tcp dport 443 accept'));
  expect(text).toContain('meta skuid 9999');expect(text).toContain('counter drop');
+ expect(text).not.toContain('ct state established');
+});
+test('consent permits only fixed IPv4-loopback established reply traffic before private drops',()=>{
+ const run=spawnSync(['/bin/bash',`${import.meta.dir}/launch.sh`,'print-rules','9999','1.1.1.1','s552_fixture','consent'],{stdout:'pipe',stderr:'pipe'});
+ expect(run.exitCode).toBe(0);const text=run.stdout.toString();
+ const exception='ip saddr 127.0.0.1 ip daddr 127.0.0.1 tcp sport 1455 ct state established ct direction reply accept';
+ expect(text).toContain(exception);
+ expect(text.indexOf(exception)).toBeLessThan(text.indexOf('ip daddr {'));
+ expect(text.match(/ct state established/g)?.length).toBe(1);
+ expect(text).toContain('meta skuid 9999 jump s552_fixture');
 });
