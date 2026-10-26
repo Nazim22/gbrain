@@ -80,7 +80,7 @@ if (import.meta.main) {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     const c = await capture(sql, pairs, sha, families); await sql.end();
     const text = JSON.stringify(c, null, 1);
-    writeFileSync(out, text, { mode: 0o600 });
+    writeFileSync(out, text, { mode: 0o600, flag: 'wx' });   // no-clobber: an attempt's capture is never overwritten
     console.log(JSON.stringify({ out, sha256: createHash('sha256').update(text).digest('hex'), pairs: pairs.length, atoms: c.atoms.length, generations: c.generations.length, items: c.items.length, state_rows: c.state_rows.length, receipts: c.receipts.length }));
   } else if (mode === 'preflight') {
     const bad = preflight(JSON.parse(readFileSync(rest[0], 'utf8')));

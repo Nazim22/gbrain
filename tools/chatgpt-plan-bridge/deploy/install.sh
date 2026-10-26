@@ -48,42 +48,10 @@ cat > /etc/chatgpt-plan-bridge/config.json <<EOF
 EOF
 chown root:cpbridge /etc/chatgpt-plan-bridge/config.json; chmod 0640 /etc/chatgpt-plan-bridge/config.json
 
-step "move the gbrain-local sign-in to the bridge user (single owner)"
-if [[ ! -e /srv/chatgpt-plan-bridge/auth/credentials.json ]]; then
-  [[ ! -e /srv/gbrain-eval/auth/refresh.pending ]] || { echo "eval refresh.pending present: refuse"; exit 1; }
-  # No-follow move: open each source with O_NOFOLLOW (regular file, owned by gbrain-eval, one link), create each
-  # destination with O_EXCL|O_NOFOLLOW owned by cpbridge, verify bytes, then overwrite the eval copy through the
-  # same no-follow handle and unlink it. `install`/`cp`/`shred` would follow a symlink the eval user planted.
-  python3 -I - <<'PY'
-import os, pwd, stat
-src, dst = '/srv/gbrain-eval/auth', '/srv/chatgpt-plan-bridge/auth'
-ev, cb = pwd.getpwnam('gbrain-eval'), pwd.getpwnam('cpbridge')
-for d, u in ((src, ev), (dst, cb)):
-    st = os.lstat(d)
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != u.pw_uid: raise SystemExit(f'refuse dir {d}')
-def read_nofollow(p):
-    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != ev.pw_uid or st.st_nlink != 1: raise SystemExit(f'refuse {p}')
-        return os.read(fd, 1 << 20)
-    finally: os.close(fd)
-for name in ('credentials.json', 'host.json'):
-    data = read_nofollow(f'{src}/{name}')
-    out = os.open(f'{dst}/{name}', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try: os.write(out, data); os.fsync(out); os.fchown(out, cb.pw_uid, cb.pw_gid)
-    finally: os.close(out)
-    if read_nofollow(f'{src}/{name}') != data: raise SystemExit(f'changed during move: {name}')
-fd = os.open(f'{src}/credentials.json', os.O_WRONLY | os.O_NOFOLLOW)
-try:
-    st = os.fstat(fd)  # re-check on THIS handle: the eval user owns the directory and could have swapped the file
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != ev.pw_uid or st.st_nlink != 1: raise SystemExit('refuse overwrite')
-    os.write(fd, b'\0' * st.st_size); os.fsync(fd)
-finally: os.close(fd)
-os.unlink(f'{src}/credentials.json')
-print('sign-in moved to', dst)
-PY
-fi
+step "move the gbrain-local sign-in to the bridge user (single owner; reconciles any partial earlier move)"
+# move_signin.py holds the eval user's refresh.lock for the whole move, opens everything O_NOFOLLOW, writes
+# host.json then credentials.json (the commit marker) atomically, and reconciles partial states (tested: move_signin.test.sh).
+python3 -I "$SRC/deploy/move_signin.py" /srv/gbrain-eval/auth /srv/chatgpt-plan-bridge/auth gbrain-eval cpbridge
 ls -la /srv/chatgpt-plan-bridge/auth
 
 step "unit + start + health"
@@ -96,7 +64,11 @@ systemctl enable --now chatgpt-plan-bridge-egress.timer
 sleep 2
 systemctl is-active chatgpt-plan-bridge.service
 nft list chain inet filter cpbridge_egress | head -14; nft list set inet filter cpbridge_egress_v4 | head -8
-curl -sS -o /dev/null -w 'no-secret status=%{http_code}\n' http://127.0.0.1:$PORT/v1/bridge/status
-# The header goes through curl's config on stdin (printf is a builtin): the secret never appears in any argv.
-printf 'header = "Authorization: Bearer %s"\n' "$(< /etc/chatgpt-plan-bridge/caller.secret)" | curl -sS -K - http://127.0.0.1:$PORT/v1/bridge/status; echo
+# Health assertions are ENFORCED: 401 without the caller secret, 200 with it (secret via curl -K on stdin, never argv).
+code=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/v1/bridge/status)
+[[ $code == 401 ]] || { echo "health FAIL: unauthenticated status=$code (want 401)"; exit 1; }; echo "no-secret status=401 OK"
+body=$(mktemp -p /srv/chatgpt-plan-bridge/tmp); trap 'rm -f "$body"' EXIT
+code=$(printf 'header = "Authorization: Bearer %s"\n' "$(< /etc/chatgpt-plan-bridge/caller.secret)" | curl -sS -K - -o "$body" -w '%{http_code}' http://127.0.0.1:$PORT/v1/bridge/status)
+[[ $code == 200 ]] || { echo "health FAIL: authenticated status=$code (want 200)"; exit 1; }; echo "with-secret status=200 OK"; cat "$body"; echo
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("halted") is None, "bridge latch set at install"; print("routes", d["routes"])' "$body"
 step "installed $HEAD"

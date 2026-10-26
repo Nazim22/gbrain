@@ -23,7 +23,10 @@ export function parseAdmitManifest(text: string): Set<string> {
 /** null = no manifest (admit everything); a Set = admit only these `hash16\tsource` keys (empty Set = closed). */
 export async function resolveAdmitManifest(engine: BrainEngine): Promise<Set<string> | null> {
   let path: string | null = null;
-  try { path = (await engine.getConfig(ADMIT_HASHES_KEY)) ?? null; } catch { path = null; }
+  // Only a successful read that finds the key unset means "no manifest". A failed lookup admits NOTHING: when the
+  // manifest bounds a batch, an unreadable config must never widen it to every item.
+  try { path = (await engine.getConfig(ADMIT_HASHES_KEY)) ?? null; }
+  catch { console.error(`[extract_atoms] ${ADMIT_HASHES_KEY} lookup failed: admission closed`); return new Set(); }
   if (!path) return null;
   let text = '';
   try { text = readFileSync(path, 'utf8'); } catch { console.error(`[extract_atoms] ${ADMIT_HASHES_KEY} set but unreadable: admission closed`); return new Set(); }

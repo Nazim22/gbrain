@@ -72,3 +72,15 @@ describe('extract_atoms atom provenance', () => {
     expect(atom.frontmatter.extracted_route).toBeTruthy();
   });
 });
+
+describe('admission manifest lookup failures', () => {
+  test('a failed config lookup admits nothing (never everything)', async () => {
+    const { resolveAdmitManifest } = await import('../src/core/cycle/extract-atoms-admit.ts');
+    const broken = { getConfig: async () => { throw new Error('connection terminated'); } } as any;
+    const admit = await resolveAdmitManifest(broken);
+    expect(admit).not.toBeNull();
+    expect(admit!.size).toBe(0);
+    const unset = { getConfig: async () => null } as any;
+    expect(await resolveAdmitManifest(unset)).toBeNull();          // a successful read of "unset" keeps today's behaviour
+  });
+});
