@@ -34,7 +34,7 @@ export function readManifest(path: string, corpusDir: string): { pairs: Pair[]; 
 export async function capture(sql: postgres.Sql, pairs: Pair[], manifestSha: string, familiesFrom?: string[]): Promise<Capture> {
   const hashes = pairs.flatMap(p => [p.hash16, `pending:${p.hash16}`]), paths = pairs.map(p => p.path), keys = pairs.map(p => p.ownerKey);
   return sql.begin('READ ONLY', async tx => {
-    const atoms = await tx`SELECT id, slug, deleted_at, content_hash, frontmatter, compiled_truth,
+    const atoms = await tx`SELECT id, slug, deleted_at, content_hash, frontmatter, compiled_truth, effective_date, effective_date_source,
         COALESCE(frontmatter->>'source_hash','') AS h, COALESCE(frontmatter->>'source_path','') AS p
       FROM pages WHERE type='atom' AND source_id='default'
         AND (frontmatter->>'source_hash' = ANY(${hashes}) OR frontmatter->>'source_path' = ANY(${paths})) ORDER BY id`;
@@ -55,7 +55,8 @@ export async function capture(sql: postgres.Sql, pairs: Pair[], manifestSha: str
     const pairOf = (a: any) => pairs.find(p => p.path === a.p || a.h === p.hash16 || a.h === `pending:${p.hash16}`)?.path ?? '';
     return {
       manifest_sha256: manifestSha, captured_at: new Date().toISOString(), pairs, receipt_families: families,
-      atoms: atoms.map((a: any) => ({ id: Number(a.id), slug: a.slug, deleted_at: a.deleted_at ? new Date(a.deleted_at).toISOString() : null, content_hash: a.content_hash, frontmatter: a.frontmatter, compiled_truth: a.compiled_truth, pair: pairOf(a) })),
+      atoms: atoms.map((a: any) => ({ id: Number(a.id), slug: a.slug, deleted_at: a.deleted_at ? new Date(a.deleted_at).toISOString() : null, content_hash: a.content_hash, frontmatter: a.frontmatter, compiled_truth: a.compiled_truth, pair: pairOf(a),
+        effective_date: a.effective_date ? new Date(a.effective_date).toISOString() : null, effective_date_source: a.effective_date_source ?? null })), // stage 2 §4 date gates
       generations: generations.map((g: any) => ({ ...g, id: Number(g.id) })), items: items.map((i: any) => ({ ...i, generation_id: Number(i.generation_id) })),
       state_rows: [...state_rows], receipts: receipts.map((r: any) => ({ id: Number(r.id), slug: r.slug, deleted_at: r.deleted_at ? new Date(r.deleted_at).toISOString() : null, content_hash: r.content_hash, frontmatter: r.frontmatter, compiled_truth: r.compiled_truth, pair: '' })),
     } as Capture;
