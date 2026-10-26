@@ -1,6 +1,6 @@
 #!/bin/bash
 # Luna canary, stage 1 (CANARY-PACKET.md; DESIGN.md r4 fae517a8). ONE step per invocation, output in full:
-#   canary.sh <A|V|B|C|D|E|F|G|H|I|K|S|resume|rollback> <reviewed-head-full-sha>
+#   canary.sh <A|V|B|C|D|E|F|G|R|H|I|K|S|resume|rollback> <reviewed-head-full-sha>   (R: stage 2 only)
 # A installs the bridge; V instead binds an ALREADY-installed bridge to these reviewed bytes. K builds the blind kit from the
 # attempt's atom write set; S scores both raters' sealed labels and writes rating/PASS only if both pass (resume requires it).
 # Every step refuses unless the worktree is clean at exactly <reviewed-head>; that worktree's src/ IS the gbrain runtime
@@ -213,6 +213,41 @@ G) step "run: verify bindings, open admission to THIS manifest, extract (one for
    grep -E "admission manifest|\[extract_atoms\]" "$A/run.err" | tail -20 || true
    bridge_status | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print("bridge halted after run:", d.get("halted"))' || echo "bridge status unavailable"
    echo "dream rc=$rc"; [[ $rc == 0 ]] || { echo "STOP: dream exited $rc -> run 'rollback' (it captures the post-failure write set)"; exit $rc; } ;;
+R) step "retry THIS attempt's malformed-output failures ONCE (stage 2): exclusive retry.manifest, same OPEN..CLOSE discipline as G"
+   S2 || { echo "REFUSE: R is stage 2 only"; exit 1; }
+   A=$(attempt); bindings "$A"
+   [[ -e "$A/run.json" && -s "$A/after.json" && -s "$A/plan.json" ]] || { echo "REFUSE: R needs G and H to have run in this attempt"; exit 1; }
+   [[ ! -e "$A/retry.manifest" ]] || { echo "REFUSE: the retry allowance of this attempt is used (retry.manifest exists)"; exit 1; }
+   [[ -n ${CANARY_MEMBERS:-} && -n ${CANARY_SESSIONS:-} && -e $A/STAGE2 ]] || { echo "REFUSE: R needs CANARY_MEMBERS, CANARY_SESSIONS and a stage-2 attempt"; exit 1; }
+   cmp -s <(awk -F'\t' '{print $1"\t"$4}' "$CANARY_MEMBERS") "$A/canary.manifest" || { echo "REFUSE: members do not bind this canary.manifest"; exit 1; }
+   no_runner
+   live=$(q "select count(*) from gbrain_cycle_locks where ttl_expires_at > now()"); echo "live cycle locks: $live"; [[ $live == 0 ]] || { echo "REFUSE: live cycle locks"; exit 1; }
+   bridge_status | python3 -I -c 'import json,sys; d=json.load(sys.stdin); h=d.get("halted"); print("bridge halted:", h); sys.exit(1 if h else 0)' || { echo "REFUSE: bridge halt latch is set (or status unavailable)"; exit 1; }
+   admission_is_closed || { echo "REFUSE: admission not closed before the retry"; exit 1; }
+   [[ $(db_count dream.synthesize.session_corpus_dir) == 0 && $(file_has_corpus) == 0 ]] || { echo "REFUSE: corpus key present before OPEN"; exit 1; }
+   # Eligibility (date_gates is the oracle) + exclusive retry.manifest FIRST: from here on the allowance is consumed.
+   python3 -I "$OPS/retry_plan.py" "$A" "$CANARY_MEMBERS" || { echo "REFUSE (no OPEN): not a bounded malformed-output retry"; exit 1; }
+   python3 -I "$OPS/date_parts.py" bytes-check "$A/retry.members" || { echo "REFUSE (no OPEN): a retry member's bytes changed since the freeze"; exit 1; }
+   python3 -I "$OPS/date_parts.py" sessions-check "$A/retry.members" "$CANARY_SESSIONS" || { echo "REFUSE (no OPEN): a retry member's session grew since the freeze"; exit 1; }
+   # Keep the G-pass captures byte-for-byte under their own names; H then re-captures after.json/plan.json for the whole
+   # attempt (the canonical names every consumer binds, rollback included, so it covers the retry's writes too).
+   for f in after plan; do mv -n "$A/$f.json" "$A/$f.g1.json"; chmod 0444 "$A/$f.g1.json"; done
+   [[ ! -e "$A/after.json" && ! -e "$A/plan.json" ]] || { echo "REFUSE: could not set the G-pass captures aside"; exit 1; }
+   (set -o noclobber; date -u +%FT%TZ > "$A/T_retry")
+   trap g_cleanup EXIT
+   gb config set cycle.extract_atoms.admit_hashes_file "$A/retry.manifest"
+   [[ $(db_value cycle.extract_atoms.admit_hashes_file) == "$A/retry.manifest" ]] || { echo "REFUSE: admission readback mismatch"; exit 1; }
+   gb config set dream.synthesize.session_corpus_dir "$CORPUS"   # the corpus key exists only from OPEN to CLOSED
+   if [[ ${CANARY_DRYRUN:-} == 1 && ${CANARY_DRYRUN_FAULT:-} == retry-after-open ]]; then echo "[dry-run] injected failure after retry OPEN"; false; fi
+   luna_env; export GBRAIN_EXTRACT_PHASE_BUDGET_MS=3600000
+   set +e; (cd "$W" && set -o noclobber && bun src/cli.ts dream --source default --dir "$A/checkout" --phase extract_atoms --json > "$A/run-retry.json" 2> "$A/run-retry.err"); rc=$?; set -e
+   gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest"
+   admission_is_closed || { echo "ALERT: admission did not close; close it by hand before anything else"; exit 1; }
+   disable_extraction; trap - EXIT
+   grep -E "admission manifest|\[extract_atoms\]" "$A/run-retry.err" | tail -20 || true
+   python3 -I -c 'import json,sys; sys.path=[]; d=json.load(open(sys.argv[1])); f=[x for p in d.get("phases",[]) for x in (p.get("details") or {}).get("failures",[])]; print("retry failures:", json.dumps(f))' "$A/run-retry.json" || echo "retry failures: unreadable"
+   echo "dream rc=$rc"; [[ $rc == 0 ]] || { echo "STOP: retry dream exited $rc (unknown outcome; no second retry)"; exit $rc; }
+   echo "next: state_check post-run, H (re-capture of the whole attempt), then date_gates" ;;
 H) step "write set AFTER (bound to BEFORE) + checks"
    A=$(attempt); bindings "$A"; [[ -e "$A/run.json" ]] || { echo "REFUSE: G has not run in this attempt"; exit 1; }
    bun "$OPS/writeset.ts" capture "$A/canary.manifest" "$CORPUS" "$A/after.json" --like "$A/before.json"

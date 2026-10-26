@@ -12,6 +12,11 @@
 #  batch 5  same, with the admission close failing -> trap reports admission UNKNOWN, corpus key verified -> post-run
 #           FAIL -> close by hand -> post-run OK -> rollback on decision
 #  batch 6  earlier KEPT batch tampered in the scratch DB -> date_gates FAIL (10) -> S refuses -> rollback on decision
+#  (Pebble consult 21:32Z, bounded retry R)  batch 2 also: R refuses on a PASSed attempt
+#  batch 7  one malformed output -> gates 10 (failed pair only) -> R (exclusive retry.manifest) -> success -> H re-capture
+#           -> date_gates PASS (retried 1, completed pairs preserved) -> R re-entry refused -> K S resume
+#  batch 8  malformed again in R -> re-gates FAIL (10) -> R re-entry refused -> rollback on decision
+#  batch 9  failure after R's OPEN -> trap verifies both closures -> post-run OK -> R re-entry refused -> rollback
 # Usage: stage2-rehearsal.test.sh <scratch-db gbrain_s552_*> <source scratch gbrain home> <out dir> <plan run.manifest>
 set -u
 DB=$1 SRCHOME=$2 OUT=$3 PLAN=$4
@@ -21,7 +26,7 @@ mkdir -p "$OUT"; [[ -z $(ls -A "$OUT") ]] || { echo "REFUSE: $OUT must be empty"
 RUN=$OUT/run CAN=$OUT/canary; mkdir -p "$OUT/corpus" "$OUT/ctl" "$RUN" "$CAN"
 cp -a "$SRCHOME" "$OUT/home"
 head -c 24 /dev/urandom | base64 > "$OUT/secret"; chmod 600 "$OUT/secret"; : > "$OUT/ledger.jsonl"; echo ok > "$OUT/ctl/mode"
-sed -n '40,57p' "$PLAN" | cut -f3 | while read -r p; do cp -p "$p" "$OUT/corpus/"; done
+sed -n '40,69p' "$PLAN" | cut -f3 | while read -r p; do cp -p "$p" "$OUT/corpus/"; done
 PORT=$((20000 + RANDOM % 20000))
 python3 -I "$C/stub_bridge.py" "$PORT" "$OUT/secret" "$OUT/ledger.jsonl" "$OUT/ctl" & STUB=$!
 trap 'kill $STUB 2>/dev/null' EXIT; sleep 1
@@ -46,7 +51,7 @@ PY
 # Step 0 (read-only freeze over the scratch corpus)
 (cd "$O" && bun inventory.ts "$OUT/corpus" "$RUN/freeze-inventory" "$RUN/renames.tsv" > "$RUN/freeze-inventory.out")
 python3 -I -c "import json,sys;d=json.load(open(sys.argv[1]));[print(r['hash16']+'\t'+r['path']) for r in d['rows'] if r['class']=='missing']" "$RUN/freeze-inventory/inventory.json" > "$RUN/eligible.manifest"
-out=$(python3 -I "$O/date_parts.py" plan "$RUN/eligible.manifest" "$RUN/run.manifest" "$RUN/refused.tsv" 2>&1); expect "step 0 freeze plans the scratch parts" "$out" "plan: 18 dated"
+out=$(python3 -I "$O/date_parts.py" plan "$RUN/eligible.manifest" "$RUN/run.manifest" "$RUN/refused.tsv" 2>&1); expect "step 0 freeze plans the scratch parts" "$out" "plan: 30 dated"
 slice() {   # runbook 2.1-2.3 for rows a..b: slice, session growth, eligibility with both aliases, rename, batch manifest
   local n=$1 a=$2 b=$3 M=$RUN/batch-$1.members
   sed -n "${a},${b}p" "$RUN/run.manifest" > "$M"
@@ -104,6 +109,8 @@ out=$(CANARY_MEMBERS=$RUN/batch-2.members cs G); expect "G runs (stub returns no
 cs H >/dev/null
 out=$(python3 -I "$O/date_gates.py" "$A2" "$RUN/batch-2.members" "$CAN/stage2-kept" 2>&1); expect "date_gates PASS on native zero-atom tombstones" "$out" "zero-atom tombstone"
 expect "date_gates exit/receipt" "$out" "GATES: PASS"
+out=$(CANARY_MEMBERS=$RUN/batch-2.members cs R); expect "R refuses on a PASSed attempt (nothing written)" "$out" "not a bounded malformed-output retry"
+expect "...and leaves no retry.manifest" "$(ls "$A2/retry.manifest" 2>&1)" "No such file"
 cs I >/dev/null; cs K >/dev/null
 out=$(CANARY_MEMBERS=$RUN/batch-2.members cs S); expect "S completes a zero-atom batch on the gates alone" "$out" "zero-atom batch, gates PASS"
 out=$(CANARY_MEMBERS=$RUN/batch-2.members cs resume); expect "resume after a zero-atom batch" "$out" "kept record"
@@ -141,10 +148,65 @@ out=$(prepare 6); expect "E batch 6" "$out" "attempt: $CAN/attempt-"; A4=$(attem
 out=$(CANARY_MEMBERS=$RUN/batch-6.members cs G); expect "G runs batch 6" "$out" "dream rc=0"
 cs H >/dev/null
 kid=$(python3 -I -c "import json,glob;print(json.load(open(sorted(glob.glob('$CAN/stage2-kept/*.json'))[0]))[0]['id'])")
-psql -XAt -c "update pages set content_hash = 'rehearsal-tamper' where id = $kid" >/dev/null
+korig=$(psql -XAt -c "select content_hash from pages where id = $kid"); psql -XAt -c "update pages set content_hash = 'rehearsal-tamper' where id = $kid" >/dev/null
 out=$(python3 -I "$O/date_gates.py" "$A4" "$RUN/batch-6.members" "$CAN/stage2-kept" 2>&1); rc=$?
 expect "date_gates FAIL when an earlier kept batch changed" "$out" "earlier kept batch changed"; expect "that FAIL is exit 10 (complete evidence)" "$rc" "10"
 cs I >/dev/null; cs K >/dev/null; labels "$A4/rating"
 out=$(CANARY_MEMBERS=$RUN/batch-6.members cs S); expect "S refuses without a bound gates.ok" "$out" "no gates.ok"
 out=$(cs rollback); expect "rollback on decision (batch 6) verifies DONE" "$out" '"verdict":"DONE"'
+psql -XAt -c "update pages set content_hash = '$korig' where id = $kid" >/dev/null   # undo the batch-6 tamper for later kept checks
+gates() { python3 -I "$O/date_gates.py" "$1" "$2" "$CAN/stage2-kept" 2>&1; }
+
+echo "##### batch 7: one malformed output -> bounded retry succeeds"
+out=$(slice 7 19 21); expect "slice 7" "$out" "slice 7 ok"
+out=$(prepare 7); expect "E batch 7" "$out" "attempt: $CAN/attempt-"; A7=$(attempt); M7=$RUN/batch-7.members
+echo 1 > "$OUT/ctl/malformed_left"
+out=$(CANARY_MEMBERS=$M7 cs G); expect "G runs batch 7 (one malformed output)" "$out" "dream rc=0"
+cs H >/dev/null
+out=$(gates "$A7" "$M7"); rc=$?; expect "gates FAIL (10) on the failed pair only" "$rc:$out" "10:"; expect "...naming a failed state row" "$out" "failed state row"
+out=$(st pre-open); expect "pre-open OK before R" "$out" "STATE pre-open: OK"
+out=$(CANARY_MEMBERS=$M7 cs R); expect "R plans exactly 1 retry pair" "$out" '"retry_pairs": 1'; expect "R's retry dream rc 0" "$out" "dream rc=0"
+expect "...with no retry failures" "$out" "retry failures: []"
+out=$(st post-run); expect "post-run OK after R" "$out" "STATE post-run: OK"
+expect "G-pass captures kept read-only" "$(stat -c %a "$A7/after.g1.json" "$A7/plan.g1.json" | paste -sd,)" "444,444"
+cs H >/dev/null
+out=$(gates "$A7" "$M7"); expect "date_gates PASS after the retry" "$out" "GATES: PASS"; expect "...counting 1 retried pair" "$out" '"retried": 1'
+cp -p "$A7/retry-snapshot.json" "$RUN/snap7.bak"; python3 -I - "$A7/retry-snapshot.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1])); p = next(k for k, v in s['pairs'].items() if v['atoms']); s['pairs'][p]['atoms'][0][1] = 'tampered'
+json.dump(s, open(sys.argv[1], 'w'))
+PY
+out=$(gates "$A7" "$M7"); rc=$?; expect "control: a changed completed pair fails the gates (10)" "$rc:$out" "10:"; expect "...as 'retry changed'" "$out" "retry changed 1 completed pair"
+cp -p "$RUN/snap7.bak" "$A7/retry-snapshot.json"; out=$(gates "$A7" "$M7"); expect "snapshot restored: PASS again" "$out" "GATES: PASS"
+out=$(CANARY_MEMBERS=$M7 cs R); expect "R re-entry refused (allowance used)" "$out" "retry allowance of this attempt is used"
+cs I >/dev/null; out=$(cs K); expect "K kit after the retry" "$out" "kit/"; labels "$A7/rating"
+out=$(CANARY_MEMBERS=$M7 cs S); expect "S PASS after the retry" "$out" "ACCEPTANCE (rating): PASS"
+out=$(CANARY_MEMBERS=$M7 cs resume); expect "resume records the retried batch" "$out" "kept record"
+
+echo "##### batch 8: malformed again in R -> STOP"
+out=$(slice 8 22 24); expect "slice 8" "$out" "slice 8 ok"
+out=$(prepare 8); expect "E batch 8" "$out" "attempt: $CAN/attempt-"; A8=$(attempt); M8=$RUN/batch-8.members
+echo 1 > "$OUT/ctl/malformed_left"
+out=$(CANARY_MEMBERS=$M8 cs G); expect "G runs batch 8 (one malformed output)" "$out" "dream rc=0"
+cs H >/dev/null; gates "$A8" "$M8" >/dev/null
+echo 1 > "$OUT/ctl/malformed_left"
+out=$(CANARY_MEMBERS=$M8 cs R); expect "R runs (dream rc 0)" "$out" "dream rc=0"; expect "...and reports the repeated malformed output" "$out" "malformed model output"
+out=$(st post-run); expect "post-run OK after the failed retry" "$out" "STATE post-run: OK"
+cs H >/dev/null
+out=$(gates "$A8" "$M8"); rc=$?; expect "re-gates FAIL (10) after a second malformed output" "$rc:$out" "10:"
+out=$(CANARY_MEMBERS=$M8 cs R); expect "R re-entry refused (no second retry)" "$out" "retry allowance of this attempt is used"
+out=$(cs rollback); expect "rollback on decision (batch 8) verifies DONE" "$out" '"verdict":"DONE"'
+
+echo "##### batch 9: failure after R's OPEN"
+out=$(slice 9 25 27); expect "slice 9" "$out" "slice 9 ok"
+out=$(prepare 9); expect "E batch 9" "$out" "attempt: $CAN/attempt-"; A9=$(attempt); M9=$RUN/batch-9.members
+echo 1 > "$OUT/ctl/malformed_left"
+out=$(CANARY_MEMBERS=$M9 cs G); expect "G runs batch 9 (one malformed output)" "$out" "dream rc=0"
+cs H >/dev/null; gates "$A9" "$M9" >/dev/null
+out=$(CANARY_DRYRUN_FAULT=retry-after-open CANARY_MEMBERS=$M9 cs R); rc=$?
+expect "R's trap reports both closures verified" "$out" "admission closed: verified; corpus key absent (db+file): verified"; expect "...with a failure status" "$([[ $rc != 0 ]] && echo nonzero)" "nonzero"
+out=$(st post-run); expect "post-run OK after R's trap" "$out" "STATE post-run: OK"
+out=$(CANARY_MEMBERS=$M9 cs R); expect "R re-entry refused after the interruption" "$out" "retry allowance of this attempt is used"
+out=$(cs rollback); expect "rollback on decision (batch 9) verifies DONE" "$out" '"verdict":"DONE"'
+out=$(st post-rollback); expect "post-rollback OK" "$out" "STATE post-rollback: OK"
 echo "RESULT: $FAILS failure(s)"; exit $FAILS

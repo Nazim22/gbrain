@@ -11,12 +11,15 @@ Reconciles the attempt-owned write set (canary.sh F/H captures + plan.json) agai
   - per pair, exactly one outcome: atoms whose single live generation has only published, non-pending items keyed to
     exactly those atom slugs and no tombstone, OR a native zero-atom tombstone with no live generation;
   - every member's file still has its frozen full sha256 (source stability at GATED);
-  - [kept-dir] every earlier KEPT batch's atoms unchanged and live in the DB (read-only psql).
+  - [kept-dir] every earlier KEPT batch's atoms unchanged and live in the DB (read-only psql);
+  - after a bounded retry (canary.sh R; <attempt>/retry.manifest): ONLY the listed pairs may carry a failure history
+    (fail_count 1..2) once they reach a terminal outcome (atoms, or a zero-atom tombstone); every other pair's atoms,
+    live generations, items and state rows must equal retry-snapshot.json (taken from the G-pass after.json).
 On PASS it writes <attempt>/gates.ok = sha256 of plan.json, after.json and members.tsv.
 Exit 0 = PASS. Exit 10 = a gate failed on complete evidence. Exit 2 = evidence missing, unreadable or of the wrong
 shape. The runbook treats EVERY nonzero exit as STOP; only a decision turns a 10 into a rollback.
 """
-import hashlib, json, os, sys
+import hashlib, importlib.util, json, os, sys
 from collections import Counter, defaultdict
 
 def kept_check(kept_dir, fails):
@@ -42,6 +45,13 @@ def main(a, members_tsv, kept_dir=None):
     if before['manifest_sha256'] != sha(f'{a}/canary.manifest') or after['manifest_sha256'] != before['manifest_sha256']:
         raise ValueError('before/after are not bound to this canary.manifest')
     if sorted((h, p) for h, p in man) != sorted((r[0], r[3]) for r in mem): raise ValueError('members.tsv differs from canary.manifest')
+    retry = set()
+    if os.path.exists(f'{a}/retry.manifest'):   # a retried attempt must carry its whole retry evidence
+        retry = {tuple(l.split('\t')) for l in open(f'{a}/retry.manifest').read().splitlines()}
+        if not retry or not retry <= set(map(tuple, man)): raise ValueError('retry.manifest is empty or not a subset of canary.manifest')
+        for f in ('retry-snapshot.json', 'after.g1.json', 'plan.g1.json', 'run-retry.json'):
+            if not os.path.exists(f'{a}/{f}'): raise ValueError(f'retried attempt lacks {f}')
+    retry_paths = {p for _, p in retry}
     day = {r[3]: r[4] for r in mem}
     # Completeness: both captures must carry exactly the manifest's pairs, or every per-pair check below is vacuous.
     want_pairs = sorted((h, p) for h, p in man)
@@ -75,12 +85,26 @@ def main(a, members_tsv, kept_dir=None):
         elif x['pair'] not in day: fails.append(f'new atom {i} belongs to no manifest pair')
         else: new.append(x)
     live = Counter(g['owner_key'] for g in after['generations'] if g['state'] == 'live')
-    if any(v > 1 for v in live.values()): fails.append(f'owner keys with several live generations: {[k for k, v in live.items() if v > 1][:5]}')
     by_pair = defaultdict(list)
     for x in new: by_pair[x['pair']].append(x)
-    tomb = {(s['file_path'], s['content_hash']) for s in after['state_rows'] if s['tombstoned'] and int(s['fail_count']) == 0}
+    if retry:   # preservation: the retry left every other pair exactly as the G pass did
+        snap = json.load(open(f'{a}/retry-snapshot.json'))
+        if snap['after_g1_sha256'] != sha(f'{a}/after.g1.json') or snap['plan_g1_sha256'] != sha(f'{a}/plan.g1.json'):
+            raise ValueError('retry-snapshot.json is not bound to after.g1.json / plan.g1.json')
+        spec = importlib.util.spec_from_file_location('retry_plan', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'retry_plan.py'))
+        rp = importlib.util.module_from_spec(spec); spec.loader.exec_module(rp)
+        now = rp.snapshot(after, [p for _, p in man if p not in retry_paths])
+        if sorted(snap['pairs']) != sorted(now): raise ValueError('retry-snapshot.json covers different pairs')
+        changed = sorted(p for p in now if now[p] != snap['pairs'][p])
+        if changed: fails.append(f'retry changed {len(changed)} completed pair(s): {[os.path.basename(p) for p in changed[:5]]}')
+    if any(v > 1 for v in live.values()): fails.append(f'owner keys with several live generations: {[k for k, v in live.items() if v > 1][:5]}')
+    # A zero-atom tombstone is native when fail_count is 0, or 1..2 on a retried pair (a failure tombstone needs 3).
+    tomb = {(s['file_path'], s['content_hash']) for s in after['state_rows'] if s['tombstoned']
+            and (int(s['fail_count']) == 0 or (s['file_path'] in retry_paths and int(s['fail_count']) < 3))}
     any_tomb = {(s['file_path'], s['content_hash']) for s in after['state_rows'] if s['tombstoned']}
-    failed = {s['file_path'] for s in after['state_rows'] if int(s['fail_count']) > 0}
+    # A failure history is a fail, except on a retried pair that now has atoms or a tombstone.
+    failed = {s['file_path'] for s in after['state_rows'] if int(s['fail_count']) > 0
+              and not (s['file_path'] in retry_paths and (by_pair.get(s['file_path']) or s['tombstoned']))}
     items = defaultdict(list)
     for it in after['items']: items[it['generation_id']].append(it)
     outcome = Counter()
@@ -100,6 +124,7 @@ def main(a, members_tsv, kept_dir=None):
             if gens: fails.append(f'{name}: zero-atom tombstone AND {len(gens)} live generation(s)')
             outcome['zero-atom tombstone'] += 1
         else: fails.append(f'{name}: no atoms and no native zero-atom tombstone'); outcome['neither'] += 1
+        if path in retry_paths and (xs or (path, h) in tomb): outcome['retried'] += 1
         want = f'{day[path]}T00:00:00.000Z'
         for x in xs:
             fm = x['frontmatter']
