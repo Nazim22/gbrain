@@ -75,7 +75,7 @@ G) step "run: open admission to the canary manifest, extract (one foreground own
    gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest"
    grep -E "admission manifest|\[extract_atoms\]" "$D/run.err" | tail -20
    bridge_status | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print("bridge halted after run:", d.get("halted"))'
-   echo "dream rc=$rc"; [[ $rc == 0 ]] || { echo "STOP: dream exited $rc -> go to rollback"; exit $rc; } ;;
+   echo "dream rc=$rc"; [[ $rc == 0 ]] || { echo "STOP: dream exited $rc -> run 'rollback' (it captures the post-failure write set)"; exit $rc; } ;;
 H) step "write set AFTER + checks"
    bun "$OPS/writeset.ts" capture "$D/canary.manifest" "$CORPUS" "$D/after.json" --like "$D/before.json"
    bun "$OPS/rollback-batch.ts" plan "$D/before.json" "$D/after.json" | tee "$D/plan.json"
@@ -109,6 +109,11 @@ resume) step "acceptance PASSED: disable extraction for the unpatched live autop
 rollback) step "acceptance FAILED or STOP: scoped rollback (§8b) must verify DONE before anything restarts"
    gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest"
    if pgrep -af 'gbrain (autopilot|dream|cycle)'; then echo "REFUSE: a runner is active"; exit 1; fi
+   [[ -s "$D/before.json" ]] || { echo "REFUSE: no before.json: nothing was admitted, nothing to roll back"; exit 1; }
+   # G can fail before H ran: capture the post-failure write set now (runners paused, admission closed), never guess it.
+   if [[ ! -s "$D/after.json" ]]; then echo "after.json missing: capturing the post-failure write set";
+     bun "$OPS/writeset.ts" capture "$D/canary.manifest" "$CORPUS" "$D/after.json" --like "$D/before.json"; fi
+   bun "$OPS/rollback-batch.ts" plan "$D/before.json" "$D/after.json"
    bun "$OPS/rollback-batch.ts" apply "$D/before.json" "$D/after.json"     # exits non-zero unless the final verify is DONE
    bun "$OPS/rollback-batch.ts" verify "$D/before.json" "$D/after.json"    # exits 0 only on DONE; set -e stops here otherwise
    gb config set models.dream.extract_atoms "$GEMMA"

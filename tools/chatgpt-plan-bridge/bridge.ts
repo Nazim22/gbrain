@@ -44,7 +44,12 @@ export function makeHandler(cfg: Config, d: Deps) {
     const fd = openSync(haltFile, 'wx', 0o600);
     try { writeSync(fd, JSON.stringify({ ts: new Date(now()).toISOString(), code, request_id: id })); fsyncSync(fd); } finally { closeSync(fd); }
   };
-  const halted = () => { try { return JSON.parse(readFileSync(haltFile, 'utf8')); } catch { return null; } };
+  // Fail closed: only "no latch file" means not halted. An unreadable or malformed latch counts as halted.
+  const halted = () => {
+    let text: string;
+    try { text = readFileSync(haltFile, 'utf8'); } catch (e: any) { return e?.code === 'ENOENT' ? null : { code: 'latch_unreadable' }; }
+    try { const h = JSON.parse(text); return h && typeof h === 'object' ? h : { code: 'latch_malformed' }; } catch { return { code: 'latch_malformed' }; }
+  };
   const authorized = (req: Request) => {
     const h = req.headers.get('authorization') ?? '';
     const got = Buffer.from(h.startsWith('Bearer ') ? h.slice(7) : '');
@@ -82,6 +87,9 @@ export function makeHandler(cfg: Config, d: Deps) {
       let token: string;
       try { token = await d.accessToken(); }
       catch { ledger({ ...base, status: 401, code: 'auth_unavailable' }); trip('auth_unavailable', id); return err(401, 'auth_unavailable', 'oauth session expired or unavailable'); }
+      // Re-check the latch immediately before dispatch: another request may have tripped it while this one was scanning.
+      const h2 = halted();
+      if (h2) { ledger({ ...base, status: 429, code: 'bridge_halted', halted_by: h2.code }); return err(429, 'bridge_halted', `bridge halted by ${h2.code}; operator must clear halted.json`, { 'retry-after': '3600' }); }
       let up;
       try { up = await d.upstream(responsesBody(parsed), token, { connect: cfg.upstream.connect_ms, request: cfg.upstream.request_ms }, parsed.route.max_output_chars); }
       catch (e) { const code = e instanceof UpstreamError ? e.code : 'TRANSPORT-UNKNOWN'; ledger({ ...base, status: 502, code: 'unknown_completion', detail: code, latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion', code); }

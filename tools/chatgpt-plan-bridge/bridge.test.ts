@@ -157,3 +157,29 @@ test('halt latch: non-stop errors (busy, leak quarantine, provider limits) do no
   const { existsSync: ex } = await import('node:fs');
   expect(ex(join(s.dir, 'halted.json'))).toBe(false);
 });
+
+test('halt latch fails closed: an empty or malformed halted.json blocks every request', async () => {
+  const { writeFileSync } = await import('node:fs');
+  for (const content of ['', '{not json', 'null']) {
+    const s = setup();
+    writeFileSync(join(s.dir, 'halted.json'), content);
+    const r = await s.post(ok); expect(r.status).toBe(429); expect((await r.json()).error.code).toBe('bridge_halted');
+    expect(s.calls.length).toBe(0);
+  }
+});
+
+test('halt latch is re-checked right before dispatch: a request held in scanning does not cross a trip', async () => {
+  const { UpstreamError } = await import('./upstream.ts');
+  let releaseScan!: () => void; const scanGate = new Promise<void>(r => { releaseScan = r; });
+  let scans = 0, upstreamCalls = 0;
+  const s = setup({
+    scan: async () => { scans++; if (scans === 1) await scanGate; return { clean: true }; },          // request A is held in scanning
+    upstream: async () => { upstreamCalls++; throw new UpstreamError('REQUEST-TIMEOUT'); },          // request B trips the latch
+  });
+  const a = s.post(ok); await Bun.sleep(5);
+  expect((await s.post(ok)).status).toBe(502);       // B: unknown_completion → latch tripped
+  expect(upstreamCalls).toBe(1);
+  releaseScan();
+  const ra = await a; expect(ra.status).toBe(429); expect((await ra.json()).error.code).toBe('bridge_halted');
+  expect(upstreamCalls).toBe(1);                      // A never dispatched
+});
