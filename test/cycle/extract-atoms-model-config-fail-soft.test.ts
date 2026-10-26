@@ -12,10 +12,14 @@
 // instead of falling back to `resolveTierDefault('utility')`. This test
 // exercises exactly that: `getConfig` throws for every key, and the phase
 // must still complete (using the tier-default model) rather than throw.
+// The admission-manifest lookup is the one deliberate exception: it FAILS CLOSED
+// (a failed lookup admits nothing), so the model-resolution case reads that key as
+// unset, and a separate case pins "completes, but no model call".
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { runPhaseExtractAtoms } from '../../src/core/cycle/extract-atoms.ts';
+import { ADMIT_HASHES_KEY } from '../../src/core/cycle/extract-atoms-admit.ts';
 import { resolveTierDefault } from '../../src/core/model-config.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import type { ChatResult, ChatOpts } from '../../src/core/ai/gateway.ts';
@@ -57,13 +61,15 @@ function captureChat(): { calls: ChatOpts[]; chat: (o: ChatOpts) => Promise<Chat
 describe('extract_atoms model resolution stays fail-soft on a throwing config read', () => {
   test('a throwing getConfig does not reject the phase — falls back to the tier default', async () => {
     const { calls, chat } = captureChat();
-    // Wrap the real engine so every getConfig() throws, mirroring the
+    // Wrap the real engine so every model/budget getConfig() throws, mirroring the
     // "on any config-read failure" scenario the try/catch is meant to
-    // absorb, without hand-rolling a full BrainEngine stub.
+    // absorb, without hand-rolling a full BrainEngine stub. The admission key reads
+    // as unset (no manifest), the state every brain without a canary is in.
     const throwingEngine = new Proxy(engine, {
       get(target, prop, receiver) {
         if (prop === 'getConfig') {
-          return async () => {
+          return async (key: string) => {
+            if (key === ADMIT_HASHES_KEY) return null;
             throw new Error('simulated config-read failure');
           };
         }
@@ -82,5 +88,23 @@ describe('extract_atoms model resolution stays fail-soft on a throwing config re
     expect(result.phase).toBe('extract_atoms');
     expect(calls.length).toBeGreaterThan(0);
     expect(calls[0]!.model).toBe(resolveTierDefault('utility'));
+  });
+
+  test('a throwing admission lookup still completes the phase, but admits nothing (fail closed)', async () => {
+    const { calls, chat } = captureChat();
+    const throwingEngine = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'getConfig') return async () => { throw new Error('simulated config-read failure'); };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const result = await runPhaseExtractAtoms(throwingEngine as unknown as PGLiteEngine, {
+      sourceId: 'default',
+      _transcripts: [{ filePath: '/tmp/fail-soft.txt', content: 'hello world', contentHash: 'h1'.repeat(8) }],
+      _pages: [],
+      _chat: chat,
+    });
+    expect(result.phase).toBe('extract_atoms');
+    expect(calls.length).toBe(0);
   });
 });
