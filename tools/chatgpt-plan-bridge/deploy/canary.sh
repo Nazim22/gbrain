@@ -216,8 +216,8 @@ G) step "run: verify bindings, open admission to THIS manifest, extract (one for
 R) step "retry THIS attempt's malformed-output failures ONCE (stage 2): exclusive retry.manifest, same OPEN..CLOSE discipline as G"
    S2 || { echo "REFUSE: R is stage 2 only"; exit 1; }
    A=$(attempt); bindings "$A"
+   [[ ! -e "$A/retry.manifest" ]] || { echo "REFUSE: the retry allowance of this attempt is used (retry.manifest exists)"; exit 1; }   # first: names the real cause after an interrupted R
    [[ -e "$A/run.json" && -s "$A/after.json" && -s "$A/plan.json" ]] || { echo "REFUSE: R needs G and H to have run in this attempt"; exit 1; }
-   [[ ! -e "$A/retry.manifest" ]] || { echo "REFUSE: the retry allowance of this attempt is used (retry.manifest exists)"; exit 1; }
    [[ -n ${CANARY_MEMBERS:-} && -n ${CANARY_SESSIONS:-} && -e $A/STAGE2 ]] || { echo "REFUSE: R needs CANARY_MEMBERS, CANARY_SESSIONS and a stage-2 attempt"; exit 1; }
    cmp -s <(awk -F'\t' '{print $1"\t"$4}' "$CANARY_MEMBERS") "$A/canary.manifest" || { echo "REFUSE: members do not bind this canary.manifest"; exit 1; }
    no_runner
