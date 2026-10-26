@@ -91,6 +91,7 @@ def main(a, members_tsv, kept_dir=None):
         snap = json.load(open(f'{a}/retry-snapshot.json'))
         if snap['after_g1_sha256'] != sha(f'{a}/after.g1.json') or snap['plan_g1_sha256'] != sha(f'{a}/plan.g1.json'):
             raise ValueError('retry-snapshot.json is not bound to after.g1.json / plan.g1.json')
+        sys.dont_write_bytecode = True   # importing must never leave __pycache__ in the reviewed worktree (canary refuses a dirty tree)
         spec = importlib.util.spec_from_file_location('retry_plan', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'retry_plan.py'))
         rp = importlib.util.module_from_spec(spec); spec.loader.exec_module(rp)
         now = rp.snapshot(after, [p for _, p in man if p not in retry_paths])
