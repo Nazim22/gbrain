@@ -384,6 +384,13 @@ the scope the transcript supports. Each atom must:
   - Claim nothing the transcript does not state: no added numbers, outcomes,
     permanence or automation. A proposal, plan, question or backlog item is not a
     decision or a result; record it as what it is, or skip it.
+  - An announced, requested or planned change is not a done change. State an
+    outcome ("fixed", "corrected", "changed", "now does X", "limits Y") only when
+    the transcript shows evidence of THAT outcome (a tool result, read-back or test
+    run proving it); a commit proves committed code, not a deployment or its effect.
+    Otherwise say proposed, requested or planned, in the title, body AND lesson.
+  - Keep every condition the transcript attaches (time window, trigger, scope,
+    exception) in the title, body AND lesson; a lesson must not drop one.
 
 PREFER: root causes and the evidence that proved them · non-obvious gotchas and
 why they bite · decisions with their rationale and rejected alternative ·
