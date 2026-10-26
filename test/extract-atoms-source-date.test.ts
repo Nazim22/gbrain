@@ -8,7 +8,8 @@
  * atom's frontmatter `date`, so classic import and managed publication
  * (test/helpers/managed-atoms-contract.ts) store the same date.
  * Regression: dropping the stamp, reading the date after inference, or
- * borrowing a date for a transcript-derived atom (no source page).
+ * dating a transcript-derived atom (no source page) by anything but the
+ * leading `YYYY-MM-DD` of its file name.
  * Model calls go through the `_chat` seam; persistence is real PGLite.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -70,16 +71,28 @@ describe('#6720 atom content dates', () => {
     }, 60_000);
   }
 
-  test('a transcript-derived atom has no source page and borrows no date', async () => {
-    const sourceId = 'atom-date-transcript';
-    await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
-    const result = await runPhaseExtractAtoms(engine, {
-      sourceId, _pages: [], _transcripts: [{ filePath: '/fake/2026-07-09-call.txt', content: body, contentHash: 'ab'.repeat(32) }],
-      _chat: async () => reply(),
-    });
-    expect(result.details?.atoms_extracted).toBe(1);
-    const atom = await onlyAtom(sourceId);
-    expect(atom.frontmatter.date).toBeUndefined();
-    expect(atom.effective_date_source).not.toBe('date');
-  }, 60_000);
+  for (const fx of [
+    { id: 'dated-name', file: '/fake/2026-07-09-call.txt', date: '2026-07-09T00:00:00.000Z', folder: '2026-07-09' },
+    { id: 'undated-name', file: '/fake/call.txt', date: undefined, folder: 'undated' },
+    { id: 'impossible-date', file: '/fake/2026-02-30-call.txt', date: undefined, folder: '2026-02-30' },
+  ]) {
+    test(`a transcript-derived atom is dated only by its file name's leading date (${fx.id})`, async () => {
+      const sourceId = `atom-date-transcript-${fx.id}`;
+      await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
+      const result = await runPhaseExtractAtoms(engine, {
+        sourceId, _pages: [], _transcripts: [{ filePath: fx.file, content: body, contentHash: 'ab'.repeat(32) }],
+        _chat: async () => reply(),
+      });
+      expect(result.details?.atoms_extracted).toBe(1);
+      const atom = await onlyAtom(sourceId);
+      expect(atom.slug.split('/')[1]).toBe(fx.folder);
+      expect(atom.frontmatter.date).toBe(fx.date);
+      if (fx.date) {
+        expect(new Date(atom.effective_date!).toISOString()).toBe(fx.date);
+        expect(atom.effective_date_source).toBe('date');
+      } else {
+        expect(atom.effective_date_source).not.toBe('date');
+      }
+    }, 60_000);
+  }
 });
