@@ -25,6 +25,18 @@ no_runner() { if [[ ${CANARY_DRYRUN:-} == 1 ]]; then echo "[dry-run] process che
 svc() { if [[ ${CANARY_DRYRUN:-} == 1 ]]; then echo "[dry-run] systemctl $*"; else systemctl "$@"; fi; }
 CORPUS=/root/.claude/projects/-root/session-text PORT=18795 ROUTE='litellm:gpt-6-luna@medium' GEMMA='llama-server:gemma-4-12b-qat'
 [[ ${CANARY_DRYRUN:-} != 1 ]] || PORT=1   # a dry run never reaches the live bridge (closed port: no real call, G refuses)
+SECRET=/etc/chatgpt-plan-bridge/caller.secret LEDGER=/srv/chatgpt-plan-bridge/state/requests.jsonl
+if [[ ${CANARY_DRYRUN:-} == 1 ]]; then   # stage-2 rehearsal only: a local stub bridge and a scratch corpus copy
+  if [[ -n ${CANARY_PORT:-} ]]; then PORT=$CANARY_PORT; fi
+  if [[ -n ${CANARY_SECRET:-} ]]; then SECRET=$CANARY_SECRET; fi
+  if [[ -n ${CANARY_LEDGER:-} ]]; then LEDGER=$CANARY_LEDGER; fi
+  if [[ -n ${CANARY_CORPUS:-} ]]; then CORPUS=$CANARY_CORPUS; fi
+fi
+# Stage 2 (STAGE2-DESIGN r3, Pebble whole-object HOLD 19:10Z): CANARY_STAGE2=1 binds the runbook's checks into the steps:
+# D leaves the corpus key ABSENT; G holds it only from OPEN to CLOSED, checks member bytes + session growth immediately
+# before OPEN, and closes everything on any failure after OPEN; S and resume require date_gates.py's bound gates.ok;
+# an empty write set completes on the gates alone; resume records the batch's atoms for later batches' checks.
+S2() { [[ ${CANARY_STAGE2:-} == 1 ]]; }
 [[ $(git -C "$W" rev-parse HEAD) == "$WANT" && -z $(git -C "$W" status --porcelain) ]] || { echo "REFUSE: $W is not clean at $WANT"; exit 1; }
 source /root/.gbrain/pg.env
 # libpq reads these from the ENVIRONMENT (no password on any argv); PGDATABASE is a plain name, never a URI.
@@ -34,8 +46,12 @@ gb() { (cd "$W" && bun src/cli.ts "$@"); }
 q() { psql -XAt -v ON_ERROR_STOP=1 -F ' | ' -c "$1"; }
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 step() { echo "=== $(date -u +%FT%TZ) $STEP: $*"; }
-luna_env() { export LITELLM_BASE_URL="http://127.0.0.1:$PORT/v1"; export LITELLM_API_KEY="$(< /etc/chatgpt-plan-bridge/caller.secret)"; }
-bridge_status() { printf 'header = "Authorization: Bearer %s"\n' "$(< /etc/chatgpt-plan-bridge/caller.secret)" | curl -sS -f -K - "http://127.0.0.1:$PORT/v1/bridge/status"; }
+luna_env() { export LITELLM_BASE_URL="http://127.0.0.1:$PORT/v1"; export LITELLM_API_KEY="$(< "$SECRET")"; }
+bridge_status() { printf 'header = "Authorization: Bearer %s"\n' "$(< "$SECRET")" | curl -sS -f -K - "http://127.0.0.1:$PORT/v1/bridge/status"; }
+gates_ok() {   # stage 2: date_gates.py PASS receipt bound to the CURRENT plan.json, after.json and members
+  local A=$1; [[ -n ${CANARY_MEMBERS:-} && -s $CANARY_MEMBERS && -s $A/gates.ok ]] || { echo "REFUSE: no gates.ok (run date_gates.py) or CANARY_MEMBERS unset"; exit 1; }
+  [[ $(< "$A/gates.ok") == "$(sha "$A/plan.json") $(sha "$A/after.json") $(sha "$CANARY_MEMBERS")" ]] || { echo "REFUSE: gates.ok does not bind this plan/after/members"; exit 1; }
+}
 install -d -m 0700 "$D"; [[ -e "$D/closed.manifest" ]] || : > "$D/closed.manifest"
 [[ ! -s "$D/closed.manifest" ]] || { echo "REFUSE: closed.manifest is not empty"; exit 1; }
 
@@ -73,7 +89,7 @@ V) step "verify the INSTALLED bridge is these reviewed bytes and its controls ar
    bridge_status | python3 -I -c 'import json,sys; d=json.load(sys.stdin); assert d.get("halted") is None, "bridge latch set"; assert d["routes"] == ["gpt-6-luna@medium"], d["routes"]; print("with-secret status=200 OK, latch clear, routes", d["routes"])' ;;
 B) step "one real call through gbrain's gateway (synthetic prompt)"
    luna_env; bun "$OPS/real-call.ts"
-   echo "last bridge ledger row (no text by design):"; tail -1 /srv/chatgpt-plan-bridge/state/requests.jsonl ;;
+   echo "last bridge ledger row (no text by design):"; tail -1 "$LEDGER" ;;
 C) step "pause competing runners (single owner)"
    svc stop gbrain-autopilot.service
    for u in gbrain-autopilot.service gbrain-dream.timer; do s=$(svc is-active "$u" || true); echo "$u: $s"; [[ $s != active ]] || { echo "REFUSE: $u active"; exit 1; }; done
@@ -84,7 +100,7 @@ D) step "config: synthesize off, route, admission CLOSED, then corpus key; prici
    gb config set models.dream.extract_atoms "$ROUTE"
    gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest"
    admission_is_closed || { echo "REFUSE: admission not closed after set"; exit 1; }
-   gb config set dream.synthesize.session_corpus_dir "$CORPUS"
+   if S2; then disable_extraction; else gb config set dream.synthesize.session_corpus_dir "$CORPUS"; fi   # stage 2: G holds it OPEN..CLOSED
    for k in dream.synthesize.enabled models.dream.extract_atoms cycle.extract_atoms.admit_hashes_file dream.synthesize.session_corpus_dir; do echo "$k = $(db_value $k)"; done
    gb pricing set "$ROUTE" --input 0 --output 0 --source "subscription: ChatGPT Pro via Sign in with ChatGPT (owner-verified allowance, Nazz 2026-10-26)"
    [[ -e "$D/config.json.before" ]] || cp -p "$CFG" "$D/config.json.before"
@@ -99,8 +115,9 @@ E) step "new attempt: fresh read-only inventory; manifest = 20 MISSING never exp
    A="$D/attempt-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -m 0700 "$A"            # fails if it exists: no clobber
    # set -e does not apply inside an if-tested function: every step returns explicitly. On failure the new (empty of any
    # manifest) attempt dir is removed so it can never read as malformed history; earlier attempts are never touched.
+   if S2; then [[ -n ${CANARY_MANIFEST:-} && -n ${CANARY_RENAMES:-} ]] || { rmdir "$A"; echo "REFUSE: stage 2 needs CANARY_MANIFEST and CANARY_RENAMES"; exit 1; }; fi
    new_manifest() {
-     bun "$OPS/inventory.ts" "$CORPUS" "$A/inventory" > "$A/inventory.out" || return 1
+     bun "$OPS/inventory.ts" "$CORPUS" "$A/inventory" ${CANARY_RENAMES:+"$CANARY_RENAMES"} > "$A/inventory.out" || return 1   # both aliases (stage 2)
      python3 -I -c "import json;d=json.load(open('$A/inventory.out'));print(d['discovered'],d['counts'])" || return 1
      python3 -I - "$A" "${CANARY_MANIFEST:-}" "${CANARY_RENAMES:-}" <<'PY' || return 1
 import glob, hashlib, os, re, sys
@@ -151,6 +168,7 @@ print('canary', len(pick), 'sha256', hashlib.sha256(open(f'{a}/canary.manifest',
 PY
    }
    if ! new_manifest; then rm -rf -- "$A"; echo "REFUSE: E failed; removed the new attempt dir $A (history untouched)"; exit 1; fi
+   if S2; then printf '%s %s\n' "$(sha "$CANARY_MANIFEST")" "$(sha "$CANARY_RENAMES")" > "$A/STAGE2"; fi
    printf '%s\n' "$A" > "$D/ATTEMPT.tmp"; mv "$D/ATTEMPT.tmp" "$D/ATTEMPT"; echo "attempt: $A" ;;
 F) step "write set BEFORE + preflight, bound to this attempt's manifest"
    A=$(attempt); [[ ! -e "$A/before.json" ]] || { echo "REFUSE: before.json exists (one capture per attempt)"; exit 1; }
@@ -162,13 +180,25 @@ G) step "run: verify bindings, open admission to THIS manifest, extract (one for
    no_runner
    bridge_status | python3 -I -c 'import json,sys; d=json.load(sys.stdin); h=d.get("halted"); print("bridge halted:", h); sys.exit(1 if h else 0)' || { echo "REFUSE: bridge halt latch is set (or status unavailable)"; exit 1; }
    admission_is_closed || { echo "REFUSE: admission not closed before the run"; exit 1; }
+   if S2; then   # stage 2: members bind this manifest; bytes + session growth checked immediately before OPEN
+     [[ -n ${CANARY_MEMBERS:-} && -n ${CANARY_SESSIONS:-} && -e $A/STAGE2 ]] || { echo "REFUSE: stage 2 needs CANARY_MEMBERS, CANARY_SESSIONS and a stage-2 attempt"; exit 1; }
+     cmp -s <(awk -F'\t' '{print $1"\t"$4}' "$CANARY_MEMBERS") "$A/canary.manifest" || { echo "REFUSE: members do not bind this canary.manifest"; exit 1; }
+     corpus_present=$(db_count dream.synthesize.session_corpus_dir); [[ $corpus_present == 0 && $(file_has_corpus) == 0 ]] || { echo "REFUSE: corpus key present before OPEN"; exit 1; }
+     python3 -I "$OPS/date_parts.py" bytes-check "$CANARY_MEMBERS" || { echo "REFUSE (no OPEN): a member's bytes changed since the freeze"; exit 1; }
+     python3 -I "$OPS/date_parts.py" sessions-check "$CANARY_MEMBERS" "$CANARY_SESSIONS" || { echo "REFUSE (no OPEN): a member's session grew since the freeze"; exit 1; }
+   fi
    install -d -m 0700 "$A/checkout"; (set -o noclobber; date -u +%FT%TZ > "$A/T_start")
+   if S2; then trap 'gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest" >/dev/null 2>&1; gb config unset dream.synthesize.session_corpus_dir >/dev/null 2>&1; echo "STOP: G failed after OPEN; admission closed + corpus key removed (verify with state_check.sh post-run)"' EXIT; fi
    gb config set cycle.extract_atoms.admit_hashes_file "$A/canary.manifest"
    [[ $(db_value cycle.extract_atoms.admit_hashes_file) == "$A/canary.manifest" ]] || { echo "REFUSE: admission readback mismatch"; exit 1; }
+   if S2; then gb config set dream.synthesize.session_corpus_dir "$CORPUS"; fi   # the corpus key exists only from OPEN to CLOSED
    luna_env; export GBRAIN_EXTRACT_PHASE_BUDGET_MS=3600000
-   set +e; (cd "$W" && set -o noclobber && bun src/cli.ts dream --source default --dir "$A/checkout" --phase extract_atoms --json > "$A/run.json" 2> "$A/run.err"); rc=$?; set -e
+   dream=(bun src/cli.ts dream --source default --dir "$A/checkout" --phase extract_atoms --json)
+   if [[ ${CANARY_DRYRUN:-} == 1 && ${CANARY_DRYRUN_FAULT:-} == dream-exit ]]; then dream=(false); fi   # rehearsal fault injection only
+   set +e; (cd "$W" && set -o noclobber && "${dream[@]}" > "$A/run.json" 2> "$A/run.err"); rc=$?; set -e
    gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest"
    admission_is_closed || { echo "ALERT: admission did not close; close it by hand before anything else"; exit 1; }
+   if S2; then disable_extraction; trap - EXIT; fi
    grep -E "admission manifest|\[extract_atoms\]" "$A/run.err" | tail -20 || true
    bridge_status | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print("bridge halted after run:", d.get("halted"))' || echo "bridge status unavailable"
    echo "dream rc=$rc"; [[ $rc == 0 ]] || { echo "STOP: dream exited $rc -> run 'rollback' (it captures the post-failure write set)"; exit $rc; } ;;
@@ -186,10 +216,10 @@ live = Counter(g['owner_key'] for g in after['generations'] if g['state'] == 'li
 print(json.dumps({'new_atoms': len(new), 'atoms_without_provenance': noprov, 'owner_keys_with_multiple_live_generations': {k: n for k, n in live.items() if n > 1},
                   'served_models': dict(Counter(x['frontmatter'].get('extracted_model') for x in new)), 'routes': dict(Counter(x['frontmatter'].get('extracted_route') for x in new))}))
 PY
-   python3 -I - "$(< "$A/T_start")" <<'PY'
+   python3 -I - "$(< "$A/T_start")" "$LEDGER" <<'PY'
 import json, sys
 from collections import Counter
-rows = [json.loads(l) for l in open('/srv/chatgpt-plan-bridge/state/requests.jsonl') if l.strip()]
+rows = [json.loads(l) for l in open(sys.argv[2]) if l.strip()]
 iso = lambda v: __import__('datetime').datetime.fromisoformat(v.replace('Z', '+00:00'))   # parsed: '...39.066Z' is after '...39Z'
 rows = [r for r in rows if iso(r['ts']) >= iso(sys.argv[1])]
 print(json.dumps({'bridge_requests_since_T_start': len(rows), 'by_status_code': dict(Counter(f"{r.get('status')}:{r.get('code', r.get('finish'))}" for r in rows))}))
@@ -204,6 +234,10 @@ K) step "blind kit from THIS attempt's atom write set (plan.json new + changed a
    python3 -I "$OPS/make_kit.py" "$A" ;;
 S) step "score: seal both raters' labels, score each (DESIGN §8 r5); rating/PASS only if BOTH pass"
    A=$(attempt); R=$A/rating; rc=0; [[ -s $R/key.json ]] || { echo "REFUSE: no kit (run K)"; exit 1; }
+   if S2; then gates_ok "$A"
+     if [[ $(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$R/key.json") == 0 ]]; then   # nothing to rate
+       (set -o noclobber; echo "zero-atom: gates-only $(date -u +%FT%TZ)" > "$R/PASS"); echo "ACCEPTANCE: zero-atom batch, gates PASS (no labels to score) -> resume"; exit 0; fi
+   fi
    for f in labels-r1.jsonl labels-r2-pebble.jsonl; do [[ -s $R/$f ]] || { echo "REFUSE: $R/$f missing"; exit 1; }; chmod 0444 "$R/$f"; sha256sum "$R/$f"; done
    for f in labels-r1.jsonl labels-r2-pebble.jsonl; do
      echo "== $f"; set +e; python3 -I "$OPS/score.py" "$R/key.json" "$R/$f"; r=$?; set -e
@@ -216,6 +250,15 @@ resume) step "acceptance PASSED: close the attempt, disable extraction for the U
    A=$(attempt); bindings "$A"; [[ -e "$A/after.json" ]] || { echo "REFUSE: H has not captured AFTER"; exit 1; }
    [[ -s "$A/rating/PASS" ]] || { echo "REFUSE: no rating PASS from S (a FAIL goes to rollback)"; exit 1; }
    admission_is_closed || { echo "REFUSE: admission not closed"; exit 1; }
+   if S2; then gates_ok "$A"; install -d -m 0700 "$D/stage2-kept"
+     python3 -I - "$A" "$D/stage2-kept/$(basename "$A").json" <<'PY'
+import json, sys
+a, out = sys.argv[1], sys.argv[2]; ids = set(json.load(open(f'{a}/plan.json'))['new_atom_ids'])
+kept = sorted(({'id': x['id'], 'content_hash': x['content_hash']} for x in json.load(open(f'{a}/after.json'))['atoms'] if x['id'] in ids), key=lambda r: r['id'])
+assert len(kept) == len(ids), 'plan ids missing from after.json'
+json.dump(kept, open(out, 'x')); print('kept record', out, len(kept), 'atoms')
+PY
+   fi
    disable_extraction
    (set -o noclobber; echo "accepted $(date -u +%FT%TZ)" > "$A/closed")
    svc start gbrain-autopilot.service; svc is-active gbrain-autopilot.service ;;

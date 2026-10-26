@@ -46,4 +46,20 @@ with tempfile.TemporaryDirectory() as d:
     assert r.returncode == 2 and "no freeze baseline" in r.stdout, r
     open(base, "w").write(f"{sid}\t1\t1\n"); os.remove(j); r = chk()
     assert r.returncode == 2 and "unreadable" in r.stdout, r
-print("date_parts rename + sessions-check self-test: 11 checks passed")
+    # bytes-check (source stability at OPEN, Pebble 19:10Z #1) and eligible-check (both aliases, #2)
+    run2 = lambda *a: subprocess.run([sys.executable, "-I", TOOL, *a], capture_output=True, text=True)
+    pre_sha = hashlib.sha256(open(pre, "rb").read()).hexdigest()   # pre was changed above; freeze its CURRENT bytes
+    open(mem, "w").write(f"h3\t{pre_sha}\t{pre}\t{pre}\t2026-10-20\n")
+    r = run2("bytes-check", mem); assert r.returncode == 0 and "0 member(s)" in r.stdout, r
+    open(pre, "a").write("rewritten\n"); r = run2("bytes-check", mem)   # a zero-yield source rewritten after the freeze
+    assert r.returncode == 1 and f"bytes-changed\th3\t{pre}" in r.stdout, r
+    os.remove(pre); r = run2("bytes-check", mem); assert r.returncode == 2 and "member file missing" in r.stdout, r
+    inv = os.path.join(d, "inventory.json")
+    json_rows = lambda cls: '{"rows":[{"hash16":"h0","path":"%s","class":"%s"}]}' % (dated[0], cls)
+    open(mem, "w").write(f"h0\t{sha[0]}\t{legacy[0]}\t{dated[0]}\t2026-10-13\n")   # row 1 was renamed: current name = dated
+    open(inv, "w").write(json_rows("missing")); r = run2("eligible-check", mem, inv); assert r.returncode == 0, r
+    open(inv, "w").write(json_rows("extracted")); r = run2("eligible-check", mem, inv)   # an alias atom made it extracted
+    assert r.returncode == 1 and "not-eligible\th0" in r.stdout and "extracted" in r.stdout, r
+    open(inv, "w").write('{"rows":[]}'); r = run2("eligible-check", mem, inv)
+    assert r.returncode == 1 and "not-discovered" in r.stdout, r
+print("date_parts rename + sessions/bytes/eligible checks self-test: 17 checks passed")

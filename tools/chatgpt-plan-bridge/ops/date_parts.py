@@ -145,9 +145,39 @@ def sessions_check(members, baseline):
     print(f"sessions-check: {len(grew)} member(s) of a session that grew since the freeze")
     sys.exit(1 if grew else 0)
 
+def member_path(legacy, dated):
+    return dated if os.path.exists(dated) else legacy
+
+def bytes_check(members):
+    """§3a source stability: every member's file (dated name if renamed, else legacy) still has the frozen sha256.
+    Exit 0 all equal; 1 lists changed members; 2 a member file is missing."""
+    bad = []
+    for l in open(members):
+        h, sha, legacy, dated, day = l.rstrip("\n").split("\t")
+        p = member_path(legacy, dated)
+        if not os.path.exists(p): print(f"STOP: member file missing (neither name): {legacy}"); sys.exit(2)
+        if sha256(p) != sha: bad.append((h, p))
+    for h, p in bad: print(f"bytes-changed\t{h}\t{p}")
+    print(f"bytes-check: {len(bad)} member(s) changed since the freeze"); sys.exit(1 if bad else 0)
+
+def eligible_check(members, inventory_json):
+    """§2 eligibility re-checked before rename/admission from a fresh inventory run WITH renames.tsv (both aliases):
+    each member must be class 'missing' at its current name. Exit 0 all; 1 lists the others with their class."""
+    import json
+    rows = {(r["hash16"], r["path"]): r["class"] for r in json.load(open(inventory_json))["rows"]}
+    bad = []
+    for l in open(members):
+        h, sha, legacy, dated, day = l.rstrip("\n").split("\t")
+        cls = rows.get((h, member_path(legacy, dated)), "not-discovered")
+        if cls != "missing": bad.append((h, legacy, cls))
+    for h, legacy, cls in bad: print(f"not-eligible\t{h}\t{legacy}\t{cls}")
+    print(f"eligible-check: {len(bad)} member(s) no longer eligible"); sys.exit(1 if bad else 0)
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["plan"] and len(a) == 4: plan(*a[1:])
     elif a[:1] == ["rename"] and len(a) in (5, 6): rename(a[1], int(a[2]), int(a[3]), a[4], a[5:] == ["--apply"])
     elif a[:1] == ["sessions-check"] and len(a) == 3: sessions_check(a[1], a[2])
+    elif a[:1] == ["bytes-check"] and len(a) == 2: bytes_check(a[1])
+    elif a[:1] == ["eligible-check"] and len(a) == 3: eligible_check(a[1], a[2])
     else: sys.exit(__doc__)
