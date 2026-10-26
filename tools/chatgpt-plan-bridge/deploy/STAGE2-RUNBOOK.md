@@ -93,6 +93,18 @@ With `CANARY_STAGE2=1`, `canary.sh` itself enforces:
     - served `gpt-6-luna`.
 11. **`python3 -I $O/date_gates.py <attempt> $RUN/batch-NN.members /root/work/dream-s552-luna/canary/stage2-kept`** must print `GATES: PASS` (exit 0). It writes `gates.ok`.
     - Exit 10 (a gate failed on complete evidence) is a STOP. Report and decide; rollback is the expected decision.
+      - **Exception, the bounded retry (once per attempt, Pebble consult 2026-10-26 21:32Z):** when every fail names a failed-state pair from a `malformed model output`, the decision may instead be R:
+        1. `bash $C/state_check.sh pre-open` must print `STATE pre-open: OK`.
+        2. `CANARY_MEMBERS=$RUN/batch-NN.members bash $C/canary.sh R $HEAD`.
+           - It refuses with nothing opened unless the failures qualify; `date_gates` is its oracle.
+           - It creates `retry.manifest` exclusively before OPEN, so the allowance is used even if R is interrupted.
+           - It keeps the G-pass `after.g1.json` and `plan.g1.json` read-only, and runs one dream under G's trap.
+           - Any nonzero exit is a STOP with an unknown outcome. Never run a second retry.
+        3. `bash $C/state_check.sh post-run`, then `bash $C/canary.sh H $HEAD`, which re-captures the whole attempt.
+        4. Run the date_gates command above again:
+           - exit 0 → continue at step 12;
+           - exit 10 → STOP (rollback is the expected decision; R refuses a second time);
+           - exit 2 → STOP.
     - Exit 2 (evidence missing or unreadable) is a STOP and never a rollback by itself.
 12. `bash $C/canary.sh I $HEAD`, then `bash $C/canary.sh K $HEAD`: the kit covers every atom.
 13. **Blind rating** (the stage-1 procedure, unchanged): R1, an isolated Opus rater, and R2, Pebble, label the kit. Neither sees the other's file.
