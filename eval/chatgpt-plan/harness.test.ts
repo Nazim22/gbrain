@@ -18,7 +18,7 @@ test('corpus pins twenty unique files, exact hashes, scans and frozen protocol',
 test('paired run uses same prompt bytes, 20 Gemma plus 22 Luna and isolated evidence',async()=>{
  const root=await fixture();try{
  const corpus=await loadCorpus(root),out=new Evidence(join(root,'out'));await out.prepare();const budget=new Budget();const requests:any[]=[];
- const sender=async(url:string,body:unknown)=>{requests.push({url,body});if(url.endsWith('/models'))return {status:200,raw:Buffer.from(JSON.stringify({models:[{slug:'gpt-6-luna'}]}))};
+ const sender=async(url:string,body:unknown)=>{requests.push({url,body});if(url.endsWith('/models'))return {status:200,raw:Buffer.from(JSON.stringify({models:[{slug:'gpt-6-luna',supported_reasoning_levels:[{effort:'medium'}]}]}))};
  if(url.endsWith('/responses'))return {status:200,raw:Buffer.from('data: '+JSON.stringify({type:'response.completed',response:{status:'completed',output:[{type:'message',content:[{type:'output_text',text:'[]'}]}]}})+'\n\n')};
  return {status:200,raw:Buffer.from(JSON.stringify({choices:[{message:{content:'[]'},finish_reason:'stop'}]}))};};
  await runPaired(corpus,out,async()=>'',sender,budget);
@@ -40,7 +40,8 @@ test('a quota stop ends the whole run with no retry or fallback',async()=>{
 test('Luna then Sol: one model check, smoke + 20 per arm, same prompt bytes, frozen per-model effort',async()=>{
  const root=await fixture();try{
  const corpus=await loadCorpus(root),out=new Evidence(join(root,'out'));await out.prepare();const budget=new Budget();const requests:any[]=[];
- const sender=async(url:string,body:unknown)=>{requests.push({url,body});if(url.endsWith('/models'))return {status:200,raw:Buffer.from(JSON.stringify({models:[{slug:'gpt-6-luna'},{slug:'gpt-6.1-sol'}]}))};
+ const levels=['low','medium','high'].map(effort=>({effort}));
+ const sender=async(url:string,body:unknown)=>{requests.push({url,body});if(url.endsWith('/models'))return {status:200,raw:Buffer.from(JSON.stringify({models:[{slug:'gpt-6-luna',supported_reasoning_levels:levels},{slug:'gpt-6.1-sol',supported_reasoning_levels:levels}]}))};
  if(url.endsWith('/responses'))return {status:200,raw:Buffer.from('data: '+JSON.stringify({type:'response.completed',response:{status:'completed',output:[{type:'message',content:[{type:'output_text',text:'[]'}]}]}})+'\n\n')};
  return {status:200,raw:Buffer.from(JSON.stringify({choices:[{message:{content:'[]'},finish_reason:'stop'}]}))};};
  await runPaired(corpus,out,async()=>'',sender,budget,['luna','sol']);
@@ -49,17 +50,27 @@ test('Luna then Sol: one model check, smoke + 20 per arm, same prompt bytes, fro
  const gemma=requests.filter(x=>x.url.endsWith('/completions')),cloud=requests.filter(x=>x.url.endsWith('/responses'));
  const luna=cloud.filter(x=>x.body.model==='gpt-6-luna'),sol=cloud.filter(x=>x.body.model==='gpt-6.1-sol');
  expect(luna.length).toBe(21);expect(sol.length).toBe(21);
- expect(luna.every(x=>x.body.reasoning.effort==='minimal')).toBe(true);expect(sol.every(x=>x.body.reasoning.effort==='medium')).toBe(true);
+ expect(luna.every(x=>x.body.reasoning.effort==='medium')).toBe(true);expect(sol.every(x=>x.body.reasoning.effort==='medium')).toBe(true);
  for(let i=0;i<20;i++){for(const arm of [luna,sol]){expect(arm[i+1].body.instructions).toBe(gemma[i].body.messages[0].content);expect(arm[i+1].body.input[0].content).toBe(gemma[i].body.messages[1].content);}}
  }finally{await rm(root,{recursive:true,force:true});}
 });
 test('a requested model missing from the catalog stops before any cloud generation',async()=>{
  const root=await fixture();try{
  const corpus=await loadCorpus(root),out=new Evidence(join(root,'out'));await out.prepare();let generations=0;
- const sender=async(url:string)=>{if(url.endsWith('/models'))return {status:200,raw:Buffer.from(JSON.stringify({models:[{slug:'gpt-6-luna'}]}))};
+ const sender=async(url:string)=>{if(url.endsWith('/models'))return {status:200,raw:Buffer.from(JSON.stringify({models:[{slug:'gpt-6-luna',supported_reasoning_levels:[{effort:'medium'}]}]}))};
  if(url.endsWith('/responses')){generations++;return {status:200,raw:Buffer.from('')};}
  return {status:200,raw:Buffer.from(JSON.stringify({choices:[{message:{content:'[]'},finish_reason:'stop'}]}))};};
  await expect(runPaired(corpus,out,async()=>'',sender,new Budget(),['luna','sol'])).rejects.toThrow('MODEL-UNAVAILABLE');expect(generations).toBe(0);
  await expect(runPaired(corpus,new Evidence(join(root,'out2')),async()=>'',sender,new Budget(),['luna','luna'])).rejects.toThrow('CLOUD-MODELS');
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+test('a pinned effort the catalog does not list stops at the model check, before any cloud generation (P6 replay)',async()=>{
+ const root=await fixture();try{
+ const corpus=await loadCorpus(root),out=new Evidence(join(root,'out'));await out.prepare();let generations=0;
+ // P6: the pinned effort was absent from Luna's levels; the old check passed and the smoke call got a 400.
+ const sender=async(url:string)=>{if(url.endsWith('/models'))return {status:200,raw:Buffer.from(JSON.stringify({models:[{slug:'gpt-6-luna',supported_reasoning_levels:[{effort:'low'}]},{slug:'gpt-6.1-sol',supported_reasoning_levels:[{effort:'medium'}]}]}))};
+ if(url.endsWith('/responses')){generations++;return {status:400,raw:Buffer.from('')};}
+ return {status:200,raw:Buffer.from(JSON.stringify({choices:[{message:{content:'[]'},finish_reason:'stop'}]}))};};
+ await expect(runPaired(corpus,out,async()=>'',sender,new Budget(),['luna','sol'])).rejects.toThrow('EFFORT-UNSUPPORTED');expect(generations).toBe(0);
  }finally{await rm(root,{recursive:true,force:true});}
 });

@@ -6,15 +6,16 @@ import { parseAtomsOutcome, type AtomsParseOutcome } from '../../src/core/cycle/
 export const LUNA = 'gpt-6-luna';
 export const SOL = 'gpt-6.1-sol';
 /** Frozen per-model reasoning effort; no other model is ever sent. */
-export const CLOUD_MODELS = {luna:{model:LUNA,effort:'minimal'},sol:{model:SOL,effort:'medium'}} as const;
+// Luna 'minimal' was rejected (400) at P6 smoke: Luna lists low..max. Nazz 2026-10-26: medium, same as Sol.
+export const CLOUD_MODELS = {luna:{model:LUNA,effort:'medium'},sol:{model:SOL,effort:'medium'}} as const;
 export type CloudArm = keyof typeof CLOUD_MODELS;
 export const API = 'https://api.openai.com/v1';
 export const TOKEN = 'https://auth.openai.com/api/accounts/oauth/token';
 export const DISCOVERY = 'https://auth.openai.com/.well-known/openid-configuration';
 export const GEMMA = 'http://127.0.0.1:8084/v1/chat/completions';
 export const LIMITS = {
-  luna: { requests:22, connect:10_000, request:120_000, wall:2_700_000 },
-  // Sol reasons at medium effort, so per-request and wall bounds are longer; same 22-request ceiling.
+  // Both cloud arms reason at medium effort, so they share the longer per-request and wall bounds.
+  luna: { requests:22, connect:10_000, request:300_000, wall:7_200_000 },
   sol: { requests:22, connect:10_000, request:300_000, wall:7_200_000 },
   gemma: { requests:20, connect:5_000, request:300_000, wall:3_600_000 },
   // Auth traffic is separate: discovery/JWKS/code exchange, refresh and revoke checks.
@@ -25,6 +26,12 @@ export const MAX_BYTES = 256 * 1024;
 // cut it before gpt-6-luna. It gets its own, still hard, bound; model answers keep MAX_BYTES.
 export const MODELS_MAX_BYTES = 8 * 1024 * 1024;
 export function capFor(url:string) { return url===`${API}/models`?MODELS_MAX_BYTES:MAX_BYTES; }
+/** The catalog is the authority for what each model accepts; a pinned slug or effort it doesn't list stops the run before any generation. */
+export function catalogProblem(catalog:any, arm:CloudArm):'MODEL-UNAVAILABLE'|'EFFORT-UNSUPPORTED'|undefined {
+  const entry=catalog?.models?.find((m:any)=>m.slug===CLOUD_MODELS[arm].model);
+  if(!entry)return 'MODEL-UNAVAILABLE';
+  if(!entry.supported_reasoning_levels?.some((l:any)=>l.effort===CLOUD_MODELS[arm].effort))return 'EFFORT-UNSUPPORTED';
+}
 export type Arm = keyof typeof LIMITS;
 export type Prompt = {system:string; messages:Array<{role:'user';content:string}>};
 export type Wire = {status:number; raw:Buffer};

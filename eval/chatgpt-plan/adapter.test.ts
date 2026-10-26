@@ -16,7 +16,7 @@ test('request bodies pin settings and share exact prompt bytes', () => {
   const luna = lunaBody(prompt), gemma = gemmaBody(prompt);
   expect(luna.instructions).toBe(gemma.messages[0].content);
   expect(luna.input[0].content).toBe(gemma.messages[1].content);
-  expect(luna.model).toBe('gpt-6-luna'); expect(luna.reasoning.effort).toBe('minimal');
+  expect(luna.model).toBe('gpt-6-luna'); expect(luna.reasoning.effort).toBe('medium');
   expect(gemma.max_tokens).toBe(8192); expect(gemma.chat_template_kwargs.enable_thinking).toBe(false);
 });
 test('guard rejects disallowed parameters before network', async () => {
@@ -50,7 +50,7 @@ test('arm and auth counters are separate, wall bounds fail closed', () => {
   budget.take('auth'); expect(budget.counts).toEqual({luna:22,sol:0,gemma:20,auth:1});
   for(let i=1;i<12;i++)budget.take('auth');
   expect(()=>budget.take('auth')).toThrow('REQUEST-BOUND');
-  const cloudExpired = new Budget(() => now); cloudExpired.take('luna'); now=2_700_001;
+  const cloudExpired = new Budget(() => now); cloudExpired.take('luna'); now=7_200_001;
   expect(()=>cloudExpired.take('luna')).toThrow('WALL-BOUND');
   const expired = new Budget(() => now); expired.take('gemma'); now+=3_600_001;
   expect(() => expired.take('gemma')).toThrow('WALL-BOUND');
@@ -70,7 +70,7 @@ test('per-model effort is frozen: swapped or unknown models are refused before s
  const p={system:'s',messages:[{role:'user' as const,content:'u'}]};
  expect(cloudBody('sol',p)).toEqual({model:'gpt-6.1-sol',instructions:'s',input:p.messages,stream:true,store:false,reasoning:{effort:'medium'}});
  await expect(guardedRequest(`${API}/responses`,{...cloudBody('sol',p),reasoning:{effort:'minimal'}},sender)).rejects.toThrow('REQUEST-SHAPE');
- await expect(guardedRequest(`${API}/responses`,{...cloudBody('luna',p),reasoning:{effort:'medium'}},sender)).rejects.toThrow('REQUEST-SHAPE');
+ await expect(guardedRequest(`${API}/responses`,{...cloudBody('luna',p),reasoning:{effort:'low'}},sender)).rejects.toThrow('REQUEST-SHAPE');
  await expect(guardedRequest(`${API}/responses`,{...cloudBody('luna',p),model:'gpt-6-sol'},sender)).rejects.toThrow('REQUEST-SHAPE');
  expect(sent).toBe(0);
  expect(JSON.parse(encodeLog({arm:'sol',model:'gpt-6.1-sol',part_id:'p01'}))).toMatchObject({arm:'sol',model:'gpt-6.1-sol',part_id:'p01'});

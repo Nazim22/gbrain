@@ -2,7 +2,7 @@ import { mkdir,open,readFile,lstat,realpath,appendFile } from 'node:fs/promises'
 import { resolve,join,dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { atomsPrompt } from '../../src/core/cycle/extract-atoms.ts';
-import { API,GEMMA,CLOUD_MODELS,Budget,LIMITS,send,guardedRequest,cloudBody,gemmaBody,parseLuna,parseGemma,encodeLog,type Sender,type Prompt,type Arm,type CloudArm,type Outcome } from './adapter.ts';
+import { API,GEMMA,CLOUD_MODELS,catalogProblem,Budget,LIMITS,send,guardedRequest,cloudBody,gemmaBody,parseLuna,parseGemma,encodeLog,type Sender,type Prompt,type Arm,type CloudArm,type Outcome } from './adapter.ts';
 export const sha=(data:Uint8Array|string)=>createHash('sha256').update(data).digest('hex');
 export type Part={id:string;prompt:Prompt};
 export async function loadCorpus(dir:string):Promise<Part[]> {
@@ -55,7 +55,8 @@ export async function runPaired(parts:Part[],out:Evidence,access:()=>Promise<str
       await out.put(`${arm}-${id}.raw`,wire.raw);
       if(id==='models') {
         const catalog=JSON.parse(wire.raw.toString());
-        if(cloud.some(a=>!catalog.models?.some((m:any)=>m.slug===CLOUD_MODELS[a].model)))throw Error('MODEL-UNAVAILABLE');
+        const problem=cloud.map(a=>catalogProblem(catalog,a)).find(Boolean);
+        if(problem)throw Error(problem);
         await out.log({arm,part_id:id,model,terminal_status:'SUCCESS',latency_ms:Date.now()-started,bytes:wire.raw.length});return;
       }
       const outcome=arm!=='gemma'?parseLuna(wire.raw.toString()):parseGemma(wire.raw.toString());
@@ -69,7 +70,7 @@ export async function runPaired(parts:Part[],out:Evidence,access:()=>Promise<str
       else if(e.raw instanceof Buffer)await out.put(`${arm}-${id}.raw`,e.raw);
       await out.log({arm,part_id:id,model,terminal_status:'STOPPED',latency_ms:Date.now()-started});
       // Only allowlisted local failures leave this boundary; raw provider errors remain protected.
-      const code=typeof e.message==='string'&&/^(HTTP-(401|403|429|503|FAILED)|MODEL-UNAVAILABLE|PROVIDER-STOP|ARM-STOP|REQUEST-BOUND|WALL-BOUND|OUTPUT-BOUND|CONNECT-TIMEOUT|REQUEST-TIMEOUT|DISCONNECTED|TRANSPORT-UNKNOWN|REDIRECT|REFRESH-PENDING|REFRESH-UNKNOWN|INVALID-GRANT)$/.test(e.message)?e.message:'RUN-STOPPED';
+      const code=typeof e.message==='string'&&/^(HTTP-(401|403|429|503|FAILED)|MODEL-UNAVAILABLE|EFFORT-UNSUPPORTED|PROVIDER-STOP|ARM-STOP|REQUEST-BOUND|WALL-BOUND|OUTPUT-BOUND|CONNECT-TIMEOUT|REQUEST-TIMEOUT|DISCONNECTED|TRANSPORT-UNKNOWN|REDIRECT|REFRESH-PENDING|REFRESH-UNKNOWN|INVALID-GRANT)$/.test(e.message)?e.message:'RUN-STOPPED';
       throw Error(code);
     }
   }
