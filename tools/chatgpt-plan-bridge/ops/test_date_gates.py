@@ -45,6 +45,16 @@ with tempfile.TemporaryDirectory() as t:
     assert open(f'{a}/gates.ok').read() == want_ok
     print(f"2. dated: exit 0, outcomes {out['outcomes']}, earlier kept batch verified in the DB, gates.ok bound")
 
+    # Stale success (Pebble 19:30Z #1): after a PASS, a failing or unknown rerun must remove gates.ok. The marker is
+    # NOT deleted by the harness here; date_gates itself must invalidate it.
+    assert os.path.exists(f'{a}/gates.ok')
+    json.dump([{'id': json.load(open(k1))[0]['id'], 'content_hash': '0' * 64}], open(f'{kept}/attempt-z.json', 'w'))
+    r = run(k=kept); assert r.returncode == 10 and not os.path.exists(f'{a}/gates.ok'), ('PASS->FAIL left gates.ok', r)
+    os.remove(f'{kept}/attempt-z.json'); r = run(k=kept); assert r.returncode == 0 and os.path.exists(f'{a}/gates.ok'), r
+    os.rename(f'{a}/plan.json', f'{a}/plan.json.away'); r = run(k=kept)
+    assert r.returncode == 2 and not os.path.exists(f'{a}/gates.ok'), ('PASS->unknown left gates.ok', r)
+    os.rename(f'{a}/plan.json.away', f'{a}/plan.json')
+    print('2b. stale success: PASS -> FAIL and PASS -> unknown both remove gates.ok (marker not touched by the harness)')
     m2 = f'{t}/members-changed.tsv'; open(m2, 'w').write(open(mem).read().replace(sha(pairs[0][1]), '0' * 64, 1))
     r = run(m=m2); assert r.returncode == 10 and 'bytes changed since the freeze' in r.stdout, r
     bad = copy.deepcopy(good); tp = next(p for p in bad['pairs'] if any(s['file_path'] == p['path'] and s['tombstoned'] for s in bad['state_rows']))

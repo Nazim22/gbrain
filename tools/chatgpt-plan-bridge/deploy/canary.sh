@@ -48,6 +48,16 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 step() { echo "=== $(date -u +%FT%TZ) $STEP: $*"; }
 luna_env() { export LITELLM_BASE_URL="http://127.0.0.1:$PORT/v1"; export LITELLM_API_KEY="$(< "$SECRET")"; }
 bridge_status() { printf 'header = "Authorization: Bearer %s"\n' "$(< "$SECRET")" | curl -sS -f -K - "http://127.0.0.1:$PORT/v1/bridge/status"; }
+g_cleanup() {   # stage-2 G EXIT trap (Pebble 19:30Z #2): attempt BOTH closures independently, verify each, keep the failure status
+  local rc=$? adm=UNKNOWN corp=UNKNOWN; set +e
+  if [[ ${CANARY_DRYRUN:-} == 1 && ${CANARY_DRYRUN_FAULT:-} == after-open-noadmclose ]]; then echo "[dry-run] admission close skipped (simulated failure)"
+  else gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest" >/dev/null 2>&1; fi
+  gb config unset dream.synthesize.session_corpus_dir >/dev/null 2>&1
+  [[ $(db_value cycle.extract_atoms.admit_hashes_file 2>/dev/null) == "$D/closed.manifest" ]] && adm=verified
+  [[ $(db_count dream.synthesize.session_corpus_dir 2>/dev/null) == 0 && $(file_has_corpus 2>/dev/null) == 0 ]] && corp=verified
+  echo "STOP: G failed after OPEN (exit $rc). admission closed: $adm; corpus key absent (db+file): $corp. Run state_check.sh post-run; any UNKNOWN -> close by hand."
+  [[ $rc != 0 ]] || rc=1; exit "$rc"
+}
 gates_ok() {   # stage 2: date_gates.py PASS receipt bound to the CURRENT plan.json, after.json and members
   local A=$1; [[ -n ${CANARY_MEMBERS:-} && -s $CANARY_MEMBERS && -s $A/gates.ok ]] || { echo "REFUSE: no gates.ok (run date_gates.py) or CANARY_MEMBERS unset"; exit 1; }
   [[ $(< "$A/gates.ok") == "$(sha "$A/plan.json") $(sha "$A/after.json") $(sha "$CANARY_MEMBERS")" ]] || { echo "REFUSE: gates.ok does not bind this plan/after/members"; exit 1; }
@@ -188,10 +198,11 @@ G) step "run: verify bindings, open admission to THIS manifest, extract (one for
      python3 -I "$OPS/date_parts.py" sessions-check "$CANARY_MEMBERS" "$CANARY_SESSIONS" || { echo "REFUSE (no OPEN): a member's session grew since the freeze"; exit 1; }
    fi
    install -d -m 0700 "$A/checkout"; (set -o noclobber; date -u +%FT%TZ > "$A/T_start")
-   if S2; then trap 'gb config set cycle.extract_atoms.admit_hashes_file "$D/closed.manifest" >/dev/null 2>&1; gb config unset dream.synthesize.session_corpus_dir >/dev/null 2>&1; echo "STOP: G failed after OPEN; admission closed + corpus key removed (verify with state_check.sh post-run)"' EXIT; fi
+   if S2; then trap g_cleanup EXIT; fi
    gb config set cycle.extract_atoms.admit_hashes_file "$A/canary.manifest"
    [[ $(db_value cycle.extract_atoms.admit_hashes_file) == "$A/canary.manifest" ]] || { echo "REFUSE: admission readback mismatch"; exit 1; }
    if S2; then gb config set dream.synthesize.session_corpus_dir "$CORPUS"; fi   # the corpus key exists only from OPEN to CLOSED
+   if [[ ${CANARY_DRYRUN:-} == 1 && ${CANARY_DRYRUN_FAULT:-} == after-open* ]]; then echo "[dry-run] injected failure after OPEN"; false; fi
    luna_env; export GBRAIN_EXTRACT_PHASE_BUDGET_MS=3600000
    dream=(bun src/cli.ts dream --source default --dir "$A/checkout" --phase extract_atoms --json)
    if [[ ${CANARY_DRYRUN:-} == 1 && ${CANARY_DRYRUN_FAULT:-} == dream-exit ]]; then dream=(false); fi   # rehearsal fault injection only

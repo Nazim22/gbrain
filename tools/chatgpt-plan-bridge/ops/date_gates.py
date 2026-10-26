@@ -113,13 +113,15 @@ def main(a, members_tsv, kept_dir=None):
                       'fail_count': len(fails), 'fails': fails[:20]}, indent=1))
     if fails: return 10
     # PASS receipt bound to the exact evidence; canary.sh (stage 2) S and resume require it to match.
-    ok = f"{sha(f'{a}/plan.json')} {sha(f'{a}/after.json')} {sha(members_tsv)}\n"
-    if os.path.exists(f'{a}/gates.ok') and open(f'{a}/gates.ok').read() != ok: raise ValueError('gates.ok exists for different evidence')
-    open(f'{a}/gates.ok', 'w').write(ok)
+    open(f'{a}/gates.ok', 'x').write(f"{sha(f'{a}/plan.json')} {sha(f'{a}/after.json')} {sha(members_tsv)}\n")   # invalidated at start
     return 0
 
 if __name__ == '__main__':
     if len(sys.argv) not in (3, 4): print(__doc__); sys.exit(2)
+    # Invalidate any earlier success FIRST: only a run that passes now may leave gates.ok behind (Pebble 19:30Z #1).
+    try:
+        if os.path.exists(os.path.join(sys.argv[1], 'gates.ok')): os.remove(os.path.join(sys.argv[1], 'gates.ok'))
+    except OSError as e: print(f'STOP: cannot invalidate the previous gates.ok: {e}'); sys.exit(2)
     try: rc = main(*sys.argv[1:])
     except Exception as e: print(f'STOP: gate evidence missing or unreadable: {type(e).__name__}: {e}'); sys.exit(2)
     print('GATES: PASS' if rc == 0 else 'GATES: FAIL (complete evidence) -> STOP; rollback only on a decision'); sys.exit(rc)

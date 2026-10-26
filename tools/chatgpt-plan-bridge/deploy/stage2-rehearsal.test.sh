@@ -5,8 +5,13 @@
 #  batch 1  normal: slice -> sessions/eligible checks -> rename -> E V B C D F pre-open G post-run H date_gates I K S
 #           resume post-resume (plus refusals: G without members, members not bound, bytes changed, session grew)
 #  batch 2  zero-atom: stub returns no atoms -> native tombstones -> date_gates PASS -> S completes on gates only
-#  batch 3  STOP cleanup: G fault after OPEN -> admission closed + corpus key absent (post-run OK) -> rollback on decision
-#  batch 4  earlier KEPT batch tampered in the scratch DB -> date_gates FAIL (10) -> S refuses -> rollback on decision
+#           plus stale success: after a PASS, a post-OPEN source rewrite -> date_gates 10 removes gates.ok -> S refuses;
+#           PASS -> unreadable evidence -> 2 removes gates.ok
+#  batch 3  dream fails (rc 1) -> normal closure path -> post-run OK -> rollback on decision
+#  batch 4  failure AFTER OPEN through G's EXIT trap -> both closures verified -> post-run OK -> rollback on decision
+#  batch 5  same, with the admission close failing -> trap reports admission UNKNOWN, corpus key verified -> post-run
+#           FAIL -> close by hand -> post-run OK -> rollback on decision
+#  batch 6  earlier KEPT batch tampered in the scratch DB -> date_gates FAIL (10) -> S refuses -> rollback on decision
 # Usage: stage2-rehearsal.test.sh <scratch-db gbrain_s552_*> <source scratch gbrain home> <out dir> <plan run.manifest>
 set -u
 DB=$1 SRCHOME=$2 OUT=$3 PLAN=$4
@@ -16,7 +21,7 @@ mkdir -p "$OUT"; [[ -z $(ls -A "$OUT") ]] || { echo "REFUSE: $OUT must be empty"
 RUN=$OUT/run CAN=$OUT/canary; mkdir -p "$OUT/corpus" "$OUT/ctl" "$RUN" "$CAN"
 cp -a "$SRCHOME" "$OUT/home"
 head -c 24 /dev/urandom | base64 > "$OUT/secret"; chmod 600 "$OUT/secret"; : > "$OUT/ledger.jsonl"; echo ok > "$OUT/ctl/mode"
-sed -n '40,51p' "$PLAN" | cut -f3 | while read -r p; do cp -p "$p" "$OUT/corpus/"; done
+sed -n '40,57p' "$PLAN" | cut -f3 | while read -r p; do cp -p "$p" "$OUT/corpus/"; done
 PORT=$((20000 + RANDOM % 20000))
 python3 -I "$C/stub_bridge.py" "$PORT" "$OUT/secret" "$OUT/ledger.jsonl" "$OUT/ctl" & STUB=$!
 trap 'kill $STUB 2>/dev/null' EXIT; sleep 1
@@ -41,7 +46,7 @@ PY
 # Step 0 (read-only freeze over the scratch corpus)
 (cd "$O" && bun inventory.ts "$OUT/corpus" "$RUN/freeze-inventory" "$RUN/renames.tsv" > "$RUN/freeze-inventory.out")
 python3 -I -c "import json,sys;d=json.load(open(sys.argv[1]));[print(r['hash16']+'\t'+r['path']) for r in d['rows'] if r['class']=='missing']" "$RUN/freeze-inventory/inventory.json" > "$RUN/eligible.manifest"
-out=$(python3 -I "$O/date_parts.py" plan "$RUN/eligible.manifest" "$RUN/run.manifest" "$RUN/refused.tsv" 2>&1); expect "step 0 freeze plans the scratch parts" "$out" "plan: 12 dated"
+out=$(python3 -I "$O/date_parts.py" plan "$RUN/eligible.manifest" "$RUN/run.manifest" "$RUN/refused.tsv" 2>&1); expect "step 0 freeze plans the scratch parts" "$out" "plan: 18 dated"
 slice() {   # runbook 2.1-2.3 for rows a..b: slice, session growth, eligibility with both aliases, rename, batch manifest
   local n=$1 a=$2 b=$3 M=$RUN/batch-$1.members
   sed -n "${a},${b}p" "$RUN/run.manifest" > "$M"
@@ -76,7 +81,17 @@ out=$(CANARY_MEMBERS=$RUN/batch-1.members cs G); expect "G runs (corpus key only
 out=$(st post-run);                       expect "post-run: admission closed and corpus key absent (db+file)" "$out" "STATE post-run: OK"
 cs H >/dev/null
 out=$(python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" 2>&1); expect "date_gates PASS (3 dated atoms, outcomes consistent)" "$out" "GATES: PASS"
+f1=$(head -1 "$RUN/batch-1.members" | cut -f4); cp -p "$f1" "$RUN/f1b.bak"; echo "rewritten after OPEN" >> "$f1"
+out=$(python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" 2>&1); rc=$?
+expect "a post-OPEN source rewrite fails the gates (10)" "$rc:$out" "10:"; expect "...naming the rewritten member" "$out" "bytes changed since the freeze"
+expect "the earlier PASS marker is gone" "$(ls "$A1/gates.ok" 2>&1)" "No such file"
 cs I >/dev/null; out=$(cs K); expect "K builds the kit" "$out" "kit/"; labels "$A1/rating"
+out=$(CANARY_MEMBERS=$RUN/batch-1.members cs S); expect "S refuses on the stale (removed) marker" "$out" "no gates.ok"
+cp -p "$RUN/f1b.bak" "$f1"
+out=$(python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" 2>&1); expect "restored bytes: date_gates PASS again" "$out" "GATES: PASS"
+mv "$A1/plan.json" "$A1/plan.json.away"; out=$(python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" 2>&1); rc=$?
+expect "PASS -> unreadable evidence is exit 2" "$rc" "2"; expect "...and removes the marker" "$(ls "$A1/gates.ok" 2>&1)" "No such file"
+mv "$A1/plan.json.away" "$A1/plan.json"; python3 -I "$O/date_gates.py" "$A1" "$RUN/batch-1.members" "$CAN/stage2-kept" >/dev/null
 out=$(CANARY_MEMBERS=$RUN/batch-1.members cs S); expect "S PASS (both raters, gates.ok bound)" "$out" "ACCEPTANCE (rating): PASS"
 out=$(CANARY_MEMBERS=$RUN/batch-1.members cs resume); expect "resume records the kept batch" "$out" "kept record"
 out=$(st post-resume);                    expect "post-resume: closed, corpus key absent" "$out" "STATE post-resume: OK"
@@ -92,7 +107,7 @@ cs I >/dev/null; cs K >/dev/null
 out=$(CANARY_MEMBERS=$RUN/batch-2.members cs S); expect "S completes a zero-atom batch on the gates alone" "$out" "zero-atom batch, gates PASS"
 out=$(CANARY_MEMBERS=$RUN/batch-2.members cs resume); expect "resume after a zero-atom batch" "$out" "kept record"
 
-echo "##### batch 3: STOP cleanup after OPEN"
+echo "##### batch 3: dream fails (normal closure path)"
 out=$(slice 3 7 9); expect "slice 3" "$out" "slice 3 ok"
 out=$(prepare 3); expect "E batch 3" "$out" "attempt: $CAN/attempt-"
 out=$(CANARY_DRYRUN_FAULT=dream-exit CANARY_MEMBERS=$RUN/batch-3.members cs G); expect "G with a failure after OPEN stops" "$out" "STOP: dream exited 1"
@@ -100,16 +115,35 @@ out=$(st post-run);                       expect "STOP cleanup: admission closed
 out=$(cs rollback);                       expect "rollback on decision verifies DONE" "$out" '"verdict":"DONE"'
 out=$(st post-rollback);                  expect "post-rollback: closed, corpus absent, route Gemma" "$out" "STATE post-rollback: OK"
 
-echo "##### batch 4: an earlier KEPT batch changed"
+echo "##### batch 4: failure after OPEN through the EXIT trap"
 out=$(slice 4 10 12); expect "slice 4" "$out" "slice 4 ok"
-out=$(prepare 4); expect "E batch 4" "$out" "attempt: $CAN/attempt-"; A4=$(attempt)
-out=$(CANARY_MEMBERS=$RUN/batch-4.members cs G); expect "G runs batch 4" "$out" "dream rc=0"
+out=$(prepare 4); expect "E batch 4" "$out" "attempt: $CAN/attempt-"
+out=$(CANARY_DRYRUN_FAULT=after-open CANARY_MEMBERS=$RUN/batch-4.members cs G); rc=$?
+expect "the trap reports both closures verified" "$out" "admission closed: verified; corpus key absent (db+file): verified"; expect "...and keeps a failure status" "$([[ $rc != 0 ]] && echo nonzero)" "nonzero"
+out=$(st post-run); expect "post-run OK after the trap" "$out" "STATE post-run: OK"
+out=$(cs rollback); expect "rollback on decision (batch 4) verifies DONE" "$out" '"verdict":"DONE"'
+
+echo "##### batch 5: failure after OPEN with the admission close failing"
+out=$(slice 5 13 15); expect "slice 5" "$out" "slice 5 ok"
+out=$(prepare 5); expect "E batch 5" "$out" "attempt: $CAN/attempt-"
+out=$(CANARY_DRYRUN_FAULT=after-open-noadmclose CANARY_MEMBERS=$RUN/batch-5.members cs G); rc=$?
+expect "the trap reports admission UNKNOWN and still removes the corpus key" "$out" "admission closed: UNKNOWN; corpus key absent (db+file): verified"
+expect "...with a failure status" "$([[ $rc != 0 ]] && echo nonzero)" "nonzero"
+out=$(st post-run); expect "post-run FAILs while admission is open" "$out" "STATE post-run: FAIL"
+(cd "$W" && bun src/cli.ts config set cycle.extract_atoms.admit_hashes_file "$CAN/closed.manifest" >/dev/null 2>&1)   # runbook: close by hand
+out=$(st post-run); expect "close by hand -> post-run OK" "$out" "STATE post-run: OK"
+out=$(cs rollback); expect "rollback on decision (batch 5) verifies DONE" "$out" '"verdict":"DONE"'
+
+echo "##### batch 6: an earlier KEPT batch changed"
+out=$(slice 6 16 18); expect "slice 6" "$out" "slice 6 ok"
+out=$(prepare 6); expect "E batch 6" "$out" "attempt: $CAN/attempt-"; A4=$(attempt)
+out=$(CANARY_MEMBERS=$RUN/batch-6.members cs G); expect "G runs batch 6" "$out" "dream rc=0"
 cs H >/dev/null
 kid=$(python3 -I -c "import json,glob;print(json.load(open(sorted(glob.glob('$CAN/stage2-kept/*.json'))[0]))[0]['id'])")
 psql -XAt -c "update pages set content_hash = 'rehearsal-tamper' where id = $kid" >/dev/null
-out=$(python3 -I "$O/date_gates.py" "$A4" "$RUN/batch-4.members" "$CAN/stage2-kept" 2>&1); rc=$?
+out=$(python3 -I "$O/date_gates.py" "$A4" "$RUN/batch-6.members" "$CAN/stage2-kept" 2>&1); rc=$?
 expect "date_gates FAIL when an earlier kept batch changed" "$out" "earlier kept batch changed"; expect "that FAIL is exit 10 (complete evidence)" "$rc" "10"
 cs I >/dev/null; cs K >/dev/null; labels "$A4/rating"
-out=$(CANARY_MEMBERS=$RUN/batch-4.members cs S); expect "S refuses without a bound gates.ok" "$out" "no gates.ok"
-out=$(cs rollback); expect "rollback on decision (batch 4) verifies DONE" "$out" '"verdict":"DONE"'
+out=$(CANARY_MEMBERS=$RUN/batch-6.members cs S); expect "S refuses without a bound gates.ok" "$out" "no gates.ok"
+out=$(cs rollback); expect "rollback on decision (batch 6) verifies DONE" "$out" '"verdict":"DONE"'
 echo "RESULT: $FAILS failure(s)"; exit $FAILS
