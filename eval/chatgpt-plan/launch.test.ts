@@ -38,3 +38,9 @@ test('consent permits only fixed IPv4-loopback established reply traffic before 
  expect(text.match(/ct state established/g)?.length).toBe(1);
  expect(text).toContain('meta skuid 9999 jump s552_fixture');
 });
+test('cloudArms binds run-go cloud_models to exact allowlisted ids',async()=>{
+ const { cloudArms } = await import('./cli.ts');
+ expect(cloudArms(undefined)).toEqual(['luna']);
+ expect(cloudArms(['gpt-6-luna','gpt-6.1-sol'])).toEqual(['luna','sol']);
+ for(const bad of [[],['gpt-6-luna','gpt-6-luna'],['gpt-6-sol'],'gpt-6-luna',[1]])expect(()=>cloudArms(bad)).toThrow('CLOUD-MODELS');
+});

@@ -3,7 +3,7 @@ import { createConnection } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
 import { join } from 'node:path';
 import { TokenStore,beginLogin,finishLogin,revoke } from './auth.ts';
-import { Budget, send } from './adapter.ts';
+import { Budget, send, LUNA, CLOUD_MODELS, type CloudArm } from './adapter.ts';
 import { Evidence,loadCorpus,runPaired,sha } from './harness.ts';
 const ROOT='/srv/gbrain-eval';
 async function tcp(host:string,port:number):Promise<boolean> {
@@ -52,6 +52,12 @@ async function login(store:TokenStore) {
  const timer=setTimeout(()=>settle(Error('LOGIN-TIMEOUT')),300000);
  try {console.log('Continue with ChatGPT. Use the approved SSH loopback forward only.');console.log(pending.url);await finished;await server.stop();}finally{clearTimeout(timer);await server.stop(true);}
 }
+/** run-go.json `cloud_models` (owner-bound, exact model ids, ordered); absent = Luna only, as originally reviewed. */
+export function cloudArms(models:unknown):CloudArm[] {
+ const list=models===undefined?[LUNA]:models;
+ if(!Array.isArray(list)||!list.length||new Set(list).size!==list.length)throw Error('CLOUD-MODELS');
+ return list.map(m=>{const arm=(Object.keys(CLOUD_MODELS) as CloudArm[]).find(a=>CLOUD_MODELS[a].model===m);if(!arm)throw Error('CLOUD-MODELS');return arm;});
+}
 async function main() {
  const command=process.argv[2],store=new TokenStore(join(ROOT,'auth'));
  if(command==='probe')return probes(false);
@@ -71,6 +77,6 @@ async function main() {
  const capEvidence=await readFile(join(ROOT,'corpus','allowance-evidence'));if(sha(capEvidence)!==grant.cap_evidence_sha256)throw Error('ALLOWANCE-EVIDENCE');
  const parts=await loadCorpus(join(ROOT,'corpus')),out=new Evidence(join(ROOT,'out',new Date().toISOString().replaceAll(':','-')));await out.prepare();
  await out.put('go.json',JSON.stringify(grant));const budget=new Budget();
- await runPaired(parts,out,async()=>(await store.refresh(send,budget)).access_token,undefined,budget);
+ await runPaired(parts,out,async()=>(await store.refresh(send,budget)).access_token,undefined,budget,cloudArms(grant.cloud_models));
 }
 if(import.meta.main)main().catch(()=>{console.error('S552 stopped; no retry. Inspect protected evidence locally.');process.exitCode=1;});

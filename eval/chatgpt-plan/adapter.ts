@@ -4,12 +4,18 @@ import { createParser } from 'eventsource-parser';
 import { parseAtomsOutcome, type AtomsParseOutcome } from '../../src/core/cycle/extract-atoms-parse.ts';
 
 export const LUNA = 'gpt-6-luna';
+export const SOL = 'gpt-6.1-sol';
+/** Frozen per-model reasoning effort; no other model is ever sent. */
+export const CLOUD_MODELS = {luna:{model:LUNA,effort:'minimal'},sol:{model:SOL,effort:'medium'}} as const;
+export type CloudArm = keyof typeof CLOUD_MODELS;
 export const API = 'https://api.openai.com/v1';
 export const TOKEN = 'https://auth.openai.com/api/accounts/oauth/token';
 export const DISCOVERY = 'https://auth.openai.com/.well-known/openid-configuration';
 export const GEMMA = 'http://127.0.0.1:8084/v1/chat/completions';
 export const LIMITS = {
   luna: { requests:22, connect:10_000, request:120_000, wall:2_700_000 },
+  // Sol reasons at medium effort, so per-request and wall bounds are longer; same 22-request ceiling.
+  sol: { requests:22, connect:10_000, request:300_000, wall:7_200_000 },
   gemma: { requests:20, connect:5_000, request:300_000, wall:3_600_000 },
   // Auth traffic is separate: discovery/JWKS/code exchange, refresh and revoke checks.
   auth: { requests:12, connect:10_000, request:30_000, wall:900_000 },
@@ -21,7 +27,7 @@ export type Wire = {status:number; raw:Buffer};
 export type Sender = (url:string, body:unknown, headers?:Record<string,string>, bounds?:{connect:number;request:number}) => Promise<Wire>;
 export type Outcome = {status:string; parsed?:AtomsParseOutcome; code?:string; usage?:{input_tokens?:number;output_tokens?:number}};
 export class Budget {
-  counts = {luna:0,gemma:0,auth:0};
+  counts = {luna:0,sol:0,gemma:0,auth:0};
   private starts:Partial<Record<Arm,number>> = {};
   constructor(private clock:()=>number=Date.now) {}
   remaining(arm:Arm) { return LIMITS[arm].wall - (this.clock() - (this.starts[arm] ?? this.clock())); }
@@ -32,22 +38,27 @@ export class Budget {
     this.counts[arm]++;
   }
 }
-export function lunaBody(p:Prompt) { return {model:LUNA,instructions:p.system,input:p.messages,stream:true,store:false,reasoning:{effort:'minimal'}}; }
+export function cloudBody(arm:CloudArm,p:Prompt) { return {model:CLOUD_MODELS[arm].model,instructions:p.system,input:p.messages,stream:true,store:false,reasoning:{effort:CLOUD_MODELS[arm].effort}}; }
+export function lunaBody(p:Prompt) { return cloudBody('luna',p); }
 export function gemmaBody(p:Prompt) { return {model:'gemma',messages:[{role:'system',content:p.system},...p.messages],max_tokens:8192,chat_template_kwargs:{enable_thinking:false}}; }
 function validateBody(body:unknown) {
   const b=body as ReturnType<typeof lunaBody>;
-  if(!b || Object.keys(b).sort().join(',')!=='input,instructions,model,reasoning,store,stream' || b.model!==LUNA || b.stream!==true || b.store!==false || typeof b.instructions!=='string' || JSON.stringify(b.reasoning)!=='{"effort":"minimal"}' || !Array.isArray(b.input) || b.input.length!==1 || b.input.some(i=>Object.keys(i).sort().join(',')!=='content,role' || i.role!=='user' || typeof i.content!=='string')) throw Error('REQUEST-SHAPE');
+  const pin=Object.values(CLOUD_MODELS).find(m=>m.model===b?.model);
+  if(!b || !pin || Object.keys(b).sort().join(',')!=='input,instructions,model,reasoning,store,stream' || b.stream!==true || b.store!==false || typeof b.instructions!=='string' || JSON.stringify(b.reasoning)!==JSON.stringify({effort:pin.effort}) || !Array.isArray(b.input) || b.input.length!==1 || b.input.some(i=>Object.keys(i).sort().join(',')!=='content,role' || i.role!=='user' || typeof i.content!=='string')) throw Error('REQUEST-SHAPE');
 }
 export function fixedEndpoint(url:string) {
   if(![`${API}/models`,`${API}/responses`,TOKEN,DISCOVERY,'https://auth.openai.com/.well-known/jwks.json',GEMMA].includes(url)) throw Error('ENDPOINT');
 }
+export function requestOptions(method:'GET'|'POST',headers:Record<string,string>) { return {agent:false as const,method,headers}; }
 /** Native transport has no redirects, proxy environment, SDK retries, or error-body logging. */
 export const send:Sender = (url, body, headers={}, bounds=LIMITS.luna) => new Promise((resolve,reject)=>{
   fixedEndpoint(url);
   const data=body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body);
   let finished=false, size=0; const chunks:Buffer[]=[];
   const fail=(code:string)=>{if(finished)return;finished=true;clearTimeout(connect);clearTimeout(deadline);req.destroy();reject(Object.assign(Error(code),{raw:Buffer.concat(chunks)}));};
-  const req=(url.startsWith('https:')?httpsRequest:httpRequest)(url,{method:data===undefined?'GET':'POST',headers:{...(data===undefined?{}:{'Content-Type':typeof body==='string'?'application/x-www-form-urlencoded':'application/json'}),...headers}},res=>{
+  // agent:false = a fresh socket per request, so the connect timer always sees 'connect'/'secureConnect'.
+  // A reused keep-alive socket never re-emits it, which stopped real run P4 at Gemma p02 after 5 s (S552).
+  const req=(url.startsWith('https:')?httpsRequest:httpRequest)(url,requestOptions(data===undefined?'GET':'POST',{...(data===undefined?{}:{'Content-Type':typeof body==='string'?'application/x-www-form-urlencoded':'application/json'}),...headers}),res=>{
     clearTimeout(connect);
     if((res.statusCode??0)>=300 && (res.statusCode??0)<400) {res.destroy();fail('REDIRECT');return;}
     res.on('data',(c:Buffer)=>{size+=c.length;if(size>MAX_BYTES){fail('OUTPUT-BOUND');return;}chunks.push(c);});
@@ -105,9 +116,9 @@ const statuses=new Set(['SUCCESS','FAILED','FAILED-SCHEMA','FAILED-TRUNCATED','U
 export function encodeLog(row:Record<string,unknown>) {
   const safe:Record<string,unknown>={ts:new Date().toISOString()};
   for(const key of ['latency_ms','bytes','input_tokens','output_tokens']) if(typeof row[key]==='number'&&Number.isFinite(row[key]))safe[key]=row[key];
-  if(['luna','gemma','auth'].includes(row.arm as string))safe.arm=row.arm;
+  if(['luna','sol','gemma','auth'].includes(row.arm as string))safe.arm=row.arm;
   if(typeof row.part_id==='string'&&/^(p\d{2}|smoke|models|auth)$/.test(row.part_id))safe.part_id=row.part_id;
-  if([LUNA,'gemma'].includes(row.model as string))safe.model=row.model;
+  if([LUNA,SOL,'gemma'].includes(row.model as string))safe.model=row.model;
   if(statuses.has(row.terminal_status as string))safe.terminal_status=row.terminal_status;
   if(row.error_code!==undefined)safe.error_code=safeCode(row.error_code);
   return JSON.stringify(safe)+'\n';

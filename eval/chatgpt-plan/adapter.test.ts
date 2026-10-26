@@ -47,7 +47,7 @@ test('arm and auth counters are separate, wall bounds fail closed', () => {
   expect(() => budget.take('luna')).toThrow('REQUEST-BOUND');
   for(let i=0;i<20;i++) budget.take('gemma');
   expect(() => budget.take('gemma')).toThrow('REQUEST-BOUND');
-  budget.take('auth'); expect(budget.counts).toEqual({luna:22,gemma:20,auth:1});
+  budget.take('auth'); expect(budget.counts).toEqual({luna:22,sol:0,gemma:20,auth:1});
   for(let i=1;i<12;i++)budget.take('auth');
   expect(()=>budget.take('auth')).toThrow('REQUEST-BOUND');
   const cloudExpired = new Budget(() => now); cloudExpired.take('luna'); now=2_700_001;
@@ -63,4 +63,15 @@ test('Gemma truncation and invalid/absent choice are failures', () => {
 test('log allowlist rejects untrusted strings and excludes secrets/content', () => {
   const encoded = encodeLog({ arm:'luna', part_id:'p01', terminal_status:'SUCCESS', model:'gpt-6-luna', headers:{Authorization:'private'}, content:'private', error_code:'private arbitrary error', latency_ms:5 });
   expect(encoded).not.toContain('private'); expect(encoded).not.toContain('headers'); expect(encoded).toContain('SUCCESS');
+});
+test('per-model effort is frozen: swapped or unknown models are refused before sending',async()=>{
+ const { cloudBody, guardedRequest, API, encodeLog } = await import('./adapter.ts');
+ let sent=0;const sender=async()=>{sent++;return {status:200,raw:Buffer.from('')};};
+ const p={system:'s',messages:[{role:'user' as const,content:'u'}]};
+ expect(cloudBody('sol',p)).toEqual({model:'gpt-6.1-sol',instructions:'s',input:p.messages,stream:true,store:false,reasoning:{effort:'medium'}});
+ await expect(guardedRequest(`${API}/responses`,{...cloudBody('sol',p),reasoning:{effort:'minimal'}},sender)).rejects.toThrow('REQUEST-SHAPE');
+ await expect(guardedRequest(`${API}/responses`,{...cloudBody('luna',p),reasoning:{effort:'medium'}},sender)).rejects.toThrow('REQUEST-SHAPE');
+ await expect(guardedRequest(`${API}/responses`,{...cloudBody('luna',p),model:'gpt-6-sol'},sender)).rejects.toThrow('REQUEST-SHAPE');
+ expect(sent).toBe(0);
+ expect(JSON.parse(encodeLog({arm:'sol',model:'gpt-6.1-sol',part_id:'p01'}))).toMatchObject({arm:'sol',model:'gpt-6.1-sol',part_id:'p01'});
 });
