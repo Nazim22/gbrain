@@ -115,13 +115,22 @@ Refresh holds a cross-process flock and writes a durable pending marker before
 one network attempt. Tokens/expiry/scopes rotate together using fsync+rename.
 Unknown outcomes retain that marker and stop subsequent refresh; no blind retry.
 
-After Nazz removes app access, `cli.ts revoke <account-side-evidence-path>` makes
-one refresh and one model-list check while local credentials remain present.
-Only a definitive `invalid_grant` with model-list 401 (or explicitly reported
-still-valid access-token 200) permits deletion/readback. Unknown outcomes retain
-credentials. Keep account-side evidence protected; never upload credentials or
-copy them into packets. This build tests sequencing only; actual account-side
-revocation and allowance settings remain unverified.
+After Nazz removes app access and the operation is authorized, run
+`bash eval/chatgpt-plan/launch.sh revoke <account-side-evidence-path>` (never a
+root-direct CLI). Supply one nonempty file outside the code checkout and staged
+code/corpus trees, so public staging cannot copy it. The launcher copies it to
+`/srv/gbrain-eval/out/revoke-evidence`, owned by `gbrain-eval`, mode 0600. It reuses
+the root lock/pending ownership, evaluation firewall and exactly the `run` preflight
+before `inside revoke` under the same confined UID/systemd properties. Stdout is
+only the CLI's JSON outcome; launcher/probe diagnostics go to stderr. A failed or
+unknown revoke retains the launcher pending latch, even after confirmed cessation.
+
+The unchanged revocation policy makes one refresh and one model-list check while
+local credentials remain present. Only a definitive `invalid_grant` with model-list
+401 (or explicitly reported still-valid access-token 200) permits deletion/readback.
+Unknown outcomes retain credentials. Keep account-side evidence protected; never
+upload credentials or copy them into packets. This build tests sequencing only;
+actual account-side revocation and allowance settings remain unverified.
 
 ## Official contract references (consulted during build)
 

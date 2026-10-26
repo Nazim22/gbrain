@@ -25,7 +25,11 @@ rules() {
 if [[ ${1:-} == print-rules ]]; then rules "$2" "$3" "$4" "${5:-evaluation}"; exit; fi
 [[ $(id -u) == 0 ]] || { printf 'root required\n' >&2; exit 1; }
 mode=${1:-}
-[[ $mode == rehearse || $mode == rehearse-consent || $mode == consent || $mode == run ]] || { printf 'usage: launch.sh rehearse|rehearse-consent|consent|run\nReal consent requires separate permission; no credential-copy fallback.\n' >&2; exit 2; }
+[[ $mode == rehearse || $mode == rehearse-consent || $mode == consent || $mode == run || $mode == revoke ]] || { printf 'usage: launch.sh rehearse|rehearse-consent|consent|run|revoke <evidence-file>\nReal consent requires separate permission; no credential-copy fallback.\n' >&2; exit 2; }
+if [[ $mode == revoke ]]; then
+  [[ $# == 2 && -f ${2:-} && -s ${2:-} && -r ${2:-} ]] || { printf 'revoke requires one readable, nonempty evidence-file\n' >&2; exit 2; }
+  evidence=$(realpath -e -- "$2")
+fi
 profile=evaluation
 [[ $mode != consent && $mode != rehearse-consent ]] || profile=consent
 # This build brief authorizes local rehearsal on 134 only. Runtime on 122 requires its separate GO.
@@ -34,6 +38,11 @@ if [[ $mode == rehearse* ]]; then
 fi
 src=$(cd "$(dirname "$0")/../.." && pwd)
 root=/srv/gbrain-eval
+if [[ $mode == revoke ]]; then
+  # Never let the later public code/corpus staging copy protected evidence.
+  [[ $evidence != "$(realpath -e -- "$src")/"* && $evidence != "$root/code/"* && $evidence != "$root/corpus/"* ]] || { printf 'evidence-file must be outside staged code/corpus\n' >&2; exit 2; }
+  exec 3>&1 1>&2
+fi
 lockdir=/run/gbrain-eval-launch
 [[ ! -L $lockdir ]] || exit 1
 install -d -m 0700 -o root -g root "$lockdir"
@@ -60,7 +69,7 @@ cleanup() {
   remaining=$(nft -j -a list table inet filter | python3 -c 'import json,sys; d=json.load(sys.stdin); names={sys.argv[1],sys.argv[1]+"_gate"}; print(sum(1 for x in d["nftables"] if any(isinstance(v,dict) and any(v.get(k) in names for k in ("name","comment","chain")) for v in x.values())))' "$run")
   printf 'cleanup run=%s owned_rules_and_chains=%s\n' "$run" "$remaining"
   [[ $remaining == 0 ]] || { printf 'HOLD: cleanup residue; retaining pending ownership\n'; exit 1; }
-  if ((marker_owned)); then rm -- "$marker"; fi
+  if ((marker_owned)) && [[ ${mode:-} != revoke || $status == 0 ]]; then rm -- "$marker"; fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -79,6 +88,7 @@ install -d -m 0700 -o gbrain-eval -g gbrain-eval "$root/out" "$root/auth"
 rsync -a --delete --exclude=.git --exclude=.env --exclude='.env.*' --exclude='*.tsbuildinfo' "$src/" "$root/code/"
 chown -R root:root "$root/code" "$root/corpus"
 chmod -R a-w,a+rX "$root/code" "$root/corpus"
+if [[ $mode == revoke ]]; then stage_revoke_evidence "$evidence" "$root/out/revoke-evidence" "$uid" "$(id -g gbrain-eval)"; fi
 git -C "$src" rev-parse HEAD > "$root/code/BUILD-HEAD"
 chmod 0444 "$root/code/BUILD-HEAD"
 if [[ $mode == rehearse* ]]; then
@@ -110,4 +120,5 @@ fi
 counter=$(nft -j list chain inet filter "$run" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(e["counter"].get("packets",0) for x in d["nftables"] for e in x.get("rule",{}).get("expr",[]) if "counter" in e))')
 printf 'denial_drop_packets=%s\n' "$counter"
 if [[ $mode != consent ]]; then ((counter>0)) || { printf 'drop counter did not rise\n' >&2; exit 1; }; fi
-if [[ $mode == run ]]; then inside run; fi
+if [[ $mode == run ]]; then inside run;
+elif [[ $mode == revoke ]]; then inside revoke "$root/out/revoke-evidence" >&3; fi

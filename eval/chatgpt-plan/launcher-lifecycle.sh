@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Root-owned stable lock inode; a pending marker survives crashes/unknown teardown.
+stage_revoke_evidence() {
+  install -m 0600 -o "$3" -g "$4" -- "$1" "$2"
+}
 acquire_owner() {
   local lock=$1 pending=$2
   exec 9>"$lock"
