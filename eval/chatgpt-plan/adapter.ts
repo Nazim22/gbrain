@@ -96,17 +96,23 @@ const safeCodes=new Set(['subscription_sharing_usage_limit_exceeded','subscripti
 export function safeCode(code:unknown) {return typeof code==='string'&&safeCodes.has(code)?code:'UNKNOWN';}
 export function parseLuna(raw:string):Outcome {
   let terminal:Outcome|undefined, malformed=false, sawTerminal=false;
+  // On the ChatGPT-plan route response.completed carries output:[] (P7 smoke, S552); the answer arrives only as output_item.done.
+  const doneItems:any[]=[];
   const parser=createParser({onError:()=>{malformed=true;},onEvent:e=>{
     if(e.data==='[DONE]')return;
     try {
       const data=JSON.parse(e.data);
+      if(data.type==='response.output_item.done'){if(sawTerminal)malformed=true;else doneItems.push(data.item);return;}
       if(!['response.completed','response.failed','response.incomplete','error'].includes(data.type))return;
       if(sawTerminal){malformed=true;return;}sawTerminal=true;
       if(data.type==='response.incomplete') {terminal={status:'FAILED-TRUNCATED',parsed:parseAtomsOutcome('', 'length')};return;}
       if(data.type!=='response.completed') {terminal={status:'FAILED',code:safeCode(data.response?.error?.code??data.code)};return;}
       const response=data.response;
       if(response?.status!=='completed' || !Array.isArray(response.output)){malformed=true;return;}
-      const contents=response.output.filter((o:any)=>o.type==='message').flatMap((o:any)=>o.content??[]);
+      // Never both: a non-empty completed.output that disagrees with the streamed items would be ambiguous.
+      if(response.output.length&&doneItems.length&&JSON.stringify(response.output)!==JSON.stringify(doneItems)){malformed=true;return;}
+      const output=response.output.length?response.output:doneItems;
+      const contents=output.filter((o:any)=>o?.type==='message').flatMap((o:any)=>o.content??[]);
       if(contents.some((c:any)=>c.type==='refusal')) {terminal={status:'FAILED',parsed:parseAtomsOutcome('','refusal')};return;}
       const text=contents.filter((c:any)=>c.type==='output_text'&&typeof c.text==='string').map((c:any)=>c.text).join('');
       const parsed=parseAtomsOutcome(text,'stop');

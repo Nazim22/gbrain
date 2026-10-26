@@ -6,6 +6,27 @@ test('completed valid output alone is accepted', () => {
   expect(parseLuna(done()).status).toBe('SUCCESS');
   expect(parseLuna(done('not JSON')).status).toBe('FAILED-SCHEMA');
 });
+// The real P7 smoke stream's event sequence: the answer only arrives in output_item.done; completed.output is [].
+const item = (text: string) => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', annotations: [], logprobs: [], text }] });
+const raw = (type: string, body: object) => `event: ${type}\ndata: ${JSON.stringify({ type, ...body })}\n\n`;
+const planStream = (text: string, completedOutput: unknown[] = []) => [
+  raw('response.created', { response: { status: 'in_progress', output: [] } }),
+  raw('response.output_item.added', { item: { type: 'message', role: 'assistant', content: [] } }),
+  raw('response.output_text.delta', { delta: text }),
+  raw('response.output_text.done', { text }),
+  raw('response.output_item.done', { item: item(text) }),
+  raw('response.completed', { response: { status: 'completed', output: completedOutput, usage: { input_tokens: 817, output_tokens: 8 } } }),
+].join('');
+test('plan-route stream: the answer comes from output_item.done when completed.output is empty', () => {
+  const ok = parseLuna(planStream('{"atoms":[]}'));
+  expect(ok.status).toBe('SUCCESS'); expect(ok.parsed?.ok).toBe(true); expect(ok.usage).toEqual({ input_tokens: 817, output_tokens: 8 });
+  expect(parseLuna(planStream('not JSON')).status).toBe('FAILED-SCHEMA');
+  // Same items in both places is fine; disagreeing copies are ambiguous, never silently picked.
+  expect(parseLuna(planStream('{"atoms":[]}', [item('{"atoms":[]}')])).status).toBe('SUCCESS');
+  expect(parseLuna(planStream('{"atoms":[]}', [item('[]')])).status).toBe('UNKNOWN');
+  // An item after the terminal event is malformed.
+  expect(parseLuna(planStream('{"atoms":[]}') + raw('response.output_item.done', { item: item('[]') })).status).toBe('UNKNOWN');
+});
 test('terminal failures never promote partial content', () => {
   for (const [wire, status] of [[event('response.failed'), 'FAILED'], [event('response.incomplete'), 'FAILED-TRUNCATED'], ['data: {"type":"response.output_text.delta","delta":"[]"}\n\n', 'UNKNOWN']] as const) {
     expect(parseLuna(wire).status).toBe(status);
