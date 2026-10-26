@@ -25,4 +25,12 @@ with tempfile.TemporaryDirectory() as d:
     open(legacy[1], "w").write(f"# Pingu session {sid}.part2\n\nUser: hello 1\n"); open(dated[1], "w").write("x")  # destination exists
     r = run("rename", man, "2", "2", log, "--apply")
     assert r.returncode != 0 and "destination exists" in r.stderr and os.path.exists(legacy[1]), r
-print("date_parts rename self-test: 5 checks passed")
+    # An already-dated part (legacy == dated): checked, never renamed; changed bytes stop.
+    pre = os.path.join(d, f"2026-10-20-session-{sid}.part3.txt"); open(pre, "w").write("dated already\n")
+    psha = hashlib.sha256(open(pre, "rb").read()).hexdigest(); man2 = os.path.join(d, "run2.manifest")
+    open(man2, "w").write(f"h3\t{psha}\t{pre}\t{pre}\t2026-10-20\n")
+    r = run("rename", man2, "1", "1", log, "--apply")
+    assert r.returncode == 0 and "already dated" in r.stdout and os.path.exists(pre) and len(open(log).readlines()) == 1, r
+    open(pre, "a").write("x"); r = run("rename", man2, "1", "1", log, "--apply")
+    assert r.returncode != 0 and "missing or changed" in r.stderr, r
+print("date_parts rename self-test: 7 checks passed")

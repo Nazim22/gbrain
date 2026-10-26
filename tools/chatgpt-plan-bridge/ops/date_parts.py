@@ -21,7 +21,7 @@ CONVERTER = "/root/.gbrain/ingest-session-transcript.py"
 SRC_DIR = "/root/.claude/projects/-root"
 ANCH_MAX, ANCH_MIN, ACTIVE_S = 200, 40, 20 * 60
 TURN_SEP = re.compile(r"\n\n(User|Assistant): ")
-NAME = re.compile(r"^session-([0-9a-f-]{36})((?:\.part\d+)?)\.txt$")
+NAME = re.compile(r"^(?:(\d{4}-\d{2}-\d{2})-)?session-([0-9a-f-]{36})((?:\.part\d+)?)\.txt$")  # legacy or already dated
 
 def load_converter():
     spec = importlib.util.spec_from_file_location("conv", CONVERTER)
@@ -59,7 +59,7 @@ def session_turns(conv, sid):
 
 def part_date(conv, path, cache):
     """(date, None) or (None, refusal reason)."""
-    sid = NAME.match(os.path.basename(path)).group(1)
+    sid = NAME.match(os.path.basename(path)).group(2)
     if not os.path.exists(f"{SRC_DIR}/{sid}.jsonl"): return None, "no-jsonl"
     if sid not in cache: cache[sid] = session_turns(conv, sid)
     text = open(path, errors="replace", newline="").read()
@@ -84,12 +84,15 @@ def plan(eligible, run_manifest, refused_tsv):
     for line in open(eligible):
         h, p = line.rstrip("\n").split("\t")
         m = NAME.match(os.path.basename(p))
-        if not m: refused.append((h, p, "not-a-legacy-part-name")); continue
-        sid, suffix = m.groups()
-        if not suffix and os.path.exists(os.path.join(os.path.dirname(p), f"session-{sid}.part1.txt")):
+        if not m: refused.append((h, p, "not-a-part-name")); continue
+        named_day, sid, suffix = m.groups()
+        if not suffix and glob.glob(os.path.join(os.path.dirname(p), f"*session-{sid}.part1.txt")):
             refused.append((h, p, "stale-single")); continue
         j = f"{SRC_DIR}/{sid}.jsonl"
         if os.path.exists(j) and time.time() - os.path.getmtime(j) < ACTIVE_S: refused.append((h, p, "active-session")); continue
+        if named_day:   # already dated (the converter's exact turn date, or an earlier rename): nothing to rename
+            if utc_date(f"{named_day}T00:00:00Z") != named_day: refused.append((h, p, "bad-name-date")); continue
+            rows.append((h, sha256(p), p, p, named_day)); continue
         day, why = part_date(conv, p, cache)
         if why: refused.append((h, p, why)); continue
         dated = os.path.join(os.path.dirname(p), f"{day}-{os.path.basename(p)}")
@@ -105,6 +108,9 @@ def rename(run_manifest, first, last, renames_tsv, apply):
     rows = [l.rstrip("\n").split("\t") for l in open(run_manifest)][first - 1:last]
     done = {l.split("\t")[1] for l in open(renames_tsv)} if os.path.exists(renames_tsv) else set()
     for n, (h, sha, legacy, dated, day) in enumerate(rows, first):
+        if legacy == dated:   # already dated at the run freeze: only its bytes are checked
+            if not os.path.exists(dated) or sha256(dated) != sha: sys.exit(f"{n} STOP: dated part missing or changed {dated}")
+            print(f"{n} skip (already dated) {os.path.basename(dated)}"); continue
         if dated in done and not os.path.exists(legacy) and os.path.exists(dated) and sha256(dated) == sha:
             print(f"{n} skip (already renamed) {os.path.basename(dated)}"); continue
         if not os.path.exists(legacy): sys.exit(f"{n} STOP: legacy missing {legacy}")

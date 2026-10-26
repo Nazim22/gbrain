@@ -27,12 +27,19 @@ if (renamesTsv && existsSync(renamesTsv)) for (const line of readFileSync(rename
 }
 const names = (path: string) => (other.has(path) ? [path, other.get(path)!] : [path]);
 const allNames = [...new Set(parts.flatMap(p => names(p.path)))];
-// Atom ids a verified rollback receipt names (rollback-batch.ts plan new_atom_ids + verify verdict DONE).
-const receipted = new Set<string>();
-if (receiptsDir && existsSync(receiptsDir)) for (const f of readdirSync(receiptsDir).filter(f => f.endsWith('.json'))) {
+// Rollback receipts (batch.sh rollback): a receipt is only a CLAIM until verified. It counts when its before/after
+// captures still hash to the recorded sha256, its verify verdict is DONE, and (in the read-only transaction below)
+// every atom it names is currently retired by this procedure. Anything else readmits nothing.
+const fileSha = (p: string) => createHash('sha256').update(readFileSync(p)).digest('hex');
+const claims: { file: string; ids: string[] }[] = [];
+if (receiptsDir && existsSync(receiptsDir)) for (const f of readdirSync(receiptsDir).filter(f => f.endsWith('.json')).sort()) {
   const r = JSON.parse(readFileSync(`${receiptsDir}/${f}`, 'utf8'));
-  if (r?.verify?.verdict === 'DONE') for (const id of r?.plan?.new_atom_ids ?? []) receipted.add(String(id));
+  const ok = r?.verify?.verdict === 'DONE' && typeof r.before === 'string' && typeof r.after === 'string'
+    && existsSync(r.before) && existsSync(r.after) && fileSha(r.before) === r.before_sha256 && fileSha(r.after) === r.after_sha256;
+  const ids = (r?.plan?.new_atom_ids ?? []).map(String);
+  if (ok && ids.length) claims.push({ file: f, ids }); else console.error(`[inventory] receipt ${f} not verified (verdict, capture hashes or ids)`);
 }
+const receipted = new Set<string>();
 
 const res = await sql.begin('READ ONLY', async tx => {
   const live = await tx`SELECT DISTINCT frontmatter->>'source_hash' AS h FROM pages WHERE type='atom' AND source_id='default' AND deleted_at IS NULL
@@ -47,6 +54,12 @@ const res = await sql.begin('READ ONLY', async tx => {
                            WHERE type='atom' AND source_id='default' AND deleted_at IS NOT NULL AND frontmatter->>'source_hash' = ANY(${hashes})`;
   const independent = await tx`SELECT count(DISTINCT frontmatter->>'source_path')::int AS n FROM pages WHERE type='atom' AND source_id='default'
                                AND deleted_at IS NULL AND frontmatter->>'source_path' = ANY(${allNames})`;
+  for (const c of claims) {   // current row state must match the receipt: every named atom retired by this procedure
+    const rows = await tx`SELECT id::text AS id FROM pages WHERE id = ANY(${c.ids.map(Number)}) AND deleted_at IS NOT NULL
+                          AND frontmatter->>'retired_by' = ${'luna-batch-rollback'}`;
+    if (rows.length === c.ids.length) for (const id of c.ids) receipted.add(id);
+    else console.error(`[inventory] receipt ${c.file}: ${c.ids.length - rows.length} named atom(s) not currently retired by the rollback`);
+  }
   return { live, state, retired, byPath, gens, independent };
 });
 await sql.end();
@@ -89,5 +102,6 @@ if (total !== parts.length) throw Error(`classes sum to ${total}, discovered ${p
 // Second, independent count: distinct live-atom source paths among these parts' names (= the parts whose path has
 // a live atom: extracted-by-path and changed). Printed for the runner to compare, never used to classify.
 console.log(JSON.stringify({ discovered: parts.length, unique_hashes: hashes.length, counts, independent_live_paths: res.independent[0].n,
+  receipted_atoms: receipted.size,
   missing_manifest_sha256: createHash('sha256').update(manifest).digest('hex'),
   samples: Object.fromEntries(Object.keys(counts).map(c => [c, rows.filter(r => r.class === c).slice(0, 5).map(r => r.path.split('/').pop())])) }, null, 1));
