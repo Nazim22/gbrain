@@ -13,6 +13,10 @@ step() { echo "== $(date -u +%FT%TZ) $*"; }
 
 step "user + dirs"
 id cpbridge >/dev/null 2>&1 || useradd --system --home-dir /srv/chatgpt-plan-bridge --shell /usr/sbin/nologin cpbridge
+# Root acts on paths a less-privileged user may own: refuse any symlink in them before touching anything.
+for p in /srv/chatgpt-plan-bridge /srv/chatgpt-plan-bridge/auth /srv/chatgpt-plan-bridge/state /srv/chatgpt-plan-bridge/tmp /srv/gbrain-eval /srv/gbrain-eval/auth /etc/chatgpt-plan-bridge /opt/chatgpt-plan-bridge; do
+  [[ ! -L $p ]] || { echo "refusing: $p is a symlink"; exit 1; }
+done
 install -d -m 0755 -o root -g root /opt/chatgpt-plan-bridge "$OPT" "$OPT/detectors" /etc/chatgpt-plan-bridge
 install -d -m 0700 -o cpbridge -g cpbridge /srv/chatgpt-plan-bridge /srv/chatgpt-plan-bridge/auth /srv/chatgpt-plan-bridge/state /srv/chatgpt-plan-bridge/tmp
 
@@ -42,11 +46,37 @@ EOF
 chown root:cpbridge /etc/chatgpt-plan-bridge/config.json; chmod 0640 /etc/chatgpt-plan-bridge/config.json
 
 step "move the gbrain-local sign-in to the bridge user (single owner)"
-if [[ ! -s /srv/chatgpt-plan-bridge/auth/credentials.json ]]; then
+if [[ ! -e /srv/chatgpt-plan-bridge/auth/credentials.json ]]; then
   [[ ! -e /srv/gbrain-eval/auth/refresh.pending ]] || { echo "eval refresh.pending present: refuse"; exit 1; }
-  for f in credentials.json host.json; do install -m 0600 -o cpbridge -g cpbridge "/srv/gbrain-eval/auth/$f" "/srv/chatgpt-plan-bridge/auth/$f"; done
-  cmp /srv/gbrain-eval/auth/credentials.json /srv/chatgpt-plan-bridge/auth/credentials.json
-  shred -u /srv/gbrain-eval/auth/credentials.json
+  # No-follow move: open each source with O_NOFOLLOW (regular file, owned by gbrain-eval, one link), create each
+  # destination with O_EXCL|O_NOFOLLOW owned by cpbridge, verify bytes, then overwrite the eval copy through the
+  # same no-follow handle and unlink it. `install`/`cp`/`shred` would follow a symlink the eval user planted.
+  python3 -I - <<'PY'
+import os, pwd, stat
+src, dst = '/srv/gbrain-eval/auth', '/srv/chatgpt-plan-bridge/auth'
+ev, cb = pwd.getpwnam('gbrain-eval'), pwd.getpwnam('cpbridge')
+for d, u in ((src, ev), (dst, cb)):
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != u.pw_uid: raise SystemExit(f'refuse dir {d}')
+def read_nofollow(p):
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != ev.pw_uid or st.st_nlink != 1: raise SystemExit(f'refuse {p}')
+        return os.read(fd, 1 << 20)
+    finally: os.close(fd)
+for name in ('credentials.json', 'host.json'):
+    data = read_nofollow(f'{src}/{name}')
+    out = os.open(f'{dst}/{name}', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try: os.write(out, data); os.fsync(out); os.fchown(out, cb.pw_uid, cb.pw_gid)
+    finally: os.close(out)
+    if read_nofollow(f'{src}/{name}') != data: raise SystemExit(f'changed during move: {name}')
+fd = os.open(f'{src}/credentials.json', os.O_WRONLY | os.O_NOFOLLOW)
+try: os.write(fd, b'\0' * os.fstat(fd).st_size); os.fsync(fd)
+finally: os.close(fd)
+os.unlink(f'{src}/credentials.json')
+print('sign-in moved to', dst)
+PY
 fi
 ls -la /srv/chatgpt-plan-bridge/auth
 
@@ -58,5 +88,6 @@ sleep 2
 systemctl is-active chatgpt-plan-bridge.service
 nft list chain inet filter cpbridge_egress | head -12
 curl -sS -o /dev/null -w 'no-secret status=%{http_code}\n' http://127.0.0.1:$PORT/v1/bridge/status
-curl -sS -H "Authorization: Bearer $(cat /etc/chatgpt-plan-bridge/caller.secret)" http://127.0.0.1:$PORT/v1/bridge/status; echo
+# The header goes through curl's config on stdin (printf is a builtin): the secret never appears in any argv.
+printf 'header = "Authorization: Bearer %s"\n' "$(< /etc/chatgpt-plan-bridge/caller.secret)" | curl -sS -K - http://127.0.0.1:$PORT/v1/bridge/status; echo
 step "installed $HEAD"
