@@ -102,6 +102,7 @@ import { atomGenerationOrigin, atomInputPin, heldLine, publishUnmanagedAtoms, re
 import { heldForInput } from '../generations/publish.ts';
 import { ATOM_TYPES, ATOMS_RESPONSE_SCHEMA } from './extract-atoms-schema.ts';
 import { parseAtomsOutcome } from './extract-atoms-parse.ts';
+import { admitKey, resolveAdmitManifest } from './extract-atoms-admit.ts';
 export { parseAtomsOutcome, parseAtomsResponse, type AtomsParseOutcome } from './extract-atoms-parse.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
@@ -836,8 +837,11 @@ export async function runPhaseExtractAtoms(
     sourceId,
     allHashes16,
   );
+  const admit = await resolveAdmitManifest(engine);
+  if (admit) pages = pages.filter(p => admit.has(admitKey(p.contentHash.slice(0, 16), `page:${p.slug}`)));
   for (const t of transcripts) {
     const hash16 = t.contentHash.slice(0, 16);
+    if (admit && !admit.has(admitKey(hash16, t.filePath))) continue;
     if (existingHashes.has(hash16)) {
       duplicatesSkipped++;
       continue;
@@ -1312,6 +1316,9 @@ export async function runPhaseExtractAtoms(
               ...(atom.emotional_register && { emotional_register: atom.emotional_register }),
               extracted_at: new Date().toISOString(),
               extracted_by: 'extract_atoms-v0.41.2.1',
+              // Provenance: the model that actually answered (served id) and the route asked for.
+              extracted_model: result.responseModel ?? result.model,
+              extracted_route: extractModel,
               dream_generated: true, // #5211: the flag every anti-loop guard keys on
             },
             atom.body,
@@ -1452,6 +1459,7 @@ export async function runPhaseExtractAtoms(
         extracted_at: new Date().toISOString(),
         total_rows: totalAtomsExtracted,
         cost_usd: estimatedSpendUsd,
+        model_id: extractModel,
         summary:
           `Extracted ${totalAtomsExtracted} atoms from ` +
           `${transcriptsProcessed} transcripts + ${pagesProcessed} pages.`,
