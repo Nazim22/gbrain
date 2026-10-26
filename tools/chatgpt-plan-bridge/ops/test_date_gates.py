@@ -36,5 +36,17 @@ with tempfile.TemporaryDirectory() as t:
 
     bad = f'{t}/members-bad.tsv'; open(bad, 'w').write(open(mem).read().split('\n', 1)[1])   # one member short
     r = run(a, bad); assert r.returncode == 2 and 'differs from canary.manifest' in r.stdout, r
+    good = json.load(open(f'{a}/after.json')); plan0 = json.load(open(f'{a}/plan.json'))
+    def variant(after_obj, plan_obj, why):   # Pebble 18:33Z counterexamples: each must STOP (2), never PASS
+        json.dump(after_obj, open(f'{a}/after.json', 'w')); json.dump(plan_obj, open(f'{a}/plan.json', 'w'))
+        r = run(a, mem); assert r.returncode == 2 and why in r.stdout, (r.returncode, r.stdout[-300:])
+    empty = dict(good, pairs=[], atoms=[], generations=[], state_rows=[])
+    variant(empty, dict(plan0, new_atom_ids=[], changed_atom_ids=[]), 'pairs differ from canary.manifest')   # empty capture
+    variant(dict(good, pairs=good['pairs'][1:]), plan0, 'pairs differ from canary.manifest')               # omitted pair
+    variant(good, dict(plan0, new_atom_ids=plan0['new_atom_ids'][1:]), 'plan.json does not match')            # stale/omitted plan
+    variant(good, dict(plan0, new_atom_ids=plan0['new_atom_ids'] + [999999999]), 'plan.json does not match')  # foreign id
+    json.dump(good, open(f'{a}/after.json', 'w')); json.dump(plan0, open(f'{a}/plan.json', 'w'))
+    r = run(a, mem); assert r.returncode == 0, r                                                              # restored: PASS again
     os.remove(f'{a}/after.json'); r = run(a, mem); assert r.returncode == 2 and 'STOP' in r.stdout, r
-    print('3. evidence problems (old capture shape, members mismatch, after.json missing): exit 2, never 10')
+    print('3. evidence problems (old capture shape, members mismatch, empty capture, omitted pair, stale plan, foreign plan id, '
+          'after.json missing): exit 2, never 10 or 0')

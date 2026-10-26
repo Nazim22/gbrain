@@ -24,6 +24,19 @@ def main(a, members_tsv):
         raise ValueError('before/after are not bound to this canary.manifest')
     if sorted((h, p) for h, p in man) != sorted((r[0], r[3]) for r in mem): raise ValueError('members.tsv differs from canary.manifest')
     day = {r[3]: r[4] for r in mem}
+    # Completeness: both captures must carry exactly the manifest's pairs, or every per-pair check below is vacuous.
+    want_pairs = sorted((h, p) for h, p in man)
+    for name, cap in (('before', before), ('after', after)):
+        if sorted((x['hash16'], x['path']) for x in cap['pairs']) != want_pairs:
+            raise ValueError(f'{name}.json pairs differ from canary.manifest (capture incomplete or for another manifest)')
+    # The plan is a claim: recompute it from the two captures (rollback-batch.ts writeSet: new = ids only in AFTER;
+    # changed = same id, different page state over deleted_at, content_hash, frontmatter, compiled_truth).
+    state = lambda x: json.dumps([x['deleted_at'], x['content_hash'], x['frontmatter'], x['compiled_truth']], sort_keys=True)
+    b_atoms = {x['id']: x for x in before['atoms']}
+    new_ids = sorted(x['id'] for x in after['atoms'] if x['id'] not in b_atoms)
+    changed_ids = sorted(x['id'] for x in after['atoms'] if x['id'] in b_atoms and state(x) != state(b_atoms[x['id']]))
+    if sorted(plan['new_atom_ids']) != new_ids or sorted(plan['changed_atom_ids']) != changed_ids:
+        raise ValueError('plan.json does not match the captures (stale, omitted or foreign plan)')
     atoms = {x['id']: x for x in after['atoms']}
     for x in after['atoms']:
         if 'effective_date' not in x or 'effective_date_source' not in x: raise ValueError('after.json lacks effective_date fields (old capture)')
