@@ -5,10 +5,11 @@ set -uo pipefail
 DB=$1 HOMEG=$2 M=$3 L=$4
 W=$(cd "$(dirname "$0")/../../.." && pwd); OPS=$W/tools/chatgpt-plan-bridge/ops; CORPUS=/root/.claude/projects/-root/session-text
 source /root/.gbrain/pg.env
-export GBRAIN_HOME=$HOMEG HOME=/root DATABASE_URL="postgres://gbrain:$PASS@127.0.0.1:5432/$DB"
-[[ $(psql "$DATABASE_URL" -XAtc 'select current_database()') == gbrain_s552_* ]] || { echo "REFUSE: not a scratch DB"; exit 1; }
+export GBRAIN_HOME=$HOMEG HOME=/root DATABASE_URL="postgres://gbrain:$PASS@127.0.0.1:5432/$DB"   # environment only (bun tools)
+export PGHOST=127.0.0.1 PGPORT=5432 PGUSER=gbrain PGDATABASE="$DB" PGPASSWORD="$PASS"     # psql gets no URI on its argv
+[[ $(psql -XAtc 'select current_database()') == gbrain_s552_* ]] || { echo "REFUSE: not a scratch DB"; exit 1; }
 gb() { (cd "$W" && bun src/cli.ts "$@"); }
-q() { psql "$DATABASE_URL" -XAt -F ' | ' -c "$1"; }
+q() { psql -XAt -F ' | ' -c "$1"; }
 step() { echo; echo "=== $(date -u +%FT%TZ) $*"; }
 expect() { if [[ "$2" == *"$3"* ]]; then echo "OK   $1"; else echo "FAIL $1: wanted '$3' in: $2"; FAILS=$((FAILS+1)); fi; }
 FAILS=0; install -d -m 0700 "$L" "$L/checkout"; : > "$L/closed"
@@ -36,7 +37,16 @@ bun "$OPS/writeset.ts" preflight "$L/before.json"
 run r1; cap after before
 PLAN=$(bun "$OPS/rollback-batch.ts" plan "$L/before.json" "$L/after.json"); echo "$PLAN"
 expect "old receipt is a CHANGED receipt (not new)" "$PLAN" "\"changed_receipts\":1"
-PRE=$(bun "$OPS/rollback-batch.ts" verify "$L/before.json" "$L/after.json"); expect "before apply = NOT_APPLIED" "$PRE" '"verdict":"NOT_APPLIED"'
+PRE=$(bun "$OPS/rollback-batch.ts" verify "$L/before.json" "$L/after.json"); RC=$?; expect "before apply = NOT_APPLIED" "$PRE" '"verdict":"NOT_APPLIED"'
+expect "verify exits 3 on NOT_APPLIED" "rc=$RC" "rc=3"
+
+step "2a. guard on generations: a generation row changed after the AFTER capture → apply refuses, nothing mutated"
+GID=$(q "select id from derived_generations where kind='atom' order by id desc limit 1")
+q "update derived_generations set item_set_hash = item_set_hash || 'x' where id = $GID" >/dev/null
+OUT=$(bun "$OPS/rollback-batch.ts" apply "$L/before.json" "$L/after.json" 2>&1); RC=$?; echo "$OUT" | tail -1
+expect "apply refuses a tampered generation" "$OUT" '"refused"'
+expect "refused apply exits 2" "rc=$RC" "rc=2"
+q "update derived_generations set item_set_hash = left(item_set_hash, length(item_set_hash)-1) where id = $GID" >/dev/null
 
 step "2. guard: a row changed after the AFTER capture aborts apply with nothing mutated"
 NEWID=$(echo "$PLAN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["new_atom_ids"][0])')
@@ -48,8 +58,9 @@ expect "no new atom was retired by the refused apply" "live=$LIVE" "live=$(echo 
 q "update pages set frontmatter = frontmatter - 'tamper' where id = $NEWID" >/dev/null
 
 step "3. clean apply → DONE; receipt restored exactly"
-OUT=$(bun "$OPS/rollback-batch.ts" apply "$L/before.json" "$L/after.json"); echo "$OUT"
+OUT=$(bun "$OPS/rollback-batch.ts" apply "$L/before.json" "$L/after.json"); RC=$?; echo "$OUT"
 expect "apply verdict DONE" "$OUT" '"verdict":"DONE"'
+expect "apply exits 0 on DONE" "rc=$RC" "rc=0"
 R=$(q "select deleted_at is null, updated_at < now() - interval '1 day' or true from pages where id=$RID"); expect "old receipt live again (its before-state)" "$R" "t |"
 
 step "4. idempotent: a second apply is a no-op"
@@ -57,7 +68,8 @@ OUT=$(bun "$OPS/rollback-batch.ts" apply "$L/before.json" "$L/after.json"); expe
 
 step "5. partial state (one row un-rolled by hand) → verify STOP; apply refuses"
 q "update pages set deleted_at = null, frontmatter = frontmatter - 'retired_by' - 'retired_at' where id = $NEWID" >/dev/null
-OUT=$(bun "$OPS/rollback-batch.ts" verify "$L/before.json" "$L/after.json"); expect "verify STOP on a mixed state" "$OUT" '"verdict":"STOP"'
+OUT=$(bun "$OPS/rollback-batch.ts" verify "$L/before.json" "$L/after.json"); RC=$?; expect "verify STOP on a mixed state" "$OUT" '"verdict":"STOP"'
+expect "verify exits 2 on STOP" "rc=$RC" "rc=2"
 OUT=$(bun "$OPS/rollback-batch.ts" apply "$L/before.json" "$L/after.json" 2>&1); expect "apply refuses a mixed state" "$OUT" '"refused"'
 
 step "RESULT: $FAILS failure(s)"; exit $FAILS

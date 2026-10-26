@@ -4,8 +4,9 @@
  *  plan   — print the write set (new / changed ids per table)
  *  apply  — one transaction: lock every row, require it to still equal its captured AFTER state, then mutate; every
  *           statement must affect exactly its id count; any surprise aborts the whole transaction
- *  verify — compare EVERY row against BOTH expected states: all ROLLED-BACK = DONE; all still AFTER = NOT_APPLIED
- *           (safe to apply); anything else (a mix, or a row in neither state) = STOP
+ *  verify — compare EVERY captured row (pages, generations, generation items, transcript state; full captured state, not
+ *           existence) against BOTH expected states: all ROLLED-BACK = DONE (exit 0); all still AFTER = NOT_APPLIED (exit 3,
+ *           safe to apply); anything else = STOP (exit 2). apply exits 0 only when its final verify is DONE.
  * new atoms + receipts → soft-retired (retired_by luna-batch-rollback, retired_at = the purge's 30-day hold);
  * changed existing atoms + receipts → restored to their captured BEFORE state;
  * new generations / items / transcript-state rows → deleted; a changed existing generation or state row → abort.
@@ -19,6 +20,9 @@ type Row = { id: number; deleted_at: string | null; content_hash: string | null;
 const sha = (v: unknown) => createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v)).digest('hex');
 const iso = (d: unknown) => (d ? new Date(d as string).toISOString() : null);
 const pageState = (r: Row) => sha([iso(r.deleted_at), r.content_hash, r.frontmatter, r.compiled_truth]);
+const genState = (g: any) => sha([Number(g.id), g.owner_key, Number(g.generation), g.state, g.run_id ?? null, g.input_pin ?? null, g.item_set_hash]);
+const itemsState = (rows: any[]) => sha(rows.map(i => [Number(i.generation_id), i.item_key, i.identity_hash, i.action, !!i.pending]).sort((a, b) => String(a).localeCompare(String(b))));
+const stateRow = (s: any) => sha([s.file_path, s.content_hash, Number(s.fail_count), !!s.tombstoned, s.partial_input_chars ?? null]);
 const stripRetire = (fm: any) => { const { retired_by: _a, retired_at: _b, ...rest } = fm ?? {}; return rest; };
 /** A new row is rolled back when it is deleted, carries our retirement mark, and is otherwise the AFTER content. */
 const isRetiredFrom = (cur: Row, after: Row) => !!cur.deleted_at && cur.frontmatter?.retired_by === OWN
@@ -37,13 +41,15 @@ export function writeSet(before: Capture, after: Capture) {
   const changedReceipts = [...aR.keys()].filter(id => bR.has(id) && pageState(aR.get(id)!) !== pageState(bR.get(id)!));
   const bg = new Map(before.generations.map(g => [g.id, g]));
   const changedGens = after.generations.filter(g => bg.has(g.id) && sha(g) !== sha(bg.get(g.id))).map(g => g.id);
-  const newGens = after.generations.filter(g => !bg.has(g.id)).map(g => g.id);
-  const newItems = after.items.filter(i => newGens.includes(i.generation_id)).length;
+  const newGenRows = after.generations.filter(g => !bg.has(g.id));
+  const newGens = newGenRows.map(g => g.id);
+  const newItemRows = after.items.filter(i => newGens.includes(i.generation_id));
+  const newItems = newItemRows.length;
   const sk = (s: { file_path: string; content_hash: string }) => `${s.file_path}\u0000${s.content_hash}`;
   const bs = new Map(before.state_rows.map(s => [sk(s), s]));
   const newState = after.state_rows.filter(s => !bs.has(sk(s)));
   const changedState = after.state_rows.filter(s => bs.has(sk(s)) && sha(s) !== sha(bs.get(sk(s)))).length;
-  return { newAtoms, changedAtoms, newReceipts, changedReceipts, newGens, newItems, newState, changedGens, changedState, bA, aA, bR, aR };
+  return { newAtoms, changedAtoms, newReceipts, changedReceipts, newGens, newGenRows, newItems, newItemRows, newState, changedGens, changedState, bA, aA, bR, aR };
 }
 type WS = ReturnType<typeof writeSet>;
 
@@ -59,8 +65,18 @@ async function apply(sql: postgres.Sql, ws: WS) {
       const want = ws.aA.get(id) ?? ws.aR.get(id)!; const c = curBy.get(id);
       if (!c || pageState(c) !== pageState(want)) throw Error(`ABORT: page ${id} changed since the AFTER capture — stop for review`);
     }
-    const gensNow = ws.newGens.length ? await tx`SELECT id FROM derived_generations WHERE id = ANY(${ws.newGens}) FOR UPDATE` : [];
-    exact(gensNow.length, ws.newGens.length, 'lock new generations');
+    // Generations, their items and transcript-state rows must also still equal their captured AFTER state.
+    if (ws.newGens.length) {
+      const gensNow = await tx`SELECT id, owner_key, generation, state, run_id, input_pin, item_set_hash FROM derived_generations WHERE id = ANY(${ws.newGens}) FOR UPDATE`;
+      const want = new Map(ws.newGenRows.map(g => [g.id, genState(g)]));
+      if (gensNow.length !== ws.newGens.length || gensNow.some((g: any) => want.get(Number(g.id)) !== genState(g))) throw Error('ABORT: a new generation changed since the AFTER capture — stop for review');
+      const itemsNow = await tx`SELECT generation_id, item_key, identity_hash, action, pending FROM derived_generation_items WHERE generation_id = ANY(${ws.newGens}) FOR UPDATE`;
+      if (itemsState([...itemsNow]) !== itemsState(ws.newItemRows)) throw Error('ABORT: generation items changed since the AFTER capture — stop for review');
+    }
+    for (const s of ws.newState) {
+      const cur = await tx`SELECT file_path, content_hash, fail_count, tombstoned, partial_input_chars FROM extract_atoms_transcript_state WHERE source_id='default' AND file_path=${s.file_path} AND content_hash=${s.content_hash} FOR UPDATE`;
+      if (cur.length !== 1 || stateRow(cur[0]) !== stateRow(s)) throw Error(`ABORT: transcript state ${s.file_path} changed since the AFTER capture — stop for review`);
+    }
 
     const retire = async (ids: number[], type: string, what: string) => {
       if (ids.length) exact((await tx`UPDATE pages SET deleted_at = now(), frontmatter = frontmatter || jsonb_build_object('retired_by', ${OWN}::text, 'retired_at', now()::text)
@@ -94,11 +110,18 @@ async function verify(sql: postgres.Sql, ws: WS) {
     judge(!!c && isRetiredFrom(c, a), !!c && pageState(c) === pageState(a)); }
   for (const id of [...ws.changedAtoms, ...ws.changedReceipts]) { const c = curBy.get(id), a = (ws.aA.get(id) ?? ws.aR.get(id))!, b = (ws.bA.get(id) ?? ws.bR.get(id))!;
     judge(!!c && pageState(c) === pageState(b), !!c && pageState(c) === pageState(a)); }
-  const gens = ws.newGens.length ? await sql`SELECT id FROM derived_generations WHERE id = ANY(${ws.newGens})` : [];
-  const items = ws.newGens.length ? (await sql`SELECT count(*)::int AS n FROM derived_generation_items WHERE generation_id = ANY(${ws.newGens})`)[0].n : 0;
-  for (const id of ws.newGens) { const present = gens.some((g: any) => Number(g.id) === id); judge(!present, present); }
-  if (ws.newGens.length) judge(items === 0, items === ws.newItems);
-  for (const s of ws.newState) { const n = (await sql`SELECT count(*)::int AS n FROM extract_atoms_transcript_state WHERE source_id='default' AND file_path=${s.file_path} AND content_hash=${s.content_hash}`)[0].n; judge(n === 0, n === 1); }
+  const gens = ws.newGens.length ? await sql`SELECT id, owner_key, generation, state, run_id, input_pin, item_set_hash FROM derived_generations WHERE id = ANY(${ws.newGens})` : [];
+  const gBy = new Map(gens.map((g: any) => [Number(g.id), g]));
+  for (const g of ws.newGenRows) { const c = gBy.get(g.id); judge(!c, !!c && genState(c) === genState(g)); }
+  for (const id of ws.newGens) {
+    const now = await sql`SELECT generation_id, item_key, identity_hash, action, pending FROM derived_generation_items WHERE generation_id = ${id}`;
+    const want = ws.newItemRows.filter(i => i.generation_id === id);
+    judge(now.length === 0, itemsState([...now]) === itemsState(want));
+  }
+  for (const s of ws.newState) {
+    const cur = await sql`SELECT file_path, content_hash, fail_count, tombstoned, partial_input_chars FROM extract_atoms_transcript_state WHERE source_id='default' AND file_path=${s.file_path} AND content_hash=${s.content_hash}`;
+    judge(cur.length === 0, cur.length === 1 && stateRow(cur[0]) === stateRow(s));
+  }
   const count = (k: string) => verdicts.filter(v => v === k).length;
   const verdict = verdicts.length === 0 || count('rolled') === verdicts.length ? 'DONE' : count('after') === verdicts.length ? 'NOT_APPLIED' : 'STOP';
   return { verdict, rolled_back: count('rolled'), still_after: count('after'), neither: count('neither'), total: verdicts.length };
@@ -113,12 +136,13 @@ if (import.meta.main) {
   if (mode === 'plan') { console.log(JSON.stringify({ plan: summary, new_atom_ids: ws.newAtoms, changed_atom_ids: ws.changedAtoms, receipt_ids: [...ws.newReceipts, ...ws.changedReceipts] })); process.exit(0); }
   const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
   try {
+    const code = (v: string) => (v === 'DONE' ? 0 : v === 'NOT_APPLIED' ? 3 : 2);
     if (mode === 'apply') {
       const pre = await verify(sql, ws);
-      if (pre.verdict === 'DONE' && pre.total > 0) { console.log(JSON.stringify({ applied: 'already', ...pre })); }
-      else if (pre.verdict !== 'NOT_APPLIED' && pre.total > 0) { console.log(JSON.stringify({ refused: 'state is neither AFTER nor ROLLED-BACK', ...pre })); process.exitCode = 1; }
-      else { await apply(sql, ws); console.log(JSON.stringify({ applied: summary, ...(await verify(sql, ws)) })); }
-    } else if (mode === 'verify') console.log(JSON.stringify(await verify(sql, ws)));
+      if (pre.verdict === 'DONE') { console.log(JSON.stringify({ applied: 'already', ...pre })); process.exitCode = 0; }
+      else if (pre.verdict !== 'NOT_APPLIED') { console.log(JSON.stringify({ refused: 'state is neither AFTER nor ROLLED-BACK', ...pre })); process.exitCode = 2; }
+      else { await apply(sql, ws); const post = await verify(sql, ws); console.log(JSON.stringify({ applied: summary, ...post })); process.exitCode = code(post.verdict); }
+    } else if (mode === 'verify') { const v = await verify(sql, ws); console.log(JSON.stringify(v)); process.exitCode = code(v.verdict); }
     else throw Error('mode: plan | apply | verify');
   } finally { await sql.end(); }
 }

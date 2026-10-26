@@ -134,3 +134,26 @@ test('real pinned detectors: a synthetic token is caught by both; clean prose pa
   expect(await scan('The parser reads output_item.done when completed.output is empty.', cfg)).toEqual({ clean: true });
   expect(await scan('anything', { ...cfg, redactor_sha256: '0'.repeat(64) })).toEqual({ error: 'redactor_failed' });
 }, 60_000);
+
+test('halt latch: the first stop-class event trips it; later requests never reach upstream until cleared', async () => {
+  const { UpstreamError } = await import('./upstream.ts');
+  const { rmSync, existsSync: ex } = await import('node:fs');
+  let fail = true;
+  const s = setup({ upstream: async () => { if (fail) throw new UpstreamError('REQUEST-TIMEOUT'); return { status: 200, raw: Buffer.from(planStream('[]')), charCapHit: false }; } });
+  expect((await s.post(ok)).status).toBe(502);                       // unknown_completion trips the latch
+  expect(ex(join(s.dir, 'halted.json'))).toBe(true);
+  fail = false;
+  const r = await s.post(ok); expect(r.status).toBe(429); expect((await r.json()).error.code).toBe('bridge_halted');
+  expect(s.calls.length).toBe(1);                                    // the refused request made no upstream call
+  const st = await (await s.h(new Request('http://127.0.0.1/v1/bridge/status', { headers: { authorization: `Bearer ${SECRET}` } }))).json();
+  expect(st.halted.code).toBe('unknown_completion');
+  rmSync(join(s.dir, 'halted.json'));                                // operator clears it
+  expect((await s.post(ok)).status).toBe(200);
+});
+
+test('halt latch: non-stop errors (busy, leak quarantine, provider limits) do not trip it', async () => {
+  const s = setup({ scan: async () => ({ clean: false, detector: 'redactor', rules: ['2'] }) });
+  expect((await s.post(ok)).status).toBe(503);
+  const { existsSync: ex } = await import('node:fs');
+  expect(ex(join(s.dir, 'halted.json'))).toBe(false);
+});
