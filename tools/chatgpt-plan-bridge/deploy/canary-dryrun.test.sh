@@ -57,4 +57,15 @@ out=$(run F); expect "F captures before for the new attempt" "$out" '"preflight"
 out=$(run K); expect "K refuses before H ran" "$out" "H has not run"
 cp -p "$A2/before.json" "$A2/after.json"   # stand-in AFTER: only to reach resume's rating gate
 out=$(run resume); expect "resume refuses without a rating PASS" "$out" "no rating PASS"
+# S maps exits mechanically: invalid labels STOP (never a score), a scored FAIL writes no PASS, only a real PASS writes it.
+R2=$A2/rating; mkdir -p "$R2"; printf '{"aaaaaaaa": {"atom_id": 1, "part": "part-01", "verified": true}, "bbbbbbbb": {"atom_id": 2, "part": "part-01", "verified": true}}' > "$R2/key.json"
+lab() { rm -f "$R2/$1"; printf '{"bid": "aaaaaaaa", "part": "part-01", "fidelity": %s, "generic": false, "claim_key": "a", "evidence": "", "reason": "r"}\n{"bid": "bbbbbbbb", "part": "part-01", "fidelity": "%s", "generic": false, "claim_key": "b", "evidence": "", "reason": "r"}\n' "$2" "$3" > "$R2/$1"; }
+lab labels-r1.jsonl '[]' supported; lab labels-r2-pebble.jsonl '"supported"' supported
+out=$(run S); expect "S stops on unscorable labels (fidelity [] is invalid, never a FAIL)" "$out" "was not scored (exit 2)"
+lab labels-r1.jsonl '"supported"' unsupported
+out=$(run S); expect "S reports a scored FAIL" "$out" "ACCEPTANCE (rating): FAIL"
+expect "a scored FAIL writes no rating/PASS" "$(ls "$R2/PASS" 2>&1)" "No such file"
+lab labels-r1.jsonl '"supported"' supported
+out=$(run S); expect "S passes only when both raters pass" "$out" "ACCEPTANCE (rating): PASS"
+expect "rating/PASS written" "$(ls "$R2/PASS" 2>&1)" "$R2/PASS"
 echo "RESULT: $FAILS failure(s)"; exit $FAILS

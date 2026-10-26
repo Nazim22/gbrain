@@ -68,8 +68,7 @@ A) step "install the bridge service from $WANT"
 V) step "verify the INSTALLED bridge is these reviewed bytes and its controls are intact (reuse instead of A)"
    python3 -I "$W/tools/chatgpt-plan-bridge/deploy/verify_install.py" "$W"
    for u in chatgpt-plan-bridge.service chatgpt-plan-bridge-egress.timer; do s=$(systemctl is-active "$u" || true); echo "$u: $s"; [[ $s == active ]] || { echo "REFUSE: $u not active"; exit 1; }; done
-   nft list chain inet filter cpbridge_egress | grep -E 'tcp dport 443 accept|drop$'
-   [[ $(nft list chain inet filter cpbridge_egress | grep -c -E 'counter packets [0-9]+ bytes [0-9]+ drop$') == 1 ]] || { echo "REFUSE: egress chain lost its final drop"; exit 1; }
+   python3 -I "$W/tools/chatgpt-plan-bridge/deploy/verify_live.py" "$W"     # effective egress confinement + running process identity
    code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/bridge/status"); [[ $code == 401 ]] || { echo "REFUSE: unauthenticated status=$code (want 401)"; exit 1; }; echo "no-secret status=401 OK"
    bridge_status | python3 -I -c 'import json,sys; d=json.load(sys.stdin); assert d.get("halted") is None, "bridge latch set"; assert d["routes"] == ["gpt-6-luna@medium"], d["routes"]; print("with-secret status=200 OK, latch clear, routes", d["routes"])' ;;
 B) step "one real call through gbrain's gateway (synthetic prompt)"
@@ -183,7 +182,8 @@ S) step "score: seal both raters' labels, score each (DESIGN §8 r5); rating/PAS
    for f in labels-r1.jsonl labels-r2-pebble.jsonl; do [[ -s $R/$f ]] || { echo "REFUSE: $R/$f missing"; exit 1; }; chmod 0444 "$R/$f"; sha256sum "$R/$f"; done
    for f in labels-r1.jsonl labels-r2-pebble.jsonl; do
      echo "== $f"; set +e; python3 -I "$OPS/score.py" "$R/key.json" "$R/$f"; r=$?; set -e
-     [[ $r -le 1 ]] || { echo "STOP: invalid labels in $f (exit $r): fix the labels, never the score"; exit 2; }; [[ $r == 0 ]] || rc=1
+     # 0 = scored PASS, 10 = scored FAIL; anything else (2 invalid labels, 3 error, 1 a crash) is never a score
+     [[ $r == 0 || $r == 10 ]] || { echo "STOP: $f was not scored (exit $r): fix the labels or the kit, never the score"; exit 2; }; [[ $r == 0 ]] || rc=1
    done
    if [[ $rc == 0 ]]; then (set -o noclobber; date -u +%FT%TZ > "$R/PASS"); echo "ACCEPTANCE (rating): PASS -> resume"; else echo "ACCEPTANCE (rating): FAIL -> rollback"; fi
    exit $rc ;;
