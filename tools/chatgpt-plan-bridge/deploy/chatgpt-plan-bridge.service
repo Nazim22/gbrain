@@ -1,0 +1,32 @@
+[Unit]
+Description=chatgpt-plan-bridge (Chat Completions on 127.0.0.1 over the official Sign in with ChatGPT route)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cpbridge
+Group=cpbridge
+# Per-uid egress (443 + DNS + loopback replies to our own listener only), installed as root, removed on stop.
+ExecStartPre=+/opt/chatgpt-plan-bridge/current/egress.sh add
+ExecStart=/opt/chatgpt-plan-bridge/current/bun /opt/chatgpt-plan-bridge/current/bridge.js /etc/chatgpt-plan-bridge/config.json
+ExecStopPost=+/opt/chatgpt-plan-bridge/current/egress.sh remove
+Restart=on-failure
+RestartSec=10
+# Sandbox
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/chatgpt-plan-bridge
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryMax=1G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
