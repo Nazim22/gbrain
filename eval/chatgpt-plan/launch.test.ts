@@ -44,3 +44,12 @@ test('cloudArms binds run-go cloud_models to exact allowlisted ids',async()=>{
  expect(cloudArms(['gpt-6-luna','gpt-6.1-sol'])).toEqual(['luna','sol']);
  for(const bad of [[],['gpt-6-luna','gpt-6-luna'],['gpt-6-sol'],'gpt-6-luna',[1]])expect(()=>cloudArms(bad)).toThrow('CLOUD-MODELS');
 });
+test('a cloud_models run requires a matching sealed protocol addendum',async()=>{
+ const { addendumOk } = await import('./cli.ts');const { sha } = await import('./harness.ts');
+ const doc=Buffer.from('addendum');
+ expect(addendumOk({},undefined)).toBe(true);
+ expect(addendumOk({cloud_models:['gpt-6-luna','gpt-6.1-sol']},doc)).toBe(false);
+ expect(addendumOk({cloud_models:['gpt-6-luna','gpt-6.1-sol'],protocol_addendum_sha256:sha(doc)},undefined)).toBe(false);
+ expect(addendumOk({cloud_models:['gpt-6-luna','gpt-6.1-sol'],protocol_addendum_sha256:sha(Buffer.from('other'))},doc)).toBe(false);
+ expect(addendumOk({cloud_models:['gpt-6-luna','gpt-6.1-sol'],protocol_addendum_sha256:sha(doc)},doc)).toBe(true);
+});

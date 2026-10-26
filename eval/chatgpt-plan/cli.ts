@@ -58,6 +58,11 @@ export function cloudArms(models:unknown):CloudArm[] {
  if(!Array.isArray(list)||!list.length||new Set(list).size!==list.length)throw Error('CLOUD-MODELS');
  return list.map(m=>{const arm=(Object.keys(CLOUD_MODELS) as CloudArm[]).find(a=>CLOUD_MODELS[a].model===m);if(!arm)throw Error('CLOUD-MODELS');return arm;});
 }
+/** A non-default cloud-model run must be bound to a sealed protocol addendum (corpus/PROTOCOL-ADDENDUM.md) by hash. */
+export function addendumOk(grant:any, addendum:Buffer|undefined) {
+ if(grant.cloud_models===undefined)return true;
+ return typeof grant.protocol_addendum_sha256==='string' && addendum!==undefined && sha(addendum)===grant.protocol_addendum_sha256;
+}
 async function main() {
  const command=process.argv[2],store=new TokenStore(join(ROOT,'auth'));
  if(command==='probe')return probes(false);
@@ -74,6 +79,8 @@ async function main() {
  const manifest=await readFile(join(ROOT,'corpus','manifest.json'));
  const head=(await readFile(join(ROOT,'code','BUILD-HEAD'),'utf8')).trim();
  if(grant.outbound_data_go!==true||grant.run_go!==true||grant.credits_off!==true||!(grant.weekly_cap_percent>0&&grant.weekly_cap_percent<=100)||grant.manifest_sha256!==sha(manifest)||grant.object_head!==head||!grant.cap_evidence_sha256)throw Error('RUN-GO-REQUIRED');
+ const addendum=grant.cloud_models===undefined?undefined:await readFile(join(ROOT,'corpus','PROTOCOL-ADDENDUM.md')).catch(()=>undefined);
+ if(!addendumOk(grant,addendum))throw Error('PROTOCOL-ADDENDUM');
  const capEvidence=await readFile(join(ROOT,'corpus','allowance-evidence'));if(sha(capEvidence)!==grant.cap_evidence_sha256)throw Error('ALLOWANCE-EVIDENCE');
  const parts=await loadCorpus(join(ROOT,'corpus')),out=new Evidence(join(ROOT,'out',new Date().toISOString().replaceAll(':','-')));await out.prepare();
  await out.put('go.json',JSON.stringify(grant));const budget=new Budget();

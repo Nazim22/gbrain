@@ -51,8 +51,9 @@ export function fixedEndpoint(url:string) {
 }
 export function requestOptions(method:'GET'|'POST',headers:Record<string,string>) { return {agent:false as const,method,headers}; }
 /** Native transport has no redirects, proxy environment, SDK retries, or error-body logging. */
-export const send:Sender = (url, body, headers={}, bounds=LIMITS.luna) => new Promise((resolve,reject)=>{
-  fixedEndpoint(url);
+export const send:Sender = (url, body, headers={}, bounds=LIMITS.luna) => {fixedEndpoint(url);return transport(url,body,headers,bounds);};
+/** The socket/timer path under send(), after the endpoint allowlist. Exported only so tests can drive it on a stub. */
+export const transport:Sender = (url, body, headers={}, bounds=LIMITS.luna) => new Promise((resolve,reject)=>{
   const data=body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body);
   let finished=false, size=0; const chunks:Buffer[]=[];
   const fail=(code:string)=>{if(finished)return;finished=true;clearTimeout(connect);clearTimeout(deadline);req.destroy();reject(Object.assign(Error(code),{raw:Buffer.concat(chunks)}));};
