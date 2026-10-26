@@ -28,7 +28,7 @@ source /root/.gbrain/pg.env; export PGHOST=127.0.0.1 PGPORT=5432 PGUSER=gbrain P
 FAILS=0
 run() { bash "$BS" "$@" "$HEAD" 2>&1; }
 runb() { local s=$1; shift; bash "$BS" "$s" "$HEAD" "$@" 2>&1; }
-expect() { if [[ "$2" == *"$3"* ]]; then echo "OK   $1"; else echo "FAIL $1: wanted '$3' in: $(echo "$2" | tail -4)"; FAILS=$((FAILS+1)); fi; }
+expect() { if [[ "$2" == *"$3"* ]]; then echo "OK   $1"; else echo "FAIL $1: wanted '$3' in: $(echo "$2" | tail -12)"; FAILS=$((FAILS+1)); fi; }
 adm() { psql -XAt -c "select value from config where key='cycle.extract_atoms.admit_hashes_file'"; }
 corpus_n() { psql -XAt -c "select count(*) from config where key='dream.synthesize.session_corpus_dir'"; }
 labels() {   # synthetic blind labels: every atom supported, schema exact
