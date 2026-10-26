@@ -2,7 +2,7 @@
 # Session-end: convert Claude Code session .jsonl -> clean conversation .txt
 # into the gbrain corpus, so the hourly dream extracts atoms+concepts from
 # real lived sessions (Option C, forward-only). S300. Local-only, no LLM.
-import json, sys, os, glob, re, time
+import json, sys, os, glob, re, time, datetime
 SRC_DIR="/root/.claude/projects/-root"
 OUT_DIR="/root/.claude/projects/-root/session-text"  # under corpus dir → dream picks .txt up
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -74,7 +74,7 @@ def redact_text(txt, known=frozenset()):
     return txt
 def convert(jsonl):
     sid=os.path.basename(jsonl).replace(".jsonl","")
-    turns=[]
+    turns=[]; stamps=[]
     for line in open(jsonl, errors="replace"):
         try: o=json.loads(line)
         except: continue
@@ -91,20 +91,45 @@ def convert(jsonl):
         txt=re.sub(r'<system-reminder>.*?</system-reminder>','',txt,flags=re.S).strip()
         if len(txt)<15: continue
         turns.append(("User" if role=="user" else "Assistant")+": "+txt)
+        stamps.append(o.get("timestamp"))
     if len(turns)<4: return None  # trivial session, skip
     # S523 URI passwords + S552 env/JSON/YAML/PEM/known-format secrets. Per turn (a fail-safe unterminated PEM stays inside its
     # turn), with values labeled anywhere in the session also redacted where they appear bare in another turn.
     known=set().union(*(secret_values(t) for t in turns))
-    body="\n\n".join(redact_text(t, known) for t in turns)
+    red=[redact_text(t, known) for t in turns]
+    body="\n\n".join(red)
+    starts=[]; off=0
+    for t in red: starts.append(off); off+=len(t)+2
     # cap per-file at 40k chars; split into parts so whole session is covered
     parts=[body[i:i+16000] for i in range(0,len(body),16000)] or [body]
-    written=[]
+    # S553: a new part is named by the UTC date of the first turn that starts inside it, as a leading
+    # YYYY-MM-DD (the prefix gbrain reads as the file's date); a part that already exists keeps its name.
+    # Every path is resolved before any write, so a refused part leaves the session's files untouched.
+    plan=[]
     for i,p in enumerate(parts):
         suffix="" if len(parts)==1 else f".part{i+1}"
-        fn=f"{OUT_DIR}/session-{sid}{suffix}.txt"
+        first=next((k for k,s in enumerate(starts) if i*16000<=s<(i+1)*16000), None)
+        plan.append((part_path(sid, suffix, utc_date(stamps[first]) if first is not None else None), suffix, p))
+    written=[]
+    for fn,suffix,p in plan:
         open(fn,"w").write(f"# Pingu session {sid}{suffix}\n\n{p}")
         written.append(fn)
     return written
+def utc_date(ts):
+    """UTC YYYY-MM-DD of an ISO timestamp with a zone; None when missing, zone-less or invalid."""
+    try: t=datetime.datetime.fromisoformat(str(ts).replace("Z","+00:00"))
+    except ValueError: return None
+    return t.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d") if t.tzinfo else None
+def part_path(sid, suffix, day):
+    """The file for one (session, part): the existing legacy or dated name, else the dated name for a new part
+    (legacy when there is no date). Both names existing at once is refused, never resolved by guessing."""
+    legacy=f"{OUT_DIR}/session-{sid}{suffix}.txt"
+    dated=[f for f in glob.glob(f"{OUT_DIR}/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-session-{glob.escape(sid)}{suffix}.txt")]
+    if os.path.exists(legacy) and dated or len(dated)>1:
+        raise RuntimeError(f"two files for session {sid}{suffix}: {[legacy]+dated if os.path.exists(legacy) else dated}")
+    if os.path.exists(legacy): return legacy
+    if dated: return dated[0]
+    return f"{OUT_DIR}/{day}-session-{sid}{suffix}.txt" if day else legacy
 def is_quiet(jsonl, minutes=20):
     """A session still being written to is NOT safe to convert."""
     return (time.time() - os.path.getmtime(jsonl)) > minutes*60
@@ -112,7 +137,7 @@ def is_quiet(jsonl, minutes=20):
 def already_converted(jsonl):
     """Converted AFTER its last write ⇒ nothing new to stage."""
     sid=os.path.basename(jsonl).replace(".jsonl","")
-    outs=glob.glob(f"{OUT_DIR}/session-{sid}*.txt")
+    outs=glob.glob(f"{OUT_DIR}/*session-{glob.escape(sid)}*.txt")  # S553: legacy or dated names
     if not outs: return False
     return max(os.path.getmtime(o) for o in outs) >= os.path.getmtime(jsonl)
 
@@ -127,7 +152,8 @@ if __name__=="__main__":
         n=0
         for f in sorted(glob.glob(f"{SRC_DIR}/*.jsonl")):
             if not is_quiet(f) or already_converted(f): continue
-            w=convert(f)
+            try: w=convert(f)
+            except RuntimeError as e: print(f"[session-ingest:sweep] REFUSED {os.path.basename(f)}: {e}"); continue
             if w: n+=1; print(f"[session-ingest:sweep] {os.path.basename(f)} -> {len(w)} file(s)")
         print(f"[session-ingest:sweep] staged {n} previously-unconverted session(s)")
         sys.exit(0)
