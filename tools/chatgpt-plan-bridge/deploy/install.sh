@@ -18,7 +18,10 @@ for p in /srv/chatgpt-plan-bridge /srv/chatgpt-plan-bridge/auth /srv/chatgpt-pla
   [[ ! -L $p ]] || { echo "refusing: $p is a symlink"; exit 1; }
 done
 install -d -m 0755 -o root -g root /opt/chatgpt-plan-bridge "$OPT" "$OPT/detectors" /etc/chatgpt-plan-bridge
-install -d -m 0700 -o cpbridge -g cpbridge /srv/chatgpt-plan-bridge /srv/chatgpt-plan-bridge/auth /srv/chatgpt-plan-bridge/state /srv/chatgpt-plan-bridge/tmp
+# The bridge home is ROOT-owned: the bridge user owns only the leaf dirs, so it can never swap a path component that
+# root later acts on (no check-then-use race on re-install).
+install -d -m 0755 -o root -g root /srv/chatgpt-plan-bridge
+install -d -m 0700 -o cpbridge -g cpbridge /srv/chatgpt-plan-bridge/auth /srv/chatgpt-plan-bridge/state /srv/chatgpt-plan-bridge/tmp
 
 step "bundle + detectors (root-owned, read-only to the bridge)"
 (cd "$W" && /root/.bun/bin/bun build tools/chatgpt-plan-bridge/main.ts --target=bun --outfile "$OPT/bridge.js")
@@ -72,7 +75,10 @@ for name in ('credentials.json', 'host.json'):
     finally: os.close(out)
     if read_nofollow(f'{src}/{name}') != data: raise SystemExit(f'changed during move: {name}')
 fd = os.open(f'{src}/credentials.json', os.O_WRONLY | os.O_NOFOLLOW)
-try: os.write(fd, b'\0' * os.fstat(fd).st_size); os.fsync(fd)
+try:
+    st = os.fstat(fd)  # re-check on THIS handle: the eval user owns the directory and could have swapped the file
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != ev.pw_uid or st.st_nlink != 1: raise SystemExit('refuse overwrite')
+    os.write(fd, b'\0' * st.st_size); os.fsync(fd)
 finally: os.close(fd)
 os.unlink(f'{src}/credentials.json')
 print('sign-in moved to', dst)

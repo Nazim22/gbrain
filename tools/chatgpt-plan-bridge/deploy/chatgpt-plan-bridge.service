@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 User=cpbridge
 Group=cpbridge
+# HOME is a bridge-owned leaf dir; the home root itself is root-owned (see install.sh).
+Environment=HOME=/srv/chatgpt-plan-bridge/state
 # Per-uid egress (443 + DNS + loopback replies to our own listener only), installed as root, removed on stop.
 ExecStartPre=+/opt/chatgpt-plan-bridge/current/egress.sh add
 ExecStart=/opt/chatgpt-plan-bridge/current/bun /opt/chatgpt-plan-bridge/current/bridge.js /etc/chatgpt-plan-bridge/config.json
@@ -18,7 +20,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/srv/chatgpt-plan-bridge
+ReadWritePaths=/srv/chatgpt-plan-bridge/auth /srv/chatgpt-plan-bridge/state /srv/chatgpt-plan-bridge/tmp
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
