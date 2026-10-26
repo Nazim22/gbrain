@@ -36,10 +36,11 @@ def snapshot(after, paths):
 
 def retry_outcome(path, retry_paths):
     """R's single dream outcome, structurally complete and final, or ValueError (= unknown outcome, STOP).
-    Mirrors the real runs: one extract_atoms phase; processed + failures == admitted (G batch 01: 100+0, batch 02: 99+1)."""
+    Mirrors the real runs: schema_version is the STRING '1'; one extract_atoms phase; processed + failures == admitted
+    (G batch 01: 100+0, batch 02: 99+1). test_retry_plan.py pins both real outcomes as positive controls."""
     d = json.load(open(path))   # zero-byte / truncated / non-JSON raises
     ph = d.get('phases') if isinstance(d, dict) else None
-    if not isinstance(d, dict) or d.get('schema_version') != 1 or not isinstance(ph, list) or len(ph) != 1 \
+    if not isinstance(d, dict) or d.get('schema_version') != '1' or not isinstance(ph, list) or len(ph) != 1 \
             or ph[0].get('phase') != 'extract_atoms' or not isinstance(ph[0].get('details'), dict):
         raise ValueError('retry outcome is not one extract_atoms phase of schema 1')
     det = ph[0]['details']
