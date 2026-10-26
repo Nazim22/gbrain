@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/launcher-lifecycle.sh"
 # S552: own one per-run chain/jump; never flush the shared table or change other UIDs.
 rules() {
   local uid=$1 resolver=$2 chain=$3 profile=${4:-evaluation} family=ip
@@ -8,7 +9,8 @@ rules() {
   [[ $resolver =~ ^[0-9a-fA-F.:]+$ ]] || return 2
   [[ $resolver != *:* ]] || family=ip6
   printf 'add chain inet filter %s\n' "$chain"
-  printf 'add rule inet filter output meta skuid %s jump %s comment "%s"\n' "$uid" "$chain" "$chain"
+  printf 'add chain inet filter %s_gate { type filter hook output priority -10; policy accept; }\n' "$chain"
+  printf 'add rule inet filter %s_gate meta skuid %s jump %s comment "%s"\n' "$chain" "$uid" "$chain" "$chain"
   printf 'add rule inet filter %s ip daddr 127.0.0.1 tcp dport 8084 accept\n' "$chain"
   printf 'add rule inet filter %s %s daddr %s udp dport 53 accept\n' "$chain" "$family" "$resolver"
   printf 'add rule inet filter %s %s daddr %s tcp dport 53 accept\n' "$chain" "$family" "$resolver"
@@ -32,32 +34,45 @@ if [[ $mode == rehearse* ]]; then
 fi
 src=$(cd "$(dirname "$0")/../.." && pwd)
 root=/srv/gbrain-eval
+lockdir=/run/gbrain-eval-launch
+[[ ! -L $lockdir ]] || exit 1
+install -d -m 0700 -o root -g root "$lockdir"
+marker=$lockdir/pending
+acquire_owner "$lockdir/lock" "$marker"
 run=s552_$(date -u +%Y%m%d%H%M%S)_$$
 unit=gbrain-eval-${run//_/-}
 installed=0
+started=0
+marker_owned=0
 stub_pid=
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
-  systemctl stop "$unit.service" >/dev/null 2>&1 || true
   if [[ -n $stub_pid ]]; then kill "$stub_pid" 2>/dev/null || true; wait "$stub_pid" 2>/dev/null || true; fi
+  if ((started)) && ! stop_confirmed "$unit" "$uid"; then
+    printf 'HOLD: cessation unknown; retaining confinement and pending ownership for %s\n' "$unit"
+    exit 1
+  fi
   if ((installed)) && nft list chain inet filter "$run" >/dev/null 2>&1; then
-    while read -r handle; do nft delete rule inet filter output handle "$handle"; done < <(nft -j -a list chain inet filter output | python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join(str(x["rule"]["handle"]) for x in d["nftables"] if "rule" in x and x["rule"].get("comment")==sys.argv[1]))' "$run")
-    nft delete chain inet filter "$run"
+    printf 'delete chain inet filter %s_gate\ndelete chain inet filter %s\n' "$run" "$run" | nft -f -
   fi
   local remaining
-  remaining=$(nft -j -a list table inet filter | python3 -c 'import json,sys; d=json.load(sys.stdin); name=sys.argv[1]; print(sum(1 for x in d["nftables"] if any(isinstance(v,dict) and (v.get("name")==name or v.get("comment")==name or v.get("chain")==name) for v in x.values())))' "$run")
+  remaining=$(nft -j -a list table inet filter | python3 -c 'import json,sys; d=json.load(sys.stdin); names={sys.argv[1],sys.argv[1]+"_gate"}; print(sum(1 for x in d["nftables"] if any(isinstance(v,dict) and any(v.get(k) in names for k in ("name","comment","chain")) for v in x.values())))' "$run")
   printf 'cleanup run=%s owned_rules_and_chains=%s\n' "$run" "$remaining"
-  [[ $remaining == 0 ]] || status=1
+  [[ $remaining == 0 ]] || { printf 'HOLD: cleanup residue; retaining pending ownership\n'; exit 1; }
+  if ((marker_owned)); then rm -- "$marker"; fi
   exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+(umask 0077; printf '%s\n' "$run $unit" > "$marker")
+marker_owned=1
 if ! getent passwd gbrain-eval >/dev/null; then useradd --system --user-group --no-create-home --shell /usr/sbin/nologin gbrain-eval; fi
 uid=$(id -u gbrain-eval)
 [[ $(id -G gbrain-eval) == "$(id -g gbrain-eval)" ]] || { printf 'supplementary groups refused\n' >&2; exit 1; }
 [[ $(getent passwd gbrain-eval | cut -d: -f7) == /usr/sbin/nologin ]] || exit 1
+uid_empty "$uid" || { printf 'HOLD: evaluation UID already has processes\n' >&2; exit 1; }
 install -d -m 0755 -o root -g root "$root" "$root/code" "$root/corpus"
 install -d -m 0700 -o gbrain-eval -g gbrain-eval "$root/out" "$root/auth"
 # Do not reuse mutable runtime code or inherited secrets. Copies are root-owned, not a symlink to /root.
@@ -82,6 +97,7 @@ properties=(--uid=gbrain-eval --gid=gbrain-eval -p ProtectHome=yes -p ProtectSys
  -p PrivateTmp=yes -p NoNewPrivileges=yes -p 'RestrictAddressFamilies=AF_INET AF_INET6' -p MemoryMax=2G
  -p 'SupplementaryGroups=' -p UMask=0077 -p "WorkingDirectory=$root/code")
 inside() {
+ started=1
  systemd-run --unit="$unit" --wait --pipe --collect "${properties[@]}" /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent TMPDIR="$root/out" /usr/local/bin/bun "$root/code/eval/chatgpt-plan/cli.ts" "$@"
 }
 if [[ $mode == rehearse* ]]; then

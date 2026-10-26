@@ -26,11 +26,24 @@ remain separate objects; this harness does not issue a quality/adoption verdict.
 
 Public HTTPS is not OpenAI-only. The adapter's native HTTP transport admits only
 fixed exact endpoint strings, never redirects, never proxy environment variables,
-and never SDK retries. The nft output jump matches only `gbrain-eval`'s UID.
-Order: Gemma exception; resolver-only UDP/TCP DNS; IPv4 nonpublic drops; IPv6
-nonpublic drops; public TCP 443; counted catch-all drop. Cleanup selects the jump
-by its unique run comment/handle and removes that chain only. No shared flush.
-The firewall and user are provisioned only by the launcher, not by tests.
+and never SDK retries. A run-owned output base chain at priority -10 matches only
+`gbrain-eval`'s UID and jumps to that run's confinement chain. An accept in another
+base chain cannot skip the confinement drop; allowed traffic still traverses the
+other base chains, preserving their drops. Per-UID order: Gemma exception;
+resolver-only UDP/TCP DNS; IPv4 nonpublic drops; IPv6 nonpublic drops; public TCP
+443; counted catch-all drop. Cleanup atomically removes only the two named
+run-owned chains; no shared output-rule edit, policy replacement or shared flush.
+
+Every launcher mode acquires the same root-only `/run/gbrain-eval-launch/lock`
+before staging or installing rules and holds its stable inode through cleanup.
+The root-only `pending` record survives crashes/unknown teardown: another launcher
+refuses to stage while it exists, even after the flock releases. It is a recovery
+latch, not an authorization artifact. Cleanup requires affirmative inactive/failed
+unit readback with zero main/control PIDs and an empty dedicated-UID process census
+before removing containment. Stop/readback/census uncertainty leaves the rules and
+pending record intact and exits HOLD. Reconcile that exact run and obtain review
+before manually clearing an unresolved record; never delete the lock inode.
+The firewall and user are provisioned only by the launcher, not by stubbed tests.
 
 The environment is reset before starting Bun; HOME is inaccessible and there are
 no inherited provider keys/config/DB URLs. All design sandbox properties are in
