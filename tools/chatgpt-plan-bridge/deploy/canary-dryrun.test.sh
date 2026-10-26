@@ -68,4 +68,42 @@ expect "a scored FAIL writes no rating/PASS" "$(ls "$R2/PASS" 2>&1)" "No such fi
 lab labels-r1.jsonl '"supported"' supported
 out=$(run S); expect "S passes only when both raters pass" "$out" "ACCEPTANCE (rating): PASS"
 expect "rating/PASS written" "$(ls "$R2/PASS" 2>&1)" "$R2/PASS"
+# Stage 2 (STAGE2-DESIGN r3): E takes a frozen slice (CANARY_MANIFEST) all or nothing; every refusal removes only its
+# own new attempt dir. Fixtures come from the last attempt's own read-only inventory of the live corpus.
+echo "test-closed" > "$A2/closed"
+SM="$OUT/supplied"; mkdir -p "$SM"
+python3 -I - "$A2" "$SM" "$A/canary.manifest" <<'PY'
+import glob, json, os, sys
+a2, sm, hist = sys.argv[1:4]
+exposed_h, exposed_p = set(), set()
+for m in glob.glob(os.path.join(os.path.dirname(a2), 'attempt-*/canary.manifest')):
+    for l in open(m).read().splitlines(): h, p = l.split('\t'); exposed_h.add(h); exposed_p.add(p)
+miss = [l.split('\t') for l in open(f'{a2}/inventory/missing.manifest').read().splitlines()]
+fresh = [(h, p) for h, p in miss if h not in exposed_h and p not in exposed_p]
+ext = [(r['hash16'], r['path']) for r in json.load(open(f'{a2}/inventory/inventory.json'))['rows'] if r['class'] == 'extracted']
+assert len(fresh) >= 104 and ext, (len(fresh), len(ext))
+w = lambda n, rows: open(f'{sm}/{n}', 'w').write(''.join(f'{h}\t{p}\n' for h, p in rows))
+w('ok.manifest', fresh[:3])
+w('oversized.manifest', fresh[3:104])
+w('duplicate.manifest', [fresh[3], fresh[3]])
+open(f'{sm}/malformed.manifest', 'w').write('zz\t/x\n')
+w('changed.manifest', [(fresh[4][0][:15] + ('0' if fresh[4][0][-1] != '0' else '1'), fresh[4][1])])   # hash no longer the file's bytes
+w('exposed.manifest', [open(hist).read().splitlines()[0].split('\t')])                         # an earlier attempt's pair
+w('alias.manifest', [fresh[5]])
+open(f'{sm}/alias.renames', 'w').write(f"{open(hist).read().splitlines()[1].split(chr(9))[1]}\t{fresh[5][1]}\t-\t-\t-\n")   # its other name was exposed
+w('extracted.manifest', [ext[0]])
+print('fixtures written')
+PY
+n0=$(ls -d "$OUT"/attempt-* | wc -l)
+sup() { local f=$1; shift; sleep 1; CANARY_MANIFEST="$SM/$f" "$@" bash "$C" E "$HEAD" 2>&1; }
+out=$(sup oversized.manifest);  expect "E refuses an oversized slice (101 pairs)" "$out" "supplied manifest has 101 pairs"
+out=$(sup duplicate.manifest);  expect "E refuses a duplicate pair" "$out" "duplicate hash or path"
+out=$(sup malformed.manifest);  expect "E refuses a malformed line" "$out" "malformed supplied line"
+out=$(sup changed.manifest);    expect "E refuses a pair whose bytes changed" "$out" "bytes changed or unreadable"
+out=$(sup exposed.manifest);    expect "E refuses a previously exposed pair (hash/path)" "$out" "previously exposed"
+out=$(CANARY_RENAMES="$SM/alias.renames" sup alias.manifest); expect "E refuses a pair exposed under its other name" "$out" "previously exposed"
+out=$(sup extracted.manifest);  expect "E refuses a pair that is no longer MISSING" "$out" "no longer MISSING"
+expect "refused supplied E removed only its own new dirs" "$(ls -d "$OUT"/attempt-* | wc -l)" "$n0"
+out=$(sup ok.manifest);         expect "E accepts a valid frozen slice" "$out" "attempt: $OUT/attempt-"
+A3=$(cat "$OUT/ATTEMPT"); expect "the attempt manifest IS the supplied slice" "$(cmp "$SM/ok.manifest" "$A3/canary.manifest" && echo same)" "same"
 echo "RESULT: $FAILS failure(s)"; exit $FAILS

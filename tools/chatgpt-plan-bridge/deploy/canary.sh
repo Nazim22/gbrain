@@ -94,7 +94,7 @@ p = sys.argv[2]; c = json.load(open(p)); c.setdefault('provider_base_urls', {})[
 tmp = p + '.tmp'; json.dump(c, open(tmp, 'w'), indent=2); os.chmod(tmp, 0o600); os.replace(tmp, p); print('provider_base_urls.litellm =', c['provider_base_urls']['litellm'])
 PY
    ;;
-E) step "new attempt: fresh read-only inventory; manifest = 20 MISSING never exposed by an earlier attempt, lowest sha256(hash16)"
+E) step "new attempt: fresh read-only inventory; manifest = 20 MISSING never exposed by an earlier attempt, lowest sha256(hash16) (stage 2: the CANARY_MANIFEST slice, all or nothing)"
    if [[ -s "$D/ATTEMPT" ]]; then prev=$(< "$D/ATTEMPT"); [[ -e "$prev/closed" ]] || { echo "REFUSE: previous attempt $prev is still open (resume or rollback it)"; exit 1; }; fi
    A="$D/attempt-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -m 0700 "$A"            # fails if it exists: no clobber
    # set -e does not apply inside an if-tested function: every step returns explicitly. On failure the new (empty of any
@@ -102,9 +102,10 @@ E) step "new attempt: fresh read-only inventory; manifest = 20 MISSING never exp
    new_manifest() {
      bun "$OPS/inventory.ts" "$CORPUS" "$A/inventory" > "$A/inventory.out" || return 1
      python3 -I -c "import json;d=json.load(open('$A/inventory.out'));print(d['discovered'],d['counts'])" || return 1
-     python3 -I - "$A" <<'PY' || return 1
+     python3 -I - "$A" "${CANARY_MANIFEST:-}" "${CANARY_RENAMES:-}" <<'PY' || return 1
 import glob, hashlib, os, re, sys
-a = sys.argv[1]; rows = [l.rstrip('\n').split('\t') for l in open(f'{a}/inventory/missing.manifest') if l.strip()]
+a, supplied, renames = sys.argv[1], sys.argv[2], sys.argv[3]
+rows = [l.rstrip('\n').split('\t') for l in open(f'{a}/inventory/missing.manifest') if l.strip()]
 # Freshness: every part an earlier attempt exposed (by hash AND by path, so a re-written source counts too) is excluded.
 # Fail closed: an earlier attempt dir without a readable, well-formed, non-empty canary.manifest stops E.
 seen_h, seen_p, prior = set(), set(), 0
@@ -116,11 +117,34 @@ for m in sorted(glob.glob(os.path.join(os.path.dirname(a), 'attempt-*'))):
         f = l.split('\t')
         if len(f) != 2 or not re.fullmatch(r'[0-9a-f]{16}', f[0]) or not f[1].startswith('/'): sys.exit(f'REFUSE: malformed history line in {m}: {l!r}')
         seen_h.add(f[0]); seen_p.add(f[1])
-elig = [r for r in rows if r[0] not in seen_h and r[1] not in seen_p]
+# Stage 2: a renamed part has two paths; exposure under either one counts (renames.tsv: legacy, dated, ...).
+alias = {}
+if renames:
+    for l in open(renames):
+        f = l.rstrip('\n').split('\t'); alias[f[0]] = f[1]; alias[f[1]] = f[0]
+exposed = lambda h, p: h in seen_h or p in seen_p or alias.get(p) in seen_p
+elig = [r for r in rows if not exposed(r[0], r[1])]
 print(f'history: {prior} earlier attempt(s), {len(seen_h)} parts exposed; {len(rows) - len(elig)} of {len(rows)} MISSING excluded; {len(elig)} eligible')
-if len(elig) < 20: sys.exit(f'REFUSE: only {len(elig)} eligible parts (need 20)')
-key = lambda h: hashlib.sha256(h.encode()).hexdigest()
-pick = sorted(elig, key=lambda r: key(r[0]))[:20]
+if not supplied:
+    if len(elig) < 20: sys.exit(f'REFUSE: only {len(elig)} eligible parts (need 20)')
+    key = lambda h: hashlib.sha256(h.encode()).hexdigest()
+    pick = sorted(elig, key=lambda r: key(r[0]))[:20]
+else:   # stage 2 (STAGE2-DESIGN r3): a frozen batch slice, taken as given or refused whole
+    lines = open(supplied).read().splitlines(); pick, why = [], []
+    if not 1 <= len(lines) <= 100: sys.exit(f'REFUSE: supplied manifest has {len(lines)} pairs (1..100)')
+    missing = {(h, p) for h, p in rows}
+    for l in lines:
+        f = l.split('\t')
+        if len(f) != 2 or not re.fullmatch(r'[0-9a-f]{16}', f[0]) or not f[1].startswith('/'): sys.exit(f'REFUSE: malformed supplied line: {l!r}')
+        pick.append((f[0], f[1]))
+    if len({h for h, _ in pick}) != len(pick) or len({p for _, p in pick}) != len(pick): sys.exit('REFUSE: duplicate hash or path in the supplied manifest')
+    for h, p in pick:
+        try: now = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:16]
+        except OSError: now = 'unreadable'
+        if now != h: why.append(f'bytes changed or unreadable: {p}')
+        elif (h, p) not in missing: why.append(f'no longer MISSING: {p}')
+        elif exposed(h, p): why.append(f'previously exposed (hash or either path): {p}')
+    if why: sys.exit('REFUSE: ' + '; '.join(why[:5]) + (f' (+{len(why) - 5} more)' if len(why) > 5 else ''))
 fd = os.open(f'{a}/canary.manifest', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as f: f.write(''.join(f'{h}\t{p}\n' for h, p in pick))
 print('canary', len(pick), 'sha256', hashlib.sha256(open(f'{a}/canary.manifest', 'rb').read()).hexdigest())
@@ -166,7 +190,8 @@ PY
 import json, sys
 from collections import Counter
 rows = [json.loads(l) for l in open('/srv/chatgpt-plan-bridge/state/requests.jsonl') if l.strip()]
-rows = [r for r in rows if r['ts'] >= sys.argv[1]]
+iso = lambda v: __import__('datetime').datetime.fromisoformat(v.replace('Z', '+00:00'))   # parsed: '...39.066Z' is after '...39Z'
+rows = [r for r in rows if iso(r['ts']) >= iso(sys.argv[1])]
 print(json.dumps({'bridge_requests_since_T_start': len(rows), 'by_status_code': dict(Counter(f"{r.get('status')}:{r.get('code', r.get('finish'))}" for r in rows))}))
 PY
    echo "PASS needs: 0 atoms without provenance, 0 duplicate live generations, 0 unknown_completion, 0 401/403, 0 malformed/length, latch clear." ;;

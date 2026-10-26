@@ -1,21 +1,21 @@
 /**
  * READ-ONLY inventory of transcript parts for Luna catch-up (DESIGN.md §8b). Uses gbrain's own discovery and the
  * same idempotency predicates as extract_atoms. No model calls, no writes (session is SET TRANSACTION READ ONLY).
- * Usage: DATABASE_URL=... bun inventory.ts <corpusDir> <outDir> [renames.tsv] [rollback-receipts-dir]
+ * Usage: DATABASE_URL=... bun inventory.ts <corpusDir> <outDir> [renames.tsv]
  * Writes: inventory.json (per part: path, hash16, class) + missing.manifest (hash16\tpath) + counts.
  * Stage 2 (STAGE2-DESIGN r2 §2): classes are tested in a fixed order and the first match wins; every path test runs on
- * both names of a renamed part (renames.tsv: legacy, dated, ...); a part with rollback-retired atoms is readmitted only
- * when every such atom is named by a rollback receipt whose verify verdict is DONE. The file-level exclusions
+ * both names of a renamed part (renames.tsv: legacy, dated, ...); a part with any retired atom is never eligible:
+ * a rollback's parts stay excluded (r3, Pebble 17:35Z), so there is no readmission. The file-level exclusions
  * (stale single, active session, undatable) are date_parts.py plan's, applied to this tool's missing list.
  */
 import postgres from 'postgres';
-import { writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { discoverTranscripts } from '../../../src/core/cycle/transcript-discovery.ts';
 import { claudeCliSelfSessionIds } from '../../../src/core/ai/providers/claude-cli-scratch.ts';
 
-const [corpusDir, outDir, renamesTsv, receiptsDir] = process.argv.slice(2);
-if (!corpusDir || !outDir) throw Error('usage: inventory.ts <corpusDir> <outDir> [renames.tsv] [rollback-receipts-dir]');
+const [corpusDir, outDir, renamesTsv] = process.argv.slice(2);
+if (!corpusDir || !outDir) throw Error('usage: inventory.ts <corpusDir> <outDir> [renames.tsv]');
 const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
 const parts = discoverTranscripts({ corpusDir, selfCaptureSessionIds: claudeCliSelfSessionIds() })
   .map(d => ({ path: d.filePath, hash16: d.contentHash.slice(0, 16) }));
@@ -27,19 +27,6 @@ if (renamesTsv && existsSync(renamesTsv)) for (const line of readFileSync(rename
 }
 const names = (path: string) => (other.has(path) ? [path, other.get(path)!] : [path]);
 const allNames = [...new Set(parts.flatMap(p => names(p.path)))];
-// Rollback receipts (batch.sh rollback): a receipt is only a CLAIM until verified. It counts when its before/after
-// captures still hash to the recorded sha256, its verify verdict is DONE, and (in the read-only transaction below)
-// every atom it names is currently retired by this procedure. Anything else readmits nothing.
-const fileSha = (p: string) => createHash('sha256').update(readFileSync(p)).digest('hex');
-const claims: { file: string; ids: string[] }[] = [];
-if (receiptsDir && existsSync(receiptsDir)) for (const f of readdirSync(receiptsDir).filter(f => f.endsWith('.json')).sort()) {
-  const r = JSON.parse(readFileSync(`${receiptsDir}/${f}`, 'utf8'));
-  const ok = r?.verify?.verdict === 'DONE' && typeof r.before === 'string' && typeof r.after === 'string'
-    && existsSync(r.before) && existsSync(r.after) && fileSha(r.before) === r.before_sha256 && fileSha(r.after) === r.after_sha256;
-  const ids = (r?.plan?.new_atom_ids ?? []).map(String);
-  if (ok && ids.length) claims.push({ file: f, ids }); else console.error(`[inventory] receipt ${f} not verified (verdict, capture hashes or ids)`);
-}
-const receipted = new Set<string>();
 
 const res = await sql.begin('READ ONLY', async tx => {
   const live = await tx`SELECT DISTINCT frontmatter->>'source_hash' AS h FROM pages WHERE type='atom' AND source_id='default' AND deleted_at IS NULL
@@ -54,12 +41,6 @@ const res = await sql.begin('READ ONLY', async tx => {
                            WHERE type='atom' AND source_id='default' AND deleted_at IS NOT NULL AND frontmatter->>'source_hash' = ANY(${hashes})`;
   const independent = await tx`SELECT count(DISTINCT frontmatter->>'source_path')::int AS n FROM pages WHERE type='atom' AND source_id='default'
                                AND deleted_at IS NULL AND frontmatter->>'source_path' = ANY(${allNames})`;
-  for (const c of claims) {   // current row state must match the receipt: every named atom retired by this procedure
-    const rows = await tx`SELECT id::text AS id FROM pages WHERE id = ANY(${c.ids.map(Number)}) AND deleted_at IS NOT NULL
-                          AND frontmatter->>'retired_by' = ${'luna-batch-rollback'}`;
-    if (rows.length === c.ids.length) for (const id of c.ids) receipted.add(id);
-    else console.error(`[inventory] receipt ${c.file}: ${c.ids.length - rows.length} named atom(s) not currently retired by the rollback`);
-  }
   return { live, state, retired, byPath, gens, independent };
 });
 await sql.end();
@@ -85,15 +66,15 @@ const rows = parts.map(p => {
   else if (st?.tombstoned) cls = 'tombstoned';
   else if (st) cls = 'state';
   else if (ns.some(n => genLoc.has(n))) cls = 'generation';
-  else if (ret && ret.some(r => r.by !== OWN || !receipted.has(r.id))) cls = 'retired-deliberate'; // incl. an unreceipted rollback
-  else if (ret) cls = 'missing-after-rollback';
+  else if (ret && ret.some(r => r.by !== OWN)) cls = 'retired-deliberate';
+  else if (ret) cls = 'rolled-back'; // a rollback's parts stay excluded: never eligible again in this stage
   else cls = 'missing';
   return { ...p, class: cls };
 });
 mkdirSync(outDir, { recursive: true, mode: 0o700 });
 const counts: Record<string, number> = {};
 for (const r of rows) counts[r.class] = (counts[r.class] ?? 0) + 1;
-const missing = rows.filter(r => r.class === 'missing' || r.class === 'missing-after-rollback').sort((a, b) => a.path.localeCompare(b.path));
+const missing = rows.filter(r => r.class === 'missing').sort((a, b) => a.path.localeCompare(b.path));
 const manifest = missing.map(r => `${r.hash16}\t${r.path}`).join('\n') + (missing.length ? '\n' : '');
 writeFileSync(`${outDir}/inventory.json`, JSON.stringify({ corpusDir, discovered: parts.length, counts, rows }, null, 1), { mode: 0o600 });
 writeFileSync(`${outDir}/missing.manifest`, manifest, { mode: 0o600 });
@@ -102,6 +83,5 @@ if (total !== parts.length) throw Error(`classes sum to ${total}, discovered ${p
 // Second, independent count: distinct live-atom source paths among these parts' names (= the parts whose path has
 // a live atom: extracted-by-path and changed). Printed for the runner to compare, never used to classify.
 console.log(JSON.stringify({ discovered: parts.length, unique_hashes: hashes.length, counts, independent_live_paths: res.independent[0].n,
-  receipted_atoms: receipted.size,
   missing_manifest_sha256: createHash('sha256').update(manifest).digest('hex'),
   samples: Object.fromEntries(Object.keys(counts).map(c => [c, rows.filter(r => r.class === c).slice(0, 5).map(r => r.path.split('/').pop())])) }, null, 1));
