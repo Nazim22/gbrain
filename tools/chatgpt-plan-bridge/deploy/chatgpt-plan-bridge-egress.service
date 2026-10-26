@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh the chatgpt-plan-bridge OpenAI address sets (oneshot)
+Requisite=chatgpt-plan-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/chatgpt-plan-bridge/current/egress.sh refresh

@@ -88,11 +88,14 @@ ls -la /srv/chatgpt-plan-bridge/auth
 
 step "unit + start + health"
 install -m 0644 "$SRC/deploy/chatgpt-plan-bridge.service" /etc/systemd/system/chatgpt-plan-bridge.service
+install -m 0644 "$SRC/deploy/chatgpt-plan-bridge-egress.service" /etc/systemd/system/chatgpt-plan-bridge-egress.service
+install -m 0644 "$SRC/deploy/chatgpt-plan-bridge-egress.timer" /etc/systemd/system/chatgpt-plan-bridge-egress.timer
 systemctl daemon-reload
 systemctl enable --now chatgpt-plan-bridge.service
+systemctl enable --now chatgpt-plan-bridge-egress.timer
 sleep 2
 systemctl is-active chatgpt-plan-bridge.service
-nft list chain inet filter cpbridge_egress | head -12
+nft list chain inet filter cpbridge_egress | head -14; nft list set inet filter cpbridge_egress_v4 | head -8
 curl -sS -o /dev/null -w 'no-secret status=%{http_code}\n' http://127.0.0.1:$PORT/v1/bridge/status
 # The header goes through curl's config on stdin (printf is a builtin): the secret never appears in any argv.
 printf 'header = "Authorization: Bearer %s"\n' "$(< /etc/chatgpt-plan-bridge/caller.secret)" | curl -sS -K - http://127.0.0.1:$PORT/v1/bridge/status; echo

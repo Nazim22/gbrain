@@ -1,6 +1,6 @@
 /**
  * Capture every row a manifest batch could touch, with full state (DESIGN.md §8b, r4). READ ONLY.
- * Usage: DATABASE_URL=... bun writeset.ts capture <manifest> <corpusDir> <out.json> [--since <iso>]   (receipts since <iso>)
+ * Usage: DATABASE_URL=... bun writeset.ts capture <manifest> <corpusDir> <out.json> [--like <before.json>]   (AFTER: reuse BEFORE's receipt families)
  *        DATABASE_URL=... bun writeset.ts preflight <before.json>                                   (exit 1 unless clean)
  */
 import postgres from 'postgres';
@@ -11,7 +11,7 @@ import { relative, resolve, sep } from 'node:path';
 export const OWN = 'luna-batch-rollback';
 export type Pair = { hash16: string; path: string; ownerKey: string };
 export type Capture = {
-  manifest_sha256: string; captured_at: string; pairs: Pair[];
+  manifest_sha256: string; captured_at: string; pairs: Pair[]; receipt_families: string[];
   atoms: Array<{ id: number; slug: string; deleted_at: string | null; content_hash: string | null; frontmatter: any; compiled_truth: string; pair: string }>;
   generations: Array<{ id: number; owner_key: string; generation: number; state: string; run_id: string | null; input_pin: string | null; item_set_hash: string }>;
   items: Array<{ generation_id: number; item_key: string; identity_hash: string; action: string; pending: boolean }>;
@@ -31,7 +31,7 @@ export function readManifest(path: string, corpusDir: string): { pairs: Pair[]; 
   return { pairs, sha: createHash('sha256').update(text).digest('hex') };
 }
 
-export async function capture(sql: postgres.Sql, pairs: Pair[], manifestSha: string, since?: string): Promise<Capture> {
+export async function capture(sql: postgres.Sql, pairs: Pair[], manifestSha: string, familiesFrom?: string[]): Promise<Capture> {
   const hashes = pairs.flatMap(p => [p.hash16, `pending:${p.hash16}`]), paths = pairs.map(p => p.path), keys = pairs.map(p => p.ownerKey);
   return sql.begin('READ ONLY', async tx => {
     const atoms = await tx`SELECT id, slug, deleted_at, content_hash, frontmatter, compiled_truth,
@@ -44,14 +44,17 @@ export async function capture(sql: postgres.Sql, pairs: Pair[], manifestSha: str
       WHERE generation_id = ANY(${generations.map((g: any) => g.id)}) ORDER BY generation_id, item_key` : [];
     const state_rows = await tx`SELECT file_path, content_hash, fail_count, tombstoned, partial_input_chars FROM extract_atoms_transcript_state
       WHERE source_id='default' AND file_path = ANY(${paths}) ORDER BY file_path, content_hash`;
-    // Every atoms receipt touched in the last 48 h, before AND after, so a reused per-day receipt row is a "changed existing" row.
+    // Exact candidate identities, regardless of age: a run's receipt slug is extracts/<UTC date of the run>/atoms/<source>/
+    // <first 8 of the run id>/round-single (receipt-writer.ts receiptSlug), so every receipt this run could write or reuse is in
+    // the UTC-today or UTC-tomorrow atoms family (a run may cross midnight).
+    const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+    // AFTER reuses BEFORE's families, so a run that crosses midnight compares the same receipt rows.
+    const families = familiesFrom ?? [day(Date.now()), day(Date.now() + 86_400_000)].map(d => `extracts/${d}/atoms/default/%`);
     const receipts = await tx`SELECT id, slug, deleted_at, content_hash, frontmatter, compiled_truth FROM pages
-      WHERE type='extract_receipt' AND source_id='default' AND slug LIKE 'extracts/%/atoms/%'
-        AND (created_at >= now() - interval '48 hours' OR updated_at >= now() - interval '48 hours') ORDER BY id`;
-    void since;
+      WHERE type='extract_receipt' AND source_id='default' AND (slug LIKE ${families[0]} OR slug LIKE ${families[1]}) ORDER BY id`;
     const pairOf = (a: any) => pairs.find(p => p.path === a.p || a.h === p.hash16 || a.h === `pending:${p.hash16}`)?.path ?? '';
     return {
-      manifest_sha256: manifestSha, captured_at: new Date().toISOString(), pairs,
+      manifest_sha256: manifestSha, captured_at: new Date().toISOString(), pairs, receipt_families: families,
       atoms: atoms.map((a: any) => ({ id: Number(a.id), slug: a.slug, deleted_at: a.deleted_at ? new Date(a.deleted_at).toISOString() : null, content_hash: a.content_hash, frontmatter: a.frontmatter, compiled_truth: a.compiled_truth, pair: pairOf(a) })),
       generations: generations.map((g: any) => ({ ...g, id: Number(g.id) })), items: items.map((i: any) => ({ ...i, generation_id: Number(i.generation_id) })),
       state_rows: [...state_rows], receipts: receipts.map((r: any) => ({ id: Number(r.id), slug: r.slug, deleted_at: r.deleted_at ? new Date(r.deleted_at).toISOString() : null, content_hash: r.content_hash, frontmatter: r.frontmatter, compiled_truth: r.compiled_truth, pair: '' })),
@@ -71,10 +74,11 @@ export function preflight(c: Capture): string[] {
 if (import.meta.main) {
   const [mode, ...rest] = process.argv.slice(2);
   if (mode === 'capture') {
-    const [manifest, corpusDir, out, flag, since] = rest;
+    const [manifest, corpusDir, out, flag, like] = rest;
     const { pairs, sha } = readManifest(manifest, corpusDir);
+    const families = flag === '--like' ? (JSON.parse(readFileSync(like, 'utf8')) as Capture).receipt_families : undefined;
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
-    const c = await capture(sql, pairs, sha, flag === '--since' ? since : undefined); await sql.end();
+    const c = await capture(sql, pairs, sha, families); await sql.end();
     const text = JSON.stringify(c, null, 1);
     writeFileSync(out, text, { mode: 0o600 });
     console.log(JSON.stringify({ out, sha256: createHash('sha256').update(text).digest('hex'), pairs: pairs.length, atoms: c.atoms.length, generations: c.generations.length, items: c.items.length, state_rows: c.state_rows.length, receipts: c.receipts.length }));
