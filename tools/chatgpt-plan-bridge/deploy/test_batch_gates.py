@@ -13,7 +13,8 @@ with tempfile.TemporaryDirectory() as t:
     pairs = [l.split('\t') for l in open(f'{src}/canary.manifest').read().splitlines()]
     assert all(p in day for _, p in pairs), 'a canary part has no reproduced date'
     open(f'{a}/members.tsv', 'w').write(''.join(f'{h}\t-\t{p}\t{p}\t{day[p]}\n' for h, p in pairs))  # extracted under legacy names
-    run_h = lambda: subprocess.run([sys.executable, '-I', '-c', block, a, open(f'{a}/T_start').read().strip(), run, '1'], capture_output=True, text=True)
+    run_h = lambda: subprocess.run([sys.executable, '-I', '-c', block, a, open(f'{a}/T_start').read().strip(), run,
+                                     '/srv/chatgpt-plan-bridge/state/requests.jsonl', 'gpt-6-luna'], capture_output=True, text=True)
 
     r = run_h(); out = json.loads(r.stdout)
     assert r.returncode == 10, r
