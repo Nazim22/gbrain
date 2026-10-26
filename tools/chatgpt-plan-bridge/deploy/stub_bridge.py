@@ -23,7 +23,8 @@ class H(BaseHTTPRequestHandler):
         mode = open(f'{CTL}/mode').read().strip()
         served = 'gpt-4o' if mode == 'wrong-model' else 'gpt-6-luna'
         seed = hashlib.sha256(json.dumps(body.get('messages', ''), sort_keys=True).encode()).hexdigest()[:8]
-        text = json.dumps([{'title': f'Dry run lesson {seed}', 'atom_type': 'insight',
+        probe = 'Return exactly {"atoms":[]}' in json.dumps(body.get('messages', ''))   # step B's real-call.ts prompt
+        text = '{"atoms":[]}' if probe else json.dumps([{'title': f'Dry run lesson {seed}', 'atom_type': 'insight',
                             'body': f'A dry-run atom ({seed}) proves the batch pipeline end to end.'}])
         with open(LEDGER, 'a') as f:
             f.write(json.dumps({'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'), 'status': 200, 'finish': 'stop', 'model': served}) + '\n')

@@ -61,7 +61,7 @@ out=$(runb V 1);             expect "V checks 401 + 200 + latch + route on the s
 out=$(runb B 1);             expect "B makes one call served by luna" "$out" "served"
 out=$(runb K 1);             expect "K refuses before H (no gated.ok)" "$out" "gated.ok missing"
 out=$(runb keep 1);          expect "keep refuses before H (no gated.ok)" "$out" "gated.ok missing"
-out=$(runb G 1);             expect "G opens, extracts, closes and proves quiescence" "$out" "QUIESCED"
+out=$(runb G 1);             expect "G opens, extracts, closes and proves quiescence" "$out" "QUIESCED: dream rc=0"
 expect "after G: admission closed" "$(adm)" "$OUT/runA/closed.manifest"; expect "after G: corpus key absent" "$(corpus_n)" "0"
 out=$(runb H 1);             expect "H passes every gate and writes gated.ok" "$out" "GATED: PASS"
 echo "$out" | grep -E '"(new_atoms|pairs_with_atoms|fail_count)"'
@@ -87,7 +87,7 @@ run C >/dev/null; run D >/dev/null
 out=$(runb E 1);             expect "E: already-dated members are not renamed" "$out" "skip (already dated)"
 runb V 1 >/dev/null; out=$(runb B 1); expect "B served by luna" "$out" "served"; runb F 1 >/dev/null
 echo wrong-model > "$OUT/ctl/mode"
-out=$(runb G 1);             expect "G runs against the wrong-model stub" "$out" "QUIESCED"
+out=$(runb G 1);             expect "G runs against the wrong-model stub" "$out" "QUIESCED: dream rc=0"
 out=$(runb H 1);             expect "H fails the served-model gate" "$out" "GATE FAIL (§7.2)"
 expect "no gated.ok after a failed gate" "$(ls "$OUT/runB/batch-01/gated.ok" 2>&1)" "No such file"
 out=$(runb keep 1);          expect "keep refuses after a failed gate" "$out" "gated.ok missing"

@@ -185,7 +185,7 @@ G) step "OPEN (admission + corpus key), extract (one foreground owner), CLOSE, p
    echo "dream rc=$rc"
    if [[ $rc != 0 || $live != 0 || -n $r ]]; then echo "unknown outcome: dream rc=$rc locks=$live runners=${r:-none}" > "$RUN/STOP"
      echo "HOLD (§7.1): unknown outcome. No automatic rollback; preserve everything and report to Nazz + Pebble."; exit 3; fi
-   echo "QUIESCED" ;;
+   echo "QUIESCED: dream rc=0, no runner, no live lock" ;;
 H) step "GATED (§4): write set AFTER, per-pair reconciliation, date gates, bridge rows, earlier batches unchanged"
    stopped; A=$(bdir); open_batch "$A"; bindings "$A"; need "$A/run.json"; [[ ! -e "$A/gated.ok" ]] || { echo "REFUSE: already gated"; exit 1; }
    rm -f "$A/after.json" "$A/plan.json"   # a re-run of H recaptures; nothing downstream trusts them without gated.ok
