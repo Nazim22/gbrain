@@ -25,7 +25,11 @@ export const MAX_BYTES = 256 * 1024;
 // The /v1/models catalog is ~88 KB per model (S552 run P5: 3 entries filled 251,392 bytes), so the 256 KB answer cap
 // cut it before gpt-6-luna. It gets its own, still hard, bound; model answers keep MAX_BYTES.
 export const MODELS_MAX_BYTES = 8 * 1024 * 1024;
-export function capFor(url:string) { return url===`${API}/models`?MODELS_MAX_BYTES:MAX_BYTES; }
+// A streamed answer costs ~130 bytes per output token (P7 smoke: ~260-byte delta events of 2 tokens each, the text repeated
+// three more times, ~16 KB fixed), so the largest Gemma answer seen (1,397 tokens) would stream ~230 KB, too close to 256 KB.
+// 2 MB covers ~15k output tokens; the 300 s request deadline still bounds a runaway answer.
+export const RESPONSES_MAX_BYTES = 2 * 1024 * 1024;
+export function capFor(url:string) { return url===`${API}/models`?MODELS_MAX_BYTES:url===`${API}/responses`?RESPONSES_MAX_BYTES:MAX_BYTES; }
 /** The catalog is the authority for what each model accepts; a pinned slug or effort it doesn't list stops the run before any generation. */
 export function catalogProblem(catalog:any, arm:CloudArm):'MODEL-UNAVAILABLE'|'EFFORT-UNSUPPORTED'|undefined {
   const entry=catalog?.models?.find((m:any)=>m.slug===CLOUD_MODELS[arm].model);
