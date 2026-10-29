@@ -15,6 +15,7 @@
  *         queued_discarded is the queued_discarded counted here.
  * Windows: the cancel lands at the concept lookup (U/M cases), during the pre-publication provenance-coverage read
  * (W1), or after the last group, during its maybeYield (W2, managed: the final flush must not run).
+ * The contract cases (P1, P2) pin what the separate publication steps leave when one fails or is refused.
  * PGLite always, Postgres when the lane provides DATABASE_URL.
  */
 import { describe, expect, test } from 'bun:test';
@@ -24,6 +25,7 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { PhaseResult } from '../../src/core/cycle.ts';
 import { runPhaseSynthesizeConcepts } from '../../src/core/cycle/synthesize-concepts.ts';
+import { acquirePageLock } from '../../src/core/page-lock.ts';
 import { _resetWriteThroughCacheForTest } from '../../src/core/write-through.ts';
 import { durableGitRepo } from '../helpers/git-publication.ts';
 import { isolatedSharedSkillsEngine } from '../helpers/shared-skills-engine.ts';
@@ -413,6 +415,79 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       await managed(databaseUrl, GROUPS, async (engine, root) => {
         const { ledger, result } = await cancelAfterLastGroup(engine, root, GROUPS, (_controller, jump) => jump(BUDGET_MS + 1));
         await expectCancelContract(engine, ledger, result, GROUPS, { committed: 0, queuedDiscarded: GROUPS, skipped: 0 });
+      });
+    }, 240_000);
+  });
+
+  describe(`concept publication steps when one fails or is refused, unmanaged (${backend})`, () => {
+    /**
+     * The unmanaged publication is three steps with their own transactions (concept-writes.ts publish): the page at
+     * private, its provenance edges, then the world promotion. A failed or refused step leaves the earlier ones committed.
+     */
+    const concept = conceptOf(0);
+    /** Concept-provenance edges in both directions (concept -> atom synthesized_from, atom -> concept synthesizes). */
+    const provenanceEdges = async (engine: BrainEngine) => (await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM links l JOIN pages f ON f.id = l.from_page_id JOIN pages t ON t.id = l.to_page_id
+        WHERE l.link_source = 'concept-provenance' AND $1 IN (f.slug, t.slug)`, [concept]))[0]!.n;
+    const run = (engine: BrainEngine) => runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(1), phaseBudgetMs: BUDGET_MS });
+
+    test('P1: the provenance write fails: the private page stays, without edges, counted written, and the next run skips it', async () => {
+      await unmanaged(databaseUrl, 1, async engine => {
+        const ledger = newLedger();
+        const original = engine.addLinksBatch;
+        let failed = 0;
+        engine.addLinksBatch = (async function (this: BrainEngine, ...args: Parameters<BrainEngine['addLinksBatch']>) {
+          if (args[1]?.auditSite === 'cycle.synthesize_concepts.provenance') { failed++; throw new Error('injected provenance failure'); }
+          return original.apply(this, args);
+        }) as BrainEngine['addLinksBatch'];
+        const unlog = logTransactions(engine, ledger);
+        let result: PhaseResult;
+        try { result = await run(engine); } finally { unlog(); delete (engine as unknown as Record<string, unknown>).addLinksBatch; }
+        expect(failed).toBe(1);
+        const details = result!.details as Record<string, unknown>;
+        expect(result!.status).toBe('warn');
+        expect(details.concepts_written).toBe(1);
+        expect(details.link_warnings).toEqual([{ concept: stem(0), warning: 'provenance links failed: injected provenance failure' }]);
+        expect(details.publication_deferred).toEqual([]);
+        // The page's transaction committed before the provenance transaction began and rolled back.
+        const pageTx = ledger.txs.find(tx => tx.pages.includes(concept));
+        const rolledBack = ledger.txs.filter(tx => tx.outcome === 'rolled_back');
+        expect(pageTx?.outcome).toBe('committed');
+        expect(rolledBack.length).toBe(1);
+        expect(rolledBack[0]!.begin).toBeGreaterThan(pageTx!.end!);
+        const page = await engine.getPage(concept, { sourceId: 'default' });
+        expect(page?.frontmatter?.visibility).toBe('private');
+        expect(page?.frontmatter?.synthesis_mode).toBe('deterministic_tier');
+        expect(await provenanceEdges(engine)).toBe(0);
+        // Members unchanged: the page is skipped as unchanged, so its edges are not retried and it is not promoted.
+        const again = (await run(engine)).details as Record<string, unknown>;
+        expect(again.skipped_unchanged).toEqual([concept]);
+        expect(again.concepts_written).toBe(0);
+        expect(await provenanceEdges(engine)).toBe(0);
+        expect((await engine.getPage(concept, { sourceId: 'default' }))?.frontmatter?.visibility).toBe('private');
+      });
+    }, 240_000);
+
+    test('P2: the world promotion is refused after the edges land: page private with its edges, deferred, and the next run skips it', async () => {
+      await unmanaged(databaseUrl, 1, async engine => {
+        const held: { lock: Awaited<ReturnType<typeof acquirePageLock>> } = { lock: null };
+        // A concurrent writer takes the page lock once the edges are banked, before the promotion's publication.
+        const unhook = onCoverageRead(engine, concept, async () => { held.lock = await acquirePageLock(concept); }, 2);
+        let result: PhaseResult;
+        try { result = await run(engine); } finally { unhook(); await held.lock?.release(); }
+        expect(held.lock).not.toBeNull();
+        const details = result!.details as Record<string, unknown>;
+        expect(result!.status).toBe('warn');
+        expect(details.concepts_written).toBe(0);
+        expect(details.publication_deferred).toEqual([{ concept: stem(0), reason: 'revision_conflict: The concept page is locked by another writer.' }]);
+        expect(details.link_warnings).toEqual([]);
+        const page = await engine.getPage(concept, { sourceId: 'default' });
+        expect(page?.frontmatter?.visibility).toBe('private');
+        expect(await provenanceEdges(engine)).toBe(2 * MEMBERS);
+        // Members unchanged: the deferred promotion is not retried; the page stays private.
+        const again = (await run(engine)).details as Record<string, unknown>;
+        expect(again.skipped_unchanged).toEqual([concept]);
+        expect((await engine.getPage(concept, { sourceId: 'default' }))?.frontmatter?.visibility).toBe('private');
       });
     }, 240_000);
   });
