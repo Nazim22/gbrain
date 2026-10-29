@@ -115,6 +115,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
     }, 120_000);
 
     test('every derived stamp is held on every purge route; an unknown stamp is not', async () => {
+      expect(DERIVED_RETIRED_BY).toContain('owner-retirement'); // S557: the old-atom retirement's 30-day hold depends on it
       await withBrain(databaseUrl, async engine => {
         const stamps = [...DERIVED_RETIRED_BY, 'operator-cleanup'];
         for (const stamp of stamps) {
