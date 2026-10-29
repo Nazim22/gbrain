@@ -5,10 +5,12 @@
  * `if (maintenance && groupsSkipped === 0) await writer.flush()`). A publication already in flight when the cancel lands
  * runs to its own end. Evidence is commit order, not timestamps: every top-level writing transaction of the engine is
  * logged with a sequence number, its `pg_current_xact_id()` and its outcome, plus the concept pages and
- * concept-provenance links it wrote (rows whose xmin is its xid); the cancel is logged when it is issued and when the
- * loop first reads it. Asserted per case:
+ * concept-provenance links it wrote (rows whose xmin is its xid or one of its savepoints'); the cancel is logged when it
+ * is issued and when the loop first reads it, and the phase's return when logging stops. Asserted per case:
  *   (i)   no publication transaction begins after the cancel was observed;
- *   (ii)  every logged transaction ended in COMMIT or ROLLBACK and `pg_xact_status(xid)` agrees;
+ *   (ii)  every publication transaction ended before the phase returned, every logged transaction ends in COMMIT or
+ *         ROLLBACK and `pg_xact_status(xid)` agrees (the managed brain's persistence consumer runs its own bookkeeping
+ *         transactions beside the phase, and one begun before the return may end after it);
  *   (iii) the concept pages and provenance links in the database are exactly those committed xids wrote, and a concept
  *         page never stands without its links (or the reverse);
  *   (iv)  committed + rolled_back + queued_discarded + skipped = groups found, groups_skipped = skipped, and the phase's
@@ -42,22 +44,27 @@ const atomsFor = (groups: number) => Array.from({ length: groups }, (_, g) => Ar
 const BUDGET_MS = 600_000;
 
 interface LoggedTx { begin: number; end?: number; outcome?: 'committed' | 'rolled_back'; xid: string | null; pages: string[]; links: string[] }
-interface Ledger { seq: number; txs: LoggedTx[]; issued: number | null; observed: number | null; lookups: string[] }
-const newLedger = (): Ledger => ({ seq: 0, txs: [], issued: null, observed: null, lookups: [] });
+interface Ledger { seq: number; txs: LoggedTx[]; issued: number | null; observed: number | null; returned: number | null; lookups: string[] }
+const newLedger = (): Ledger => ({ seq: 0, txs: [], issued: null, observed: null, returned: null, lookups: [] });
 const tick = (ledger: Ledger) => ++ledger.seq;
 
-/** Concept pages and concept-provenance links whose current row version this transaction wrote (xmin = its xid). */
+/**
+ * Concept pages and concept-provenance links whose current row version this transaction wrote: a visible row whose xmin is
+ * still in progress is its own, written at top level or in one of its savepoints (Postgres publishes a managed page in a
+ * subtransaction, so its xmin is not the top-level xid). The xmin is widened to xid8 in the current epoch.
+ */
+const OWN_ROW = (xmin: string) => `pg_xact_status(((pg_current_xact_id()::text::bigint / 4294967296) * 4294967296 + ${xmin}::text::bigint)::text::xid8) = 'in progress'`;
 const WRITTEN_HERE = `
-  SELECT 'page' AS kind, slug FROM pages
-   WHERE slug LIKE 'concepts/%' AND xmin::text = (pg_current_xact_id()::text::bigint % 4294967296)::text
+  SELECT 'page' AS kind, slug FROM pages WHERE slug LIKE 'concepts/%' AND ${OWN_ROW('xmin')}
   UNION ALL
   SELECT 'link', CASE WHEN f.slug LIKE 'concepts/%' THEN f.slug ELSE t.slug END FROM links l
     JOIN pages f ON f.id = l.from_page_id JOIN pages t ON t.id = l.to_page_id
-   WHERE l.link_source = 'concept-provenance' AND l.xmin::text = (pg_current_xact_id()::text::bigint % 4294967296)::text`;
+   WHERE l.link_source = 'concept-provenance' AND ${OWN_ROW('l.xmin')}`;
 
 /**
  * Logs every top-level read-write transaction of `engine` (nested ones are savepoints of a logged one). `beforeCommit`
- * runs inside the transaction after its work, before COMMIT: the pause point of an in-flight publication.
+ * runs inside the transaction after its work, before COMMIT: the pause point of an in-flight publication. The returned
+ * stop is called right after the phase returns and logs that moment.
  */
 function logTransactions(engine: BrainEngine, ledger: Ledger, beforeCommit?: (tx: LoggedTx) => Promise<void>): () => void {
   const target = engine as unknown as Record<string, unknown>;
@@ -87,7 +94,13 @@ function logTransactions(engine: BrainEngine, ledger: Ledger, beforeCommit?: (tx
       }
     };
   }
-  return () => { for (const name of methods) delete target[name]; };
+  return () => { ledger.returned ??= tick(ledger); for (const name of methods) delete target[name]; };
+}
+
+/** Waits (bounded) until every logged transaction has ended. */
+async function logSettled(ledger: Ledger): Promise<void> {
+  const until = performance.now() + 10_000;
+  while (ledger.txs.some(tx => tx.end === undefined) && performance.now() < until) await Bun.sleep(10);
 }
 
 /** A signal whose first `aborted === true` read is logged: the moment the loop observes the cancel. */
@@ -147,11 +160,14 @@ interface Expected { committed: number; queuedDiscarded: number; skipped: number
 async function expectCancelContract(engine: BrainEngine, ledger: Ledger, result: PhaseResult, groups: number, expected: Expected): Promise<void> {
   const details = result.details as Record<string, unknown>;
   expect(ledger.issued).not.toBeNull(); // the cancel fired (positive control)
+  expect(ledger.returned).not.toBeNull();
+  await logSettled(ledger);
   const cancelSeq = ledger.observed ?? ledger.issued!; // a deadline is observed no earlier than it is issued
   const publications = ledger.txs.filter(tx => tx.outcome === 'rolled_back' || tx.pages.length > 0 || tx.links.length > 0);
   // (i)
   expect(publications.filter(tx => tx.begin > cancelSeq).map(tx => ({ begin: tx.begin, pages: tx.pages, links: tx.links }))).toEqual([]);
   // (ii)
+  expect(publications.filter(tx => tx.end! > ledger.returned!).map(tx => ({ begin: tx.begin, end: tx.end, pages: tx.pages, links: tx.links }))).toEqual([]);
   expect(ledger.txs.filter(tx => !tx.outcome || tx.end === undefined)).toEqual([]);
   for (const tx of ledger.txs.filter(t => t.xid !== null)) {
     const [status] = await engine.executeRaw<{ s: string }>('SELECT pg_xact_status($1::text::xid8) AS s', [tx.xid]);
