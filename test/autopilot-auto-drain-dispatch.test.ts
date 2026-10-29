@@ -178,17 +178,18 @@ test('automatic drain window and job deadline are bounded together', () => {
   // batches. The deadline must cover the window plus a final chat call (two on a schema retry).
   expect(resolveAutopilotAutoDrainBounds(600_000, 120, 300_000)).toEqual({ windowSeconds: 120, timeoutMs: 780_000 });
   expect(resolveAutopilotAutoDrainBounds(600_000, 900, 300_000)).toEqual({ windowSeconds: 900, timeoutMs: 1_560_000 });
-  expect(resolveAutopilotAutoDrainBounds(600_000, Number.MAX_VALUE, 300_000)).toEqual({ windowSeconds: 1140, timeoutMs: 1_800_000 });
+  // Local patch e992c08db: the full-cycle anchor is 60 min, so the window clamps at 3600 - 660 s.
+  expect(resolveAutopilotAutoDrainBounds(600_000, Number.MAX_VALUE, 300_000)).toEqual({ windowSeconds: 2940, timeoutMs: 3_600_000 });
   expect(resolveAutopilotAutoDrainBounds(3_600_000, 900, 300_000)).toEqual({ windowSeconds: 900, timeoutMs: 3_600_000 });
   expect(resolveAutopilotAutoDrainBounds(600_000, 900, 300_000.5)).toEqual({ windowSeconds: 900, timeoutMs: 1_560_001 });
   // A chat timeout that leaves no room under the anchor still gets a deadline covering its one-second window.
-  expect(resolveAutopilotAutoDrainBounds(600_000, 900, 869_600)).toEqual({ windowSeconds: 1, timeoutMs: 1_800_200 });
+  expect(resolveAutopilotAutoDrainBounds(600_000, 900, 1_769_600)).toEqual({ windowSeconds: 1, timeoutMs: 3_600_200 });
 });
 
 for (const row of [
   { setting: null, interval: 600_000, window: 120, timeout: 780_000 },
   { setting: '900', interval: 600_000, window: 900, timeout: 1_560_000 },
-  { setting: '86400', interval: 600_000, window: 1140, timeout: 1_800_000 },
+  { setting: '86400', interval: 600_000, window: 2940, timeout: 3_600_000 }, // 60-min anchor (local patch e992c08db)
   { setting: '900', interval: 3_600_000, window: 900, timeout: 3_600_000 },
 ]) {
   test(`queued drain covers window ${row.setting ?? 'default'} at a ${row.interval}ms dispatch deadline`, async () => {

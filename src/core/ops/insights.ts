@@ -32,7 +32,7 @@ const reflex_pointers: Operation = {
   idempotent: true,
   outputRedaction: 'retrieval',
   description:
-    'Retrieval Reflex (#1981) over an op transport: extract salient entities from a turn of ' +
+    'Retrieval Reflex over an op transport: extract salient entities from a turn of ' +
     'user text and resolve them to compact page pointers. Same pipeline, gate, timeout and ' +
     'heartbeat as the context-engine layer — for hosts (per-prompt hooks, non-context-engine ' +
     'agents) that consume the brain over MCP instead of assemble().',

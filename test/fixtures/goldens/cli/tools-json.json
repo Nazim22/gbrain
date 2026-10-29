@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 266118,
-    "stdoutSha256": "b1136c49dcb2c752dadd5bd1b5c02eec590af57a636321baeb7727cf61ef14e9",
+    "stdoutBytes": 266110,
+    "stdoutSha256": "844a89f682c11504811bc7132ece7bf88c0d575cc485ccc008972c10866c3cfe",
     "toolNames": [
       "remember",
       "entity",
@@ -6302,7 +6302,7 @@
         "scope": "admin"
       },
       {
-        "description": "Retrieval Reflex (#1981) over an op transport: extract salient entities from a turn of user text and resolve them to compact page pointers. Same pipeline, gate, timeout and heartbeat as the context-engine layer — for hosts (per-prompt hooks, non-context-engine agents) that consume the brain over MCP instead of assemble().",
+        "description": "Retrieval Reflex over an op transport: extract salient entities from a turn of user text and resolve them to compact page pointers. Same pipeline, gate, timeout and heartbeat as the context-engine layer — for hosts (per-prompt hooks, non-context-engine agents) that consume the brain over MCP instead of assemble().",
         "idempotent": true,
         "local_only": false,
         "mutating": false,

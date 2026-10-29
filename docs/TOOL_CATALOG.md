@@ -93,7 +93,7 @@ Every non-localOnly operation on the MCP surface: 163 tools across 25 areas. **S
 | `find_trajectory` | Return the chronological claim trajectory for an entity (typed metric values over time, plus auto-detected regressions and narrative drift). | read |  |  |
 | `get_calibration_profile` | Read the active calibration profile for a holder. | read |  |  |
 | `get_recent_salience` | Recently touched pages ranked by salience. | read | yes |  |
-| `reflex_pointers` | Retrieval Reflex (#1981) over an op transport: extract salient entities from a turn of user text and resolve them to compact page pointers. | read |  |  |
+| `reflex_pointers` | Retrieval Reflex over an op transport: extract salient entities from a turn of user text and resolve them to compact page pointers. | read |  |  |
 | `volunteer_context` | Push-based context: volunteer brain pages relevant to a rolling conversation window WITHOUT being asked. | read |  |  |
 
 ## jobs
