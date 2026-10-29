@@ -539,6 +539,7 @@ export async function runPhaseSynthesizeConcepts(
       // GBRA-60: one whose edges already cover every member publishes once, at
       // world, so a strict source never commits an intermediate private page.
       const covered = visibility === 'world' && await conceptProvenanceCovers(engine, src, conceptSlug, group.atomSlugs);
+      if (Date.now() >= deadline || opts.signal?.aborted) { groupsSkipped = atomGroups.length - index; break; } // the coverage read outlived the cancel
       const write: ConceptWrite = { concept: group.conceptSlug, conceptSlug, atomSlugs: group.atomSlugs, visibility, covered, synthesisMode, synthesized, narrative,
         revision: existingSnapshot?.revision ?? null, baseline: existing?.compiled_truth ?? '' };
       // GBRA-60: a managed run's concepts publish in batches (concept-writes.ts), each one publication group on Postgres.
@@ -550,7 +551,10 @@ export async function runPhaseSynthesizeConcepts(
     // right cadence (30s instead of every-group).
     await maybeYield();
   }
-  if (maintenance && groupsSkipped === 0) await writer.flush(); // local: no publication after a deadline/signal cancel; queued concepts re-derive next cycle
+  // local: no publication after a deadline/signal cancel, including one that landed after the last group; queued concepts re-derive next cycle
+  const cancelled = groupsSkipped > 0 || Date.now() >= deadline || !!opts.signal?.aborted;
+  const queuedDiscarded = maintenance && cancelled ? writer.queued() : 0;
+  if (maintenance && !cancelled) await writer.flush();
 
   // v0.42 Wave B3: receipt + rollup for synthesize_concepts. Receipt/rollup
   // carry the cycle's resolved source (#4416, opts.sourceId); 'default'
@@ -601,7 +605,7 @@ export async function runPhaseSynthesizeConcepts(
     summary:
       `synthesize_concepts: ${conceptsWritten} concepts ` +
       `(T1=${tierCounts.T1} T2=${tierCounts.T2} T3=${tierCounts.T3})` +
-      (groupsSkipped > 0 ? ` — PARTIAL: ${groupsSkipped} group(s) left for the next cycle (phase budget reached)` : '') +
+      (groupsSkipped + queuedDiscarded > 0 ? ` — PARTIAL: ${groupsSkipped + queuedDiscarded} group(s) left for the next cycle (phase budget reached)` : '') +
       (failures.length > 0 ? ` (${failures.length} LLM-failed → template fallback)` : '') +
       (budgetCapped > 0 ? ` (${budgetCapped} over the $${budgetCap.toFixed(2)} budget → template fallback)` : '') +
       (linkWarnings.length > 0 ? ` (${linkWarnings.length} provenance-link warning(s))` : '') +
@@ -618,7 +622,7 @@ export async function runPhaseSynthesizeConcepts(
       tier_counts: tierCounts,
       synthesis_mode_counts: synthesisModeCounts,
       groups_found: atomGroups.length,
-      groups_skipped: groupsSkipped, partial: groupsSkipped > 0, phase_budget_ms: phaseBudgetMs,
+      groups_skipped: groupsSkipped, queued_discarded: queuedDiscarded, partial: groupsSkipped + queuedDiscarded > 0, phase_budget_ms: phaseBudgetMs,
       atoms_seen: atoms.length,
       failures,
       link_warnings: linkWarnings,

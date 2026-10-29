@@ -11,7 +11,10 @@
  *   (ii)  every logged transaction ended in COMMIT or ROLLBACK and `pg_xact_status(xid)` agrees;
  *   (iii) the concept pages and provenance links in the database are exactly those committed xids wrote, and a concept
  *         page never stands without its links (or the reverse);
- *   (iv)  committed + rolled_back + queued_discarded + skipped = groups found, and groups_skipped = skipped.
+ *   (iv)  committed + rolled_back + queued_discarded + skipped = groups found, groups_skipped = skipped, and the phase's
+ *         queued_discarded is the queued_discarded counted here.
+ * Windows: the cancel lands at the concept lookup (U/M cases), during the pre-publication provenance-coverage read
+ * (W1), or after the last group, during its maybeYield (W2, managed: the final flush must not run).
  * PGLite always, Postgres when the lane provides DATABASE_URL.
  */
 import { describe, expect, test } from 'bun:test';
@@ -114,6 +117,21 @@ function onLookup(engine: BrainEngine, ledger: Ledger, slug: string, act: () => 
   return () => { delete (engine as unknown as Record<string, unknown>).getPage; };
 }
 
+/**
+ * Runs `act` once, right after the `nth` provenance-coverage read of `slug` (conceptProvenanceCovers) returns: read 1 is the
+ * loop's pre-publication read, read 2 the one after its edges are banked (concept-writes.ts bankProvenance).
+ */
+function onCoverageRead(engine: BrainEngine, slug: string, act: () => void | Promise<void>, nth = 1): () => void {
+  const original = engine.executeRaw;
+  let reads = 0;
+  engine.executeRaw = (async function (this: BrainEngine, ...args: Parameters<BrainEngine['executeRaw']>) {
+    const rows = await original.apply(this, args);
+    if (this === engine && String(args[0]).includes('AS linked FROM links') && args[1]?.[1] === slug && ++reads === nth) await act();
+    return rows;
+  }) as BrainEngine['executeRaw'];
+  return () => { delete (engine as unknown as Record<string, unknown>).executeRaw; };
+}
+
 /** The phase deadline driven by a clock offset (Date.now is restored afterwards). */
 async function withClock<T>(run: (jump: (ms: number) => void) => Promise<T>): Promise<T> {
   const real = Date.now;
@@ -159,6 +177,7 @@ async function expectCancelContract(engine: BrainEngine, ledger: Ledger, result:
   const counts = { committed: pages.length, rolled_back: rolledBack, queued_discarded: reached - pages.length - rolledBack, skipped: details.groups_skipped };
   expect(counts).toEqual({ committed: expected.committed, rolled_back: 0, queued_discarded: expected.queuedDiscarded, skipped: expected.skipped });
   expect(counts.committed + counts.rolled_back + counts.queued_discarded + (counts.skipped as number)).toBe(details.groups_found as number);
+  expect(details.queued_discarded).toBe(counts.queued_discarded);
   expect(details.groups_found).toBe(groups);
   expect(details.partial).toBe(true);
 }
@@ -246,6 +265,44 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
         await expectCancelContract(engine, ledger, result!, GROUPS, { committed: K + 1, queuedDiscarded: 0, skipped: GROUPS - K - 1, inFlight: conceptOf(K) });
       });
     }, 240_000);
+
+    /** Fires the cancel during group K's pre-publication coverage read; that group is skipped at the recheck after it. */
+    const cancelAtCoverage = (engine: BrainEngine, ledger: Ledger, fire: () => void) => {
+      const unlook = onLookup(engine, ledger, '', () => {});
+      const uncover = onCoverageRead(engine, conceptOf(K), () => {
+        ledger.lookups = ledger.lookups.filter(slug => slug !== conceptOf(K));
+        ledger.issued = tick(ledger);
+        fire();
+      });
+      return () => { uncover(); unlook(); };
+    };
+
+    test('W1s: a signal during the pre-publication coverage read of K: K committed, that group never publishes', async () => {
+      await unmanaged(databaseUrl, GROUPS, async engine => {
+        const ledger = newLedger();
+        const controller = observedSignal(ledger);
+        const unlog = logTransactions(engine, ledger);
+        const unhook = cancelAtCoverage(engine, ledger, () => controller.abort());
+        let result: PhaseResult;
+        try {
+          result = await runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), signal: controller.signal, phaseBudgetMs: BUDGET_MS });
+        } finally { unhook(); unlog(); }
+        expect(ledger.observed).not.toBeNull();
+        await expectCancelContract(engine, ledger, result!, GROUPS, { committed: K, queuedDiscarded: 0, skipped: GROUPS - K });
+      });
+    }, 240_000);
+
+    test('W1d: the deadline during the pre-publication coverage read of K: same contract as the signal', async () => {
+      await unmanaged(databaseUrl, GROUPS, async engine => {
+        const ledger = newLedger();
+        const unlog = logTransactions(engine, ledger);
+        const result = await withClock(async jump => {
+          const unhook = cancelAtCoverage(engine, ledger, () => jump(BUDGET_MS + 1));
+          try { return await runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), phaseBudgetMs: BUDGET_MS }); } finally { unhook(); }
+        }).finally(unlog);
+        await expectCancelContract(engine, ledger, result, GROUPS, { committed: K, queuedDiscarded: 0, skipped: GROUPS - K });
+      });
+    }, 240_000);
   });
 
   describe(`C1 concept publication after a cancel, managed (${backend})`, () => {
@@ -319,6 +376,43 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
         expect(paused!.outcome).toBe('committed');
         expect(ledger.observed).not.toBeNull();
         await expectCancelContract(engine, ledger, result, GROUPS, { committed: CAPACITY, queuedDiscarded: 0, skipped: GROUPS - CAPACITY });
+      });
+    }, 240_000);
+
+    /**
+     * Runs the phase with the cancel fired from the last group's maybeYield: the last lookup advances the clock past the
+     * 30 s yield throttle, so `yieldDuringPhase` runs once, after every group is queued and before the final flush.
+     */
+    const cancelAfterLastGroup = async (engine: BrainEngine, root: string, groups: number, fire: (controller: AbortController, jump: (ms: number) => void) => void) => {
+      const ledger = newLedger();
+      const controller = observedSignal(ledger);
+      let yields = 0;
+      const unlog = logTransactions(engine, ledger);
+      const result = await withClock(async jump => {
+        const unhook = onLookup(engine, ledger, conceptOf(groups - 1), () => { ledger.lookups.push(conceptOf(groups - 1)); jump(31_000); });
+        try {
+          return await runPhaseSynthesizeConcepts(engine, { sourceId: 'default', brainDir: root, _atoms: atomsFor(groups), signal: controller.signal, phaseBudgetMs: BUDGET_MS,
+            yieldDuringPhase: async () => { yields++; ledger.issued = tick(ledger); fire(controller, jump); } });
+        } finally { unhook(); }
+      }).finally(unlog);
+      expect(yields).toBe(1);
+      return { ledger, result };
+    };
+
+    test('W2s: a signal during the last group\'s maybeYield: no final flush, every queued concept discarded', async () => {
+      const GROUPS = 6;
+      await managed(databaseUrl, GROUPS, async (engine, root) => {
+        const { ledger, result } = await cancelAfterLastGroup(engine, root, GROUPS, controller => controller.abort());
+        expect(ledger.observed).not.toBeNull();
+        await expectCancelContract(engine, ledger, result, GROUPS, { committed: 0, queuedDiscarded: GROUPS, skipped: 0 });
+      });
+    }, 240_000);
+
+    test('W2d: the deadline during the last group\'s maybeYield: same as the signal', async () => {
+      const GROUPS = 6;
+      await managed(databaseUrl, GROUPS, async (engine, root) => {
+        const { ledger, result } = await cancelAfterLastGroup(engine, root, GROUPS, (_controller, jump) => jump(BUDGET_MS + 1));
+        await expectCancelContract(engine, ledger, result, GROUPS, { committed: 0, queuedDiscarded: GROUPS, skipped: 0 });
       });
     }, 240_000);
   });
