@@ -92,7 +92,12 @@ export function makeHandler(cfg: Config, d: Deps) {
       if (h2) { ledger({ ...base, status: 429, code: 'bridge_halted', halted_by: h2.code }); return err(429, 'bridge_halted', `bridge halted by ${h2.code}; operator must clear halted.json`, { 'retry-after': '3600' }); }
       let up;
       try { up = await d.upstream(responsesBody(parsed), token, { connect: cfg.upstream.connect_ms, request: cfg.upstream.request_ms }, parsed.route.max_output_chars); }
-      catch (e) { const code = e instanceof UpstreamError ? e.code : 'TRANSPORT-UNKNOWN'; ledger({ ...base, status: 502, code: 'unknown_completion', detail: code, latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion', code); }
+      catch (e) {
+        const code = e instanceof UpstreamError ? e.code : 'TRANSPORT-UNKNOWN';
+        // S561 capture only: the socket error and how far the request got, so a drop names its cause. Decision unchanged.
+        const why = e instanceof UpstreamError ? { cause: e.cause, connected: e.connected, sent: e.sent } : { cause: String((e as Error)?.message ?? e).slice(0, 200) };
+        ledger({ ...base, status: 502, code: 'unknown_completion', detail: code, ...why, latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion', code);
+      }
       if (up.status !== 200) {
         let code = 'upstream_error';
         try { const b = JSON.parse(up.raw.toString()); if (typeof b?.error?.code === 'string') code = b.error.code; } catch { /* keep generic */ }

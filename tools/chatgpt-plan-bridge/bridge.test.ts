@@ -115,6 +115,16 @@ test('transport failure and a stream without a terminal event are unknown comple
   const r = await b.post(ok); expect(r.status).toBe(502); expect((await r.json()).error.code).toBe('unknown_completion');
 });
 
+test('S561 capture only: a transport failure records the socket cause and how far the request got; the latch still trips', async () => {
+  const { UpstreamError } = await import('./upstream.ts');
+  const s = setup({ upstream: async () => { throw new UpstreamError('TRANSPORT-UNKNOWN', Buffer.alloc(0), 'ECONNRESET: socket hang up', true, false); } });
+  const r = await s.post(ok); expect(r.status).toBe(502); expect((await r.json()).error.code).toBe('unknown_completion');
+  const rows = readFileSync(join(s.dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  const row = rows.find(x => x.code === 'unknown_completion');
+  expect(row).toMatchObject({ detail: 'TRANSPORT-UNKNOWN', cause: 'ECONNRESET: socket hang up', connected: true, sent: false });
+  expect(existsSync(join(s.dir, 'halted.json'))).toBe(true); // decision unchanged: still latches
+});
+
 test('provider limit codes map to 429/503; upstream 429 passes Retry-After', async () => {
   const lim = setup({ upstream: async () => ({ status: 200, raw: Buffer.from(ev('response.failed', { response: { error: { code: 'subscription_sharing_usage_limit_exceeded' } } })), charCapHit: false }) });
   expect((await lim.post(ok)).status).toBe(429);
