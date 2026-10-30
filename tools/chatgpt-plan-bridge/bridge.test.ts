@@ -115,14 +115,34 @@ test('transport failure and a stream without a terminal event are unknown comple
   const r = await b.post(ok); expect(r.status).toBe(502); expect((await r.json()).error.code).toBe('unknown_completion');
 });
 
-test('S561 capture only: a transport failure records the socket cause and how far the request got; the latch still trips', async () => {
-  const { UpstreamError } = await import('./upstream.ts');
-  const s = setup({ upstream: async () => { throw new UpstreamError('TRANSPORT-UNKNOWN', Buffer.alloc(0), 'ECONNRESET: socket hang up', true, false); } });
+test('S561 capture only: the real socket path records err_code, syscall and phase, and the latch still trips', async () => {
+  const { makeSender, UpstreamError } = await import('./upstream.ts');
+  const { createServer } = await import('node:net');
+  // A port that refuses: bind, read the port, close. The real sender then fails in connect.
+  const port = await new Promise<number>(res => { const srv = createServer(); srv.listen(0, '127.0.0.1', () => { const p = (srv.address() as any).port; srv.close(() => res(p)); }); });
+  const send = makeSender(`https://127.0.0.1:${port}/v1/responses`);
+  const e = await send({}, 'tok', { connect: 2000, request: 2000 }, 100).then(() => null, x => x);
+  expect(e).toBeInstanceOf(UpstreamError);
+  expect(e.code).toBe('TRANSPORT-UNKNOWN');
+  expect(e.info).toEqual({ err_code: 'ECONNREFUSED', syscall: 'connect', phase: 'connecting' });
+  const s = setup({ upstream: async () => { throw e; } });
   const r = await s.post(ok); expect(r.status).toBe(502); expect((await r.json()).error.code).toBe('unknown_completion');
-  const rows = readFileSync(join(s.dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
-  const row = rows.find(x => x.code === 'unknown_completion');
-  expect(row).toMatchObject({ detail: 'TRANSPORT-UNKNOWN', cause: 'ECONNRESET: socket hang up', connected: true, sent: false });
+  const row = readFileSync(join(s.dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).find(x => x.code === 'unknown_completion');
+  expect(row).toMatchObject({ detail: 'TRANSPORT-UNKNOWN', err_code: 'ECONNREFUSED', syscall: 'connect', phase: 'connecting' });
   expect(existsSync(join(s.dir, 'halted.json'))).toBe(true); // decision unchanged: still latches
+});
+
+test('S561 capture never logs an error message or an unexpected code: secret-shaped text stays out of the ledger', async () => {
+  const { UpstreamError, transportInfo } = await import('./upstream.ts');
+  const secret = 'sk-or-v1-' + 'a'.repeat(64);
+  const odd = Object.assign(new Error(`boom ${secret}`), { code: `X ${secret}`, syscall: secret });
+  expect(transportInfo(odd, true, true)).toEqual({ err_code: 'OTHER', phase: 'request_sent' });
+  for (const thrown of [new UpstreamError('TRANSPORT-UNKNOWN', Buffer.alloc(0), transportInfo(odd, true, false)), new Error(`plain ${secret}`)]) {
+    const s = setup({ upstream: async () => { throw thrown; } });
+    expect((await s.post(ok)).status).toBe(502);
+    const ledger = readFileSync(join(s.dir, 'requests.jsonl'), 'utf8');
+    expect(ledger).not.toContain(secret); expect(ledger).not.toContain('boom'); expect(ledger).not.toContain('plain');
+  }
 });
 
 test('provider limit codes map to 429/503; upstream 429 passes Retry-After', async () => {

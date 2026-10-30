@@ -94,8 +94,8 @@ export function makeHandler(cfg: Config, d: Deps) {
       try { up = await d.upstream(responsesBody(parsed), token, { connect: cfg.upstream.connect_ms, request: cfg.upstream.request_ms }, parsed.route.max_output_chars); }
       catch (e) {
         const code = e instanceof UpstreamError ? e.code : 'TRANSPORT-UNKNOWN';
-        // S561 capture only: the socket error and how far the request got, so a drop names its cause. Decision unchanged.
-        const why = e instanceof UpstreamError ? { cause: e.cause, connected: e.connected, sent: e.sent } : { cause: String((e as Error)?.message ?? e).slice(0, 200) };
+        // S561 capture only: allowlisted transport fields (error code, syscall, phase), never a message. Decision unchanged.
+        const why = e instanceof UpstreamError && e.info ? e.info : {};
         ledger({ ...base, status: 502, code: 'unknown_completion', detail: code, ...why, latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion', code);
       }
       if (up.status !== 200) {

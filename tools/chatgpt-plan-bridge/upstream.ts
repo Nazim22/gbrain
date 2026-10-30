@@ -11,17 +11,19 @@ export const RESPONSES = 'https://api.openai.com/v1/responses';
 export const STREAM_MAX_BYTES = 2 * 1024 * 1024;
 export type Upstream = { status: number; raw: Buffer; charCapHit: boolean; retryAfter?: string };
 export type UpstreamSender = (body: unknown, accessToken: string, bounds: { connect: number; request: number }, maxChars: number) => Promise<Upstream>;
-/** `cause` is the socket's own error (code + message, capped) and `sent` says whether the request body finished writing.
- *  Capture only (S561): the latch and its codes are unchanged; this names why a TRANSPORT-UNKNOWN happened. */
-export class UpstreamError extends Error {
-  constructor(readonly code: string, readonly raw?: Buffer, readonly cause?: string, readonly connected?: boolean, readonly sent?: boolean) { super(code); }
-}
-const describe = (e: unknown): string => {
-  const x = e as { code?: unknown; name?: unknown; message?: unknown };
-  return `${String(x?.code ?? x?.name ?? 'Error')}: ${String(x?.message ?? '')}`.replace(/Bearer\s+\S+/gi, 'Bearer <redacted>').slice(0, 200);
+/** Allowlisted transport metadata for a failed call (S561 capture only; the latch and its codes are unchanged):
+ *  the socket error's code and syscall when they have the expected shape, and how far the request got. Never a message. */
+export type TransportInfo = { err_code?: string; syscall?: string; phase: 'connecting' | 'connected' | 'request_sent' };
+export class UpstreamError extends Error { constructor(readonly code: string, readonly raw?: Buffer, readonly info?: TransportInfo) { super(code); } }
+export const transportInfo = (e: unknown, connected: boolean, sent: boolean): TransportInfo => {
+  const x = e as { code?: unknown; syscall?: unknown } | null;
+  const code = typeof x?.code === 'string' && /^[A-Z][A-Z0-9_]{1,39}$/.test(x.code) ? x.code : e ? 'OTHER' : undefined;
+  const syscall = typeof x?.syscall === 'string' && /^[a-z_]{1,20}$/.test(x.syscall) ? x.syscall : undefined;
+  return { ...(code ? { err_code: code } : {}), ...(syscall ? { syscall } : {}), phase: sent ? 'request_sent' : connected ? 'connected' : 'connecting' };
 };
 
-export const sendUpstream: UpstreamSender = (body, accessToken, bounds, maxChars) => new Promise((resolve, reject) => {
+/** A sender for one endpoint; `sendUpstream` is the production one. The URL is a parameter so tests drive the real socket path. */
+export const makeSender = (url: string): UpstreamSender => (body, accessToken, bounds, maxChars) => new Promise((resolve, reject) => {
   const data = JSON.stringify(body);
   let finished = false, size = 0, deltaChars = 0, connected = false, sent = false;
   const chunks: Buffer[] = [];
@@ -29,8 +31,8 @@ export const sendUpstream: UpstreamSender = (body, accessToken, bounds, maxChars
     try { const d = JSON.parse(e.data); if (d.type === 'response.output_text.delta' && typeof d.delta === 'string') deltaChars += d.delta.length; } catch { /* the terminal parser judges malformed events */ }
   } });
   const done = (v: Upstream) => { if (finished) return; finished = true; clearTimeout(connect); clearTimeout(deadline); resolve(v); };
-  const fail = (code: string, cause?: string) => { if (finished) return; finished = true; clearTimeout(connect); clearTimeout(deadline); req.destroy(); reject(new UpstreamError(code, Buffer.concat(chunks), cause, connected, sent)); };
-  const req = httpsRequest(RESPONSES, { agent: false, method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` } }, res => {
+  const fail = (code: string, e?: unknown) => { if (finished) return; finished = true; clearTimeout(connect); clearTimeout(deadline); req.destroy(); reject(new UpstreamError(code, Buffer.concat(chunks), transportInfo(e, connected, sent))); };
+  const req = httpsRequest(url, { agent: false, method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` } }, res => {
     clearTimeout(connect);
     const status = res.statusCode ?? 0;
     if (status >= 300 && status < 400) { res.destroy(); fail('REDIRECT'); return; }
@@ -39,16 +41,17 @@ export const sendUpstream: UpstreamSender = (body, accessToken, bounds, maxChars
       chunks.push(c);
       if (status === 200) { counter.feed(c.toString()); if (deltaChars > maxChars) { req.destroy(); done({ status, raw: Buffer.concat(chunks), charCapHit: true }); } }
     });
-    res.on('aborted', () => fail('DISCONNECTED', 'response aborted')); res.on('error', e => fail('DISCONNECTED', describe(e)));
+    res.on('aborted', () => fail('DISCONNECTED')); res.on('error', e => fail('DISCONNECTED', e));
     res.on('end', () => done({ status, raw: Buffer.concat(chunks), charCapHit: false, retryAfter: res.headers['retry-after'] as string | undefined }));
   });
   const connect = setTimeout(() => fail('CONNECT-TIMEOUT'), bounds.connect);
   const deadline = setTimeout(() => fail('REQUEST-TIMEOUT'), bounds.request);
   req.on('socket', s => s.once('secureConnect', () => { connected = true; clearTimeout(connect); }));
   req.on('finish', () => { sent = true; });
-  req.on('error', e => fail('TRANSPORT-UNKNOWN', describe(e)));
+  req.on('error', e => fail('TRANSPORT-UNKNOWN', e));
   req.end(data);
 });
+export const sendUpstream: UpstreamSender = makeSender(RESPONSES);
 
 /**
  * Terminal parse of a plan-route stream into answer text (rules of the reviewed parseLuna, generalised to text):
