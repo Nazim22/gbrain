@@ -16,7 +16,7 @@ The steps use only reviewed code:
 
 **Variables:**
 ```
-W=/root/work/gbrain-s552-luna-bridge   HEAD=<HEAD>   RUN=/root/work/dream-s552-luna/stage2-run
+W=/root/work/gbrain-luna484   HEAD=<HEAD>   RUN=/root/work/dream-s552-luna/stage2-run
 C=$W/tools/chatgpt-plan-bridge/deploy  O=$W/tools/chatgpt-plan-bridge/ops   CORPUS=/root/.claude/projects/-root/session-text
 ```
 DB access in every step:

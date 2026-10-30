@@ -10,7 +10,7 @@
 # rollback act only on that attempt, and verify the chain manifest -> before.json -> preflight.ok -> run -> after.json.
 set -euo pipefail
 STEP=${1:?step} WANT=${2:?reviewed head}
-W=/root/work/gbrain-s552-luna-bridge OPS=$W/tools/chatgpt-plan-bridge/ops D=/root/work/dream-s552-luna/canary DB=gbrain_pingu
+W=/root/work/gbrain-luna484 OPS=$W/tools/chatgpt-plan-bridge/ops D=/root/work/dream-s552-luna/canary DB=gbrain_pingu
 # DRY RUN (tests only): CANARY_DRYRUN=1 with CANARY_DB=gbrain_s552_* + CANARY_DIR + GBRAIN_HOME (scratch): every systemctl
 # becomes a printed no-op and nothing touches the live DB, home or services. Refused for any non-scratch database.
 if [[ ${CANARY_DRYRUN:-} == 1 ]]; then
