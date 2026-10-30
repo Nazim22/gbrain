@@ -1574,6 +1574,7 @@ async function runPhaseExtractFacts(
         phantoms_ambiguous: result.phantomsAmbiguous,
         phantoms_skipped_drift: result.phantomsSkippedDrift,
         phantoms_held_legacy_rows: result.phantomsHeldLegacyRows,
+        phantoms_skipped_disabled: result.phantomsSkippedDisabled,
         phantoms_lock_busy: result.phantomsLockBusy,
         phantoms_more_pending: result.phantomsMorePending,
         ...(decideConflict ? { decide_conflict: decideConflict } : {}),
