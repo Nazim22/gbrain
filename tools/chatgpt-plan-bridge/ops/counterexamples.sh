@@ -25,7 +25,7 @@ echo "old receipt id=$RID"
 # The seed atoms are pre-existing LIVE atoms for these sources: retire them as rollback-owned so preflight admits the retry.
 cap seed_before_rb
 bun -e "
-import postgres from 'postgres'; import {readFileSync} from 'node:fs';
+import postgres from '$W/vendor/postgres/src/index.js'; import {readFileSync} from 'node:fs';
 const sql=postgres(process.env.DATABASE_URL!,{max:1}); const paths=readFileSync('$M','utf8').split('\n').filter(Boolean).map(l=>l.split('\t')[1]);
 await sql\`update pages set deleted_at=now(), frontmatter=frontmatter||jsonb_build_object('retired_by','luna-batch-rollback','retired_at',now()::text) where type='atom' and deleted_at is null and frontmatter->>'source_path' = any(\${paths})\`;
 await sql\`delete from derived_generation_items where generation_id in (select id from derived_generations where kind='atom')\`; await sql\`delete from derived_generations where kind='atom'\`;

@@ -8,7 +8,7 @@
  * a rollback's parts stay excluded (r3, Pebble 17:35Z), so there is no readmission. The file-level exclusions
  * (stale single, active session, undatable) are date_parts.py plan's, applied to this tool's missing list.
  */
-import postgres from 'postgres';
+import postgres from '#postgres';
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { discoverTranscripts } from '../../../src/core/cycle/transcript-discovery.ts';

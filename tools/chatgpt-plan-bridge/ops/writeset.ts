@@ -3,7 +3,7 @@
  * Usage: DATABASE_URL=... bun writeset.ts capture <manifest> <corpusDir> <out.json> [--like <before.json>]   (AFTER: reuse BEFORE's receipt families)
  *        DATABASE_URL=... bun writeset.ts preflight <before.json>                                   (exit 1 unless clean)
  */
-import postgres from 'postgres';
+import postgres from '#postgres';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { relative, resolve, sep } from 'node:path';

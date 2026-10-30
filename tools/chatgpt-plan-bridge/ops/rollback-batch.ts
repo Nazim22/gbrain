@@ -11,7 +11,7 @@
  * changed existing atoms + receipts → restored to their captured BEFORE state;
  * new generations / items / transcript-state rows → deleted; a changed existing generation or state row → abort.
  */
-import postgres from 'postgres';
+import postgres from '#postgres';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { OWN, type Capture } from './writeset.ts';
