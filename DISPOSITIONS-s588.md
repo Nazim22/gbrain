@@ -5,7 +5,7 @@ Fork-only set: `git log --oneline 2fa2c921..c7aa3284b --no-merges` = 82 commits.
 
 Note: the brief said #9139 upstreamed our #7986 ranking, concept-deadline, CLI notice, phantom-redirect and procfs fixes. Upstream 777f8217f says only the concept-synthesis **abort signal** was taken; "its ranking, CLI notice, phantom-redirect and procfs changes are out of scope". Each patch below was checked against upstream code, not the PR title.
 
-Counts: KEEP 71 · ADAPT 10 · DROP 1 (of 82; ADAPT includes 4 OPEN test commits).
+Counts: KEEP 71 · ADAPT 10 · DROP 1 (of 82).
 
 | commit | date | subject | disposition | reason |
 |---|---|---|---|---|
@@ -34,11 +34,11 @@ Counts: KEEP 71 · ADAPT 10 · DROP 1 (of 82; ADAPT includes 4 OPEN test commits
 | `1beb9405b` | 2026-10-25 | refactor(cycle): move the extract_atoms provider-options parser into a sibling module | KEEP | atom prompt scope + extraction-only provider_options; live config sets cycle.extract_atoms.provider_options; not upstream |
 | `7c63f2831` | 2026-10-29 | Hold owner-directed retirements from the 72 h purge | KEEP | owner-directed retirement hold from the 72 h purge; not upstream; g0 test passes |
 | `ba9a15686` | 2026-10-29 | port-484 adapt | KEEP | port-484 adapt; still applies after auto-merge |
-| `bc1c3ff23` | 2026-10-29 | test(cycle): pin no concept publication after an observed cancel (C1) | ADAPT (OPEN) | C1 cancel tests assert the old signal contract (partial result, details.groups_skipped/queued_discarded); 7 cases + 1 unhandled error now fail because upstream throws AbortError; invariants (i)-(iii) still valid, need re-expressing (decision for Pingu) |
-| `e7139e49d` | 2026-10-29 | test: lane the C1 cancel-publication Postgres arm | ADAPT (OPEN) | C1 cancel tests assert the old signal contract (partial result, details.groups_skipped/queued_discarded); 7 cases + 1 unhandled error now fail because upstream throws AbortError; invariants (i)-(iii) still valid, need re-expressing (decision for Pingu) |
+| `bc1c3ff23` | 2026-10-29 | test(cycle): pin no concept publication after an observed cancel (C1) | ADAPT | C1 cancel tests now assert the upstream #7986 contract on the signal path (AbortError, null result) and keep invariants (i)-(iii) plus the committed/discarded counts from the ledger; deadline cases keep the full partial-result accounting |
+| `e7139e49d` | 2026-10-29 | test: lane the C1 cancel-publication Postgres arm | ADAPT | C1 cancel tests now assert the upstream #7986 contract on the signal path (AbortError, null result) and keep invariants (i)-(iii) plus the committed/discarded counts from the ledger; deadline cases keep the full partial-result accounting |
 | `8b5321bf9` | 2026-10-29 | fix(cycle): no concept publication after a cancel seen at the coverage read or after the last group | ADAPT | signal-cancel half superseded by upstream 777f8217f/a40afb695 (#7986 credited); deadline checks kept at the same points (late reply, after lookup, after coverage read, no final flush) |
-| `b8ba12acf` | 2026-10-29 | test(cycle): pin what the separate concept publication steps leave on failure or refusal | ADAPT (OPEN) | C1 cancel tests assert the old signal contract (partial result, details.groups_skipped/queued_discarded); 7 cases + 1 unhandled error now fail because upstream throws AbortError; invariants (i)-(iii) still valid, need re-expressing (decision for Pingu) |
-| `003e517e8` | 2026-10-29 | test(cycle): attribute savepoint rows and the consumer's own transactions in the C1 cancel ledger | ADAPT (OPEN) | C1 cancel tests assert the old signal contract (partial result, details.groups_skipped/queued_discarded); 7 cases + 1 unhandled error now fail because upstream throws AbortError; invariants (i)-(iii) still valid, need re-expressing (decision for Pingu) |
+| `b8ba12acf` | 2026-10-29 | test(cycle): pin what the separate concept publication steps leave on failure or refusal | ADAPT | C1 cancel tests now assert the upstream #7986 contract on the signal path (AbortError, null result) and keep invariants (i)-(iii) plus the committed/discarded counts from the ledger; deadline cases keep the full partial-result accounting |
+| `003e517e8` | 2026-10-29 | test(cycle): attribute savepoint rows and the consumer's own transactions in the C1 cancel ledger | ADAPT | C1 cancel tests now assert the upstream #7986 contract on the signal path (AbortError, null result) and keep invariants (i)-(iii) plus the committed/discarded counts from the ledger; deadline cases keep the full partial-result accounting |
 | `bce44d08a` | 2026-10-26 | wip(s552): standalone paired ChatGPT-plan eval; consent launch decision pending | KEEP | eval/chatgpt-plan local tool; separate directory, no upstream overlap |
 | `3d33a6b8a` | 2026-10-26 | fix(s552): confine consent callback replies to established IPv4 loopback | KEEP | eval/chatgpt-plan local tool; separate directory, no upstream overlap |
 | `589f825d8` | 2026-10-26 | fix(eval): enforce launch confinement and single ownership | KEEP | eval/chatgpt-plan local tool; separate directory, no upstream overlap |
@@ -91,3 +91,5 @@ Counts: KEEP 71 · ADAPT 10 · DROP 1 (of 82; ADAPT includes 4 OPEN test commits
 | `10496a802` | 2026-10-29 | fix(luna-ops): import gbrain's vendored postgres, not an untracked node_modules copy | KEEP | Luna stage-2 ops under tools/chatgpt-plan-bridge; no upstream overlap |
 | `0de9ffb39` | 2026-10-29 | port(luna484): function-size baseline carries Luna's 3 provenance lines | KEEP | function-size baseline rows for Luna provenance lines; check:function-size passes |
 | `31e6e3f4a` | 2026-10-29 | port(luna484): canary.sh runs this checkout, not the old Luna worktree | KEEP | Luna stage-2 ops under tools/chatgpt-plan-bridge; no upstream overlap |
+
+Merge fix found by the adapted tests: the resolved chat call carried two `abortSignal` keys, and upstream's later `abortSignal: opts.signal` silently replaced the local deadline signal, so the wall-clock budget no longer cancelled a slow model call. Upstream's key was removed; `conceptCallSignal(deadline, opts.signal)` covers both.

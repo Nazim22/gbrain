@@ -91,21 +91,20 @@ describe('synthesize_concepts wall-clock bound', () => {
     const ac = new AbortController();
     ac.abort();
     let calls = 0;
-    const result = await runPhaseSynthesizeConcepts(engine, {
+    // Upstream #7986 contract: a cycle-signal abort throws AbortError before any spend.
+    await expect(runPhaseSynthesizeConcepts(engine, {
       _atoms: atomsForGroups(10),
       _chat: async (o) => { calls++; return localChat()(o); },
       signal: ac.signal,
-    });
-    const d = result.details as Record<string, unknown>;
+    })).rejects.toThrow(/synthesize_concepts/);
     expect(calls).toBe(0);
-    expect(d.concepts_written).toBe(0);
-    expect(d.groups_skipped).toBe(10);
+    expect(await engine.getPage('concepts/c0')).toBeNull();
   }, 30000);
 
   test('abort during chat reaches the provider and publishes no concept', async () => {
     const ac = new AbortController();
     let received: AbortSignal | undefined;
-    const result = await runPhaseSynthesizeConcepts(engine, {
+    await expect(runPhaseSynthesizeConcepts(engine, {
       _atoms: atomsForGroups(1), signal: ac.signal,
       _chat: async (o) => {
         received = o.abortSignal;
@@ -113,11 +112,8 @@ describe('synthesize_concepts wall-clock bound', () => {
         ac.abort();
         return localChat()(o);
       },
-    });
-    const d = result.details as Record<string, unknown>;
+    })).rejects.toThrow(/synthesize_concepts/);
     expect(received?.aborted).toBe(true);
-    expect(d.concepts_written).toBe(0);
-    expect(d.groups_skipped).toBe(1);
     expect((await engine.getPage('concepts/c0'))).toBeNull();
   }, 30000);
 
@@ -138,14 +134,11 @@ describe('synthesize_concepts wall-clock bound', () => {
 
   test('a provider that throws on cancellation records no LLM failure', async () => {
     const ac = new AbortController();
-    const result = await runPhaseSynthesizeConcepts(engine, {
+    // The abort is seen before the catch records a failure, so no template fallback is published.
+    await expect(runPhaseSynthesizeConcepts(engine, {
       _atoms: atomsForGroups(1), signal: ac.signal,
       _chat: async () => { ac.abort(); throw new Error('The operation was aborted.'); },
-    });
-    const d = result.details as Record<string, unknown>;
-    expect(d.failures).toEqual([]);
-    expect(d.concepts_written).toBe(0);
-    expect(d.groups_skipped).toBe(1);
+    })).rejects.toThrow(/synthesize_concepts/);
     expect((await engine.getPage('concepts/c0'))).toBeNull();
   }, 30000);
 
@@ -162,13 +155,10 @@ describe('synthesize_concepts wall-clock bound', () => {
       return originalGetPage(...args);
     }) as typeof engine.getPage;
     try {
-      const result = await runPhaseSynthesizeConcepts(engine, {
+      await expect(runPhaseSynthesizeConcepts(engine, {
         _atoms: atomsForGroups(1), signal: ac.signal, _chat: localChat(),
-      });
+      })).rejects.toThrow(/synthesize_concepts/);
       expect(lookupReached).toBe(true);
-      expect((result.details as Record<string, unknown>).concepts_written).toBe(0);
-      expect((result.details as Record<string, unknown>).partial).toBe(true);
-      expect((result.details as Record<string, unknown>).groups_skipped).toBe(1);
     } finally {
       delete (engine as any).getPage;
     }

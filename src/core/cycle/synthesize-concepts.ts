@@ -469,7 +469,6 @@ export async function runPhaseSynthesizeConcepts(
               },
             ],
             maxTokens: synthMaxOutputTokens,
-            abortSignal: opts.signal,
           });
           // Post-await yield (T3): the LLM call is the main TTL hazard
           // codex flagged. Throttle inside maybeYield bounds the actual

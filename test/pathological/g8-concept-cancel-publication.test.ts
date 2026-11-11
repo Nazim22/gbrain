@@ -157,8 +157,15 @@ async function withClock<T>(run: (jump: (ms: number) => void) => Promise<T>): Pr
 
 interface Expected { committed: number; queuedDiscarded: number; skipped: number; inFlight?: string }
 
-async function expectCancelContract(engine: BrainEngine, ledger: Ledger, result: PhaseResult, groups: number, expected: Expected): Promise<void> {
-  const details = result.details as Record<string, unknown>;
+/**
+ * Upstream #7986 contract: a signal cancel throws `synthesize_concepts: …` (AbortError) after saving retries and the
+ * rollup, so there is no phase result; the local wall-clock deadline still returns a partial result. Null = aborted.
+ */
+const abortedToNull = (run: Promise<PhaseResult>): Promise<PhaseResult | null> =>
+  run.catch((e: unknown) => { if (e instanceof Error && /^synthesize_concepts: /.test(e.message)) return null; throw e; });
+
+async function expectCancelContract(engine: BrainEngine, ledger: Ledger, result: PhaseResult | null, groups: number, expected: Expected): Promise<void> {
+  const details = (result?.details ?? null) as Record<string, unknown> | null;
   expect(ledger.issued).not.toBeNull(); // the cancel fired (positive control)
   expect(ledger.returned).not.toBeNull();
   await logSettled(ledger);
@@ -192,9 +199,12 @@ async function expectCancelContract(engine: BrainEngine, ledger: Ledger, result:
   // (iv)
   const rolledBack = publications.filter(tx => tx.outcome === 'rolled_back').length;
   const reached = [...new Set(ledger.lookups)].length;
-  const counts = { committed: pages.length, rolled_back: rolledBack, queued_discarded: reached - pages.length - rolledBack, skipped: details.groups_skipped };
-  expect(counts).toEqual({ committed: expected.committed, rolled_back: 0, queued_discarded: expected.queuedDiscarded, skipped: expected.skipped });
-  expect(counts.committed + counts.rolled_back + counts.queued_discarded + (counts.skipped as number)).toBe(details.groups_found as number);
+  const counts = { committed: pages.length, rolled_back: rolledBack, queued_discarded: reached - pages.length - rolledBack };
+  expect(counts).toEqual({ committed: expected.committed, rolled_back: 0, queued_discarded: expected.queuedDiscarded });
+  expect(reached + expected.skipped).toBe(groups); // every group was either reached or never started
+  if (!details) return; // signal cancel: the phase threw, nothing further to account
+  expect(details.groups_skipped).toBe(expected.skipped);
+  expect(counts.committed + counts.rolled_back + counts.queued_discarded + (details.groups_skipped as number)).toBe(details.groups_found as number);
   expect(details.queued_discarded).toBe(counts.queued_discarded);
   expect(details.groups_found).toBe(groups);
   expect(details.partial).toBe(true);
@@ -238,11 +248,12 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
         const controller = observedSignal(ledger);
         const unlog = logTransactions(engine, ledger);
         const unhook = onLookup(engine, ledger, conceptOf(K), () => { ledger.issued = tick(ledger); controller.abort(); });
-        let result: PhaseResult;
+        let result: PhaseResult | null;
         try {
-          result = await runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), signal: controller.signal, phaseBudgetMs: BUDGET_MS });
+          result = await abortedToNull(runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), signal: controller.signal, phaseBudgetMs: BUDGET_MS }));
         } finally { unhook(); unlog(); }
         expect(ledger.observed).not.toBeNull();
+        expect(result!).toBeNull();
         await expectCancelContract(engine, ledger, result!, GROUPS, { committed: K, queuedDiscarded: 0, skipped: GROUPS - K });
       });
     }, 240_000);
@@ -272,14 +283,15 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
           await Bun.sleep(20);
         });
         const unhook = onLookup(engine, ledger, '', () => {});
-        let result: PhaseResult;
+        let result: PhaseResult | null;
         try {
-          result = await runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), signal: controller.signal, phaseBudgetMs: BUDGET_MS });
+          result = await abortedToNull(runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), signal: controller.signal, phaseBudgetMs: BUDGET_MS }));
         } finally { unhook(); unlog(); }
         expect(paused).not.toBeNull();
         expect(paused!.outcome).toBe('committed');
         // The in-flight publication's own later steps (its links, its world promotion) ran after the cancel was issued.
         expect(ledger.txs.some(tx => tx.begin > ledger.issued! && tx.links.includes(conceptOf(K)))).toBe(true);
+        expect(result!).toBeNull();
         await expectCancelContract(engine, ledger, result!, GROUPS, { committed: K + 1, queuedDiscarded: 0, skipped: GROUPS - K - 1, inFlight: conceptOf(K) });
       });
     }, 240_000);
@@ -301,11 +313,12 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
         const controller = observedSignal(ledger);
         const unlog = logTransactions(engine, ledger);
         const unhook = cancelAtCoverage(engine, ledger, () => controller.abort());
-        let result: PhaseResult;
+        let result: PhaseResult | null;
         try {
-          result = await runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), signal: controller.signal, phaseBudgetMs: BUDGET_MS });
+          result = await abortedToNull(runPhaseSynthesizeConcepts(engine, { _atoms: atomsFor(GROUPS), signal: controller.signal, phaseBudgetMs: BUDGET_MS }));
         } finally { unhook(); unlog(); }
         expect(ledger.observed).not.toBeNull();
+        expect(result!).toBeNull();
         await expectCancelContract(engine, ledger, result!, GROUPS, { committed: K, queuedDiscarded: 0, skipped: GROUPS - K });
       });
     }, 240_000);
@@ -333,7 +346,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       const controller = observedSignal(ledger);
       const disarm = arm(ledger, controller);
       try {
-        return { ledger, result: await runPhaseSynthesizeConcepts(engine, { sourceId: 'default', brainDir: root, _atoms: atomsFor(groups), signal: controller.signal, phaseBudgetMs: BUDGET_MS }) };
+        return { ledger, result: await abortedToNull(runPhaseSynthesizeConcepts(engine, { sourceId: 'default', brainDir: root, _atoms: atomsFor(groups), signal: controller.signal, phaseBudgetMs: BUDGET_MS })) };
       } finally { disarm(); }
     };
     const signalAtLookup = (engine: BrainEngine, group: number) => (ledger: Ledger, controller: AbortController) => {
@@ -347,6 +360,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       await managed(databaseUrl, GROUPS, async (engine, root) => {
         const { ledger, result } = await runManaged(engine, root, GROUPS, signalAtLookup(engine, K));
         expect(ledger.observed).not.toBeNull();
+        expect(result).toBeNull();
         await expectCancelContract(engine, ledger, result, GROUPS, { committed: 0, queuedDiscarded: K, skipped: GROUPS - K });
       });
     }, 240_000);
@@ -371,6 +385,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       await managed(databaseUrl, GROUPS, async (engine, root) => {
         const { ledger, result } = await runManaged(engine, root, GROUPS, signalAtLookup(engine, CAPACITY + J));
         expect(ledger.observed).not.toBeNull();
+        expect(result).toBeNull();
         await expectCancelContract(engine, ledger, result, GROUPS, { committed: CAPACITY, queuedDiscarded: J, skipped: GROUPS - CAPACITY - J });
       });
     }, 240_000);
@@ -393,6 +408,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
         expect(paused).not.toBeNull();
         expect(paused!.outcome).toBe('committed');
         expect(ledger.observed).not.toBeNull();
+        expect(result).toBeNull();
         await expectCancelContract(engine, ledger, result, GROUPS, { committed: CAPACITY, queuedDiscarded: 0, skipped: GROUPS - CAPACITY });
       });
     }, 240_000);
@@ -409,8 +425,8 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       const result = await withClock(async jump => {
         const unhook = onLookup(engine, ledger, conceptOf(groups - 1), () => { ledger.lookups.push(conceptOf(groups - 1)); jump(31_000); });
         try {
-          return await runPhaseSynthesizeConcepts(engine, { sourceId: 'default', brainDir: root, _atoms: atomsFor(groups), signal: controller.signal, phaseBudgetMs: BUDGET_MS,
-            yieldDuringPhase: async () => { yields++; ledger.issued = tick(ledger); fire(controller, jump); } });
+          return await abortedToNull(runPhaseSynthesizeConcepts(engine, { sourceId: 'default', brainDir: root, _atoms: atomsFor(groups), signal: controller.signal, phaseBudgetMs: BUDGET_MS,
+            yieldDuringPhase: async () => { yields++; ledger.issued = tick(ledger); fire(controller, jump); } }));
         } finally { unhook(); }
       }).finally(unlog);
       expect(yields).toBe(1);
@@ -422,6 +438,7 @@ for (const { backend, databaseUrl } of pathologicalArms()) {
       await managed(databaseUrl, GROUPS, async (engine, root) => {
         const { ledger, result } = await cancelAfterLastGroup(engine, root, GROUPS, controller => controller.abort());
         expect(ledger.observed).not.toBeNull();
+        expect(result).toBeNull();
         await expectCancelContract(engine, ledger, result, GROUPS, { committed: 0, queuedDiscarded: GROUPS, skipped: 0 });
       });
     }, 240_000);
