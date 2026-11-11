@@ -14,14 +14,14 @@ import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
 import { appendContextNote, type InferredVia } from '../facts/subject-infer.ts';
 import { inferenceNote } from '../facts/subject-infer-write.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
-import { FACT_WITHDRAWN_MESSAGE, isFactWithdrawn, withdrawnFromDetail } from '../facts/withdrawal.ts';
+import { FACT_WITHDRAWN_MESSAGE, withdrawnFromDetail } from '../facts/withdrawal.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { authorizeStoredRequest, authorizeWrite, submissionAuthority } from './authority.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { initializeLocalPersistence } from './page-mutations.ts';
 import { prepareFileTarget } from './page-prepare.ts';
-import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
+import { currentVerifiedLocalWriter, hostIdFor } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, probeWorktreeWriter, type WorktreeBinding } from './ownership.ts';
 import { authorizeFactsBackstop } from './effect-facts.ts';
 import { admitWriteInTransaction, getWriteRequest, getWriteRequestById, receiptFor } from './journal.ts';
@@ -34,6 +34,7 @@ import { FACTS_BATCH_INCOMPLETE_MESSAGE, isEntityMovedRefusal } from './verb-err
 import { assertAmbientCaptureAdmissible, captureGateLaneForSource } from '../facts/capture-sources.ts';
 import { declareDerivation, type DerivationDeclaration } from '../trust/taint.ts';
 import type { TaintInput, WriteTrust } from '../trust/tier.ts';
+import { withSpeakerNote } from '../facts/speaker-context.ts';
 
 export interface ManagedFactsResult {
   inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; write_requests: WriteReceipt[];
@@ -290,7 +291,7 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
     if (binding.state !== 'active' || !binding.owner_host_id) throw opError('owner_unavailable', 'The canonical fact writer is unavailable; extraction has not started.',
       `Source ${ctx.sourceId}'s canonical worktree is ${binding.state}, not active, so facts cannot be published yet. Check writer status and extract again once the owner is active.`,
       { fix: ownerStatusFix(ctx.sourceId) });
-    if (binding.owner_host_id === localHostId()) {
+    if (binding.owner_host_id === hostIdFor(engine)) {
       if (!await probeWorktreeWriter(binding, engine)) throw opError('writer_lock_unavailable', 'The canonical fact writer is busy; extraction has not started.',
         `Another write holds source ${ctx.sourceId}'s canonical writer. Nothing was admitted, so run the extraction again once the writer is idle (the same request_id is safe).`,
         { fix: ownerStatusFix(ctx.sourceId) });
@@ -499,17 +500,17 @@ function sameSignature(a: FactEmbeddingSignature | null | undefined, b: FactEmbe
 }
 
 /**
- * #6048: admit the refused requests' retained facts as `followUp`, or return
- * null (nothing admitted) while any refused page still fails the canonical
- * file check. Each refused request must still be authorized under its stored
- * authority and its page under the current writer grant; facts target the
- * page's current revision and are never wider than the current default
- * visibility. No extraction runs again.
+ * #6048: admit the refused requests' retained facts as `followUp` with
+ * `withdrawn: 'skip'`, or return null (nothing admitted) while any refused page
+ * still fails the canonical file check. Each refused request must still be
+ * authorized under its stored authority and its page under the current writer
+ * grant; facts target the page's current revision and are never wider than the
+ * current default visibility. No extraction runs again.
  */
 async function readmitRefusedFacts(engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]): Promise<WriteRequest[] | null> {
   const { sourceId, remote } = followUp.authority;
   const activePack = (await loadActivePackForEngine(engine, { remote, sourceId }).catch(() => null))?.manifest;
-  const privateOnly = await resolveDefaultVisibility(engine) === 'private';
+  const narrowed = await retainedVisibility(engine);
   const entities: ManagedFactsEntityInput[] = [];
   for (const row of refused) {
     await authorizeStoredRequest(engine, row);
@@ -523,8 +524,8 @@ async function readmitRefusedFacts(engine: BrainEngine, followUp: ManagedFactsSe
       throw refusal;
     }
     const { expected_revision: _refusedRevision, facts, ...kept } = row.intent as ManagedFactIntent;
-    entities.push({ slug: row.slug, pageId: page.page.id, intent: { ...kept, batchKey: followUp.batchKey, expected_revision: page.revision,
-      facts: privateOnly ? facts!.map(fact => ({ ...fact, visibility: 'private' as const })) : facts } });
+    entities.push({ slug: row.slug, pageId: page.page.id, intent: { ...kept, batchKey: followUp.batchKey, withdrawn: 'skip', expected_revision: page.revision,
+      facts: facts!.map(narrowed) } });
   }
   return admitManagedFactsBatch(engine, followUp, regroupParts(followUp.batchKey, entities), entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
 }
@@ -539,7 +540,7 @@ async function readmitRefusedFacts(engine: BrainEngine, followUp: ManagedFactsSe
  */
 async function readmitWithdrawnFacts(engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]): Promise<WriteRequest[] | null> {
   const { sourceId } = followUp.authority;
-  const narrowed = await retainedVisibility(engine, sourceId);
+  const narrowed = await retainedVisibility(engine);
   const entities: ManagedFactsEntityInput[] = [];
   for (const row of refused) {
     await authorizeStoredRequest(engine, row);
@@ -548,31 +549,30 @@ async function readmitWithdrawnFacts(engine: BrainEngine, followUp: ManagedFacts
     const { expected_revision: _refusedRevision, facts, ...kept } = row.intent as ManagedFactIntent;
     if (!page && (row.page_id !== null || facts!.some(fact => fact.entity_slug === row.slug))) return null;
     entities.push({ slug: row.slug, pageId: page?.page.id ?? null, intent: { ...kept, batchKey: followUp.batchKey, withdrawn: 'skip',
-      ...(page ? { expected_revision: page.revision } : {}), facts: await Promise.all(facts!.map(narrowed)) } });
+      ...(page ? { expected_revision: page.revision } : {}), facts: facts!.map(narrowed) } });
   }
   return admitManagedFactsBatch(engine, followUp, regroupParts(followUp.batchKey, entities), entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
 }
 
 /**
- * Retained facts are never wider than the current default visibility. A fact forgotten at its retained visibility keeps
- * that visibility, so preparation skips and counts it; narrowing it to private would re-save a forgotten claim under a
- * visibility the ledger never covered.
+ * Retained facts are never wider than the current default visibility. Every follow-up is admitted with
+ * `withdrawn: 'skip'`, whose preparation and locked validation skip a claim forgotten at any visibility, so a narrowed
+ * fact never re-saves a claim forgotten at its retained visibility.
  */
-async function retainedVisibility(engine: BrainEngine, sourceId: string): Promise<(fact: FrozenExtractedFact) => Promise<FrozenExtractedFact>> {
+async function retainedVisibility(engine: BrainEngine): Promise<(fact: FrozenExtractedFact) => FrozenExtractedFact> {
   const privateOnly = await resolveDefaultVisibility(engine) === 'private';
-  return async fact => privateOnly && fact.visibility !== 'private'
-    && !await isFactWithdrawn(engine, sourceId, fact.visibility ?? 'private', fact.fact, fact.entity_slug ?? null) ? { ...fact, visibility: 'private' } : fact;
+  return fact => privateOnly && fact.visibility !== 'private' ? { ...fact, visibility: 'private' } : fact;
 }
 
 /**
- * #7602: admit the refused requests' retained facts as `followUp` at each entity page's current revision. A request whose
+ * #7602: admit the refused requests' retained facts as `followUp` with `withdrawn: 'skip'` at each entity page's current revision. A request whose
  * page was deleted or replaced since admission is left out and keeps its refusal; null when none is left. Each refused request must still be authorized
  * under its stored authority and its page under the current writer grant; the retained intent is otherwise kept as
  * admitted. No extraction runs again.
  */
 async function readmitMovedFacts(engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]): Promise<WriteRequest[] | null> {
   const { sourceId } = followUp.authority;
-  const narrowed = await retainedVisibility(engine, sourceId);
+  const narrowed = await retainedVisibility(engine);
   const entities: ManagedFactsEntityInput[] = [];
   for (const row of refused) {
     await authorizeStoredRequest(engine, row);
@@ -580,8 +580,8 @@ async function readmitMovedFacts(engine: BrainEngine, followUp: ManagedFactsSess
     const page = await engine.readPageSnapshot(row.slug, { sourceId });
     if ((page?.page.id ?? null) !== row.page_id) continue;
     const { expected_revision: _movedRevision, facts, ...kept } = row.intent as ManagedFactIntent;
-    entities.push({ slug: row.slug, pageId: row.page_id, intent: { ...kept, batchKey: followUp.batchKey,
-      ...(page ? { expected_revision: page.revision } : {}), facts: await Promise.all(facts!.map(narrowed)) } });
+    entities.push({ slug: row.slug, pageId: row.page_id, intent: { ...kept, batchKey: followUp.batchKey, withdrawn: 'skip',
+      ...(page ? { expected_revision: page.revision } : {}), facts: facts!.map(narrowed) } });
   }
   if (!entities.length) return null;
   return admitManagedFactsBatch(engine, followUp, regroupParts(followUp.batchKey, entities), entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
@@ -604,7 +604,7 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
     await authorizeWrite(engine, session.authority, 'extract_facts', slug);
     await authorizePageVisibility(engine, session.authority, slug);
     const group = groups.get(slug) ?? [];
-    const context = options.explicitContext ? fact.context ?? null : ctx.sourceSlug ?? pageSlug ?? null;
+    const context = options.explicitContext ? fact.context ?? null : withSpeakerNote(ctx.speaker, ctx.sourceSlug ?? pageSlug ?? null);
     // #5836: an inferred subject carries its provenance note into the fence cell and the row.
     group.push({ ...fact, entity_slug: attributed, visibility, context: fact.entity_inferred ? appendContextNote(context, inferenceNote(fact.entity_inferred)) : context,
       embedding: fact.embedding ? Array.from(fact.embedding) : null,

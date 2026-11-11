@@ -21,10 +21,12 @@ import { validateSlug } from '../utils.ts';
 import { ALL_SOURCES, NO_SOURCES, isValidSourceId } from '../source-id.ts';
 import { encodeDeepResearchId } from '../deep-research-id.ts';
 import { isSearchMode } from '../search/mode.ts';
-import { stampEvidence } from '../search/evidence.ts';
+import { stampEvidence, type EvidenceOpts } from '../search/evidence.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { SearchResult, HybridSearchMeta, PageReadScope, PageReadPolicy } from '../types.ts';
 import { resolveExcludePrivatePages, isPrivatePage } from '../search/private-visibility.ts';
+import { assertMemberPageWriter, assertScopePageWriter } from '../access/member-facts.ts';
+import { pageNotVisibleError, remoteTargetHidden } from '../persistence/page-visibility.ts';
 
 // --- Agent-contract fixes shared by the op error sites ---
 
@@ -373,6 +375,8 @@ export function slugOutsideCallerFence(ctx: OperationContext, slug: string): boo
  * 'notes-archive/...' by startsWith construction.
  */
 export function enforceClientSlugFence(ctx: OperationContext, slug: string, opName: string): void {
+  assertMemberPageWriter(ctx, slug, opName);
+  assertScopePageWriter(ctx, slug, opName);
   if (ctx.auth?.fenceProjectionDegraded) {
     throw opError(
       'permission_denied',
@@ -1061,7 +1065,10 @@ export async function requireWritablePage(
     sourceId: writeSource,
     includeDeleted: true,
   });
-  if (writable) {
+  // GBRA-218 / GBRA-431: a page the remote caller cannot read answers exactly as a missing slug. A delegated subagent
+  // write keeps its own privacy refusal below.
+  const hidden = !!writable && await remoteTargetHidden(ctx.engine, ctx.remote, writeSource, slug, ctx.viaSubagent === true);
+  if (writable && !hidden) {
     if (ctx.viaSubagent === true && ctx.auth && isPrivatePage(writable)
       && await resolveExcludePrivatePages(ctx.engine, ctx.remote)) {
       throw opError('permission_denied', `${operation}: this page is outside your write visibility.`,
@@ -1069,15 +1076,18 @@ export async function requireWritablePage(
     }
     return;
   }
-  if (allowCreate) return;
+  if (allowCreate) {
+    if (hidden) throw pageNotVisibleError();
+    return;
+  }
 
   const visibleScope = federatedSearchScope(ctx);
-  const spansAnotherSource =
-    (visibleScope.sourceIds?.some((sourceId) => sourceId !== writeSource) ?? false) ||
-    (visibleScope.sourceId !== undefined && visibleScope.sourceId !== writeSource);
-  if (spansAnotherSource) {
-    const visible = await ctx.engine.getPage(slug, visibleScope);
-    if (visible && visible.source_id !== writeSource) {
+  // GBRA-218: the diagnostic reads only the other sources, under the caller's read policy, so a page the caller cannot
+  // read there (or a hidden row in the write source) answers exactly as a missing slug.
+  const otherSources = (visibleScope.sourceIds ?? (visibleScope.sourceId !== undefined ? [visibleScope.sourceId] : [])).filter(id => id !== writeSource);
+  if (otherSources.length) {
+    const visible = await ctx.engine.getPage(slug, await readPolicyOpts(ctx, { sourceIds: otherSources }));
+    if (visible && !await remoteTargetHidden(ctx.engine, ctx.remote, visible.source_id, slug)) {
       throw opError(
         'permission_denied',
         `${operation}${endpoint === 'page' ? '' : ` ${endpoint}`} page "${slug}" is readable from source "${visible.source_id}" but this client writes to source "${writeSource}".`,
@@ -1226,8 +1236,8 @@ export function resolvePerCallMode(ctx: OperationContext, raw: unknown, opName =
 }
 
 /** T4 — stamp evidence/create_safety on a result set, fail-soft. */
-export function stampEvidenceSafe(results: SearchResult[]): void {
-  try { stampEvidence(results); } catch { /* non-fatal */ }
+export function stampEvidenceSafe(results: SearchResult[], opts?: EvidenceOpts): void {
+  try { stampEvidence(results, opts); } catch { /* non-fatal */ }
 }
 
 export function stampDeepResearchIds(results: SearchResult[]): void {

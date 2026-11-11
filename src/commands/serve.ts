@@ -8,6 +8,7 @@ export { serveFailFastRequested, writeServeFailFastEnvelope } from '../core/serv
 import { isEngineDegraded as isEngineDegradedForServe } from '../core/degraded-marker.ts';
 import { startMcpServer, stdioRpcsInFlightCount, resolveMcpStdioSourceScope } from '../mcp/server.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
+import { parseStdioMemberFlag } from '../core/stdio-member-flag.ts';
 import { RESIDENT_POOL_FLOOR } from '../core/pg-access-classify.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSchedulerOpts } from '../core/facts/drain-scheduler.ts';
@@ -17,6 +18,7 @@ import { isReadOnlyServeArgs, readOnlyServeSkipsResidentDuties } from '../core/d
 import { onForwardProgress } from '../core/forward-progress.ts';
 import { foregroundWindow } from '../core/foreground-activity.ts';
 import { graduationHandoffRequested, writeServeGraduationEnvelope } from '../core/persistence/graduation-serve-guard.ts';
+import { withLocalScope } from '../core/engine-scope-store.ts';
 import {
   installLoopStallWatchdog,
   resolveServeStallWatchdogMs,
@@ -233,10 +235,15 @@ export async function finishHttpServe(
   exitOnce(0);
 }
 
-export async function runServe(
+/** gbrain serve (stdio and --http) runs in a local scope, so its own AI calls use the process gateway (engine-scope.ts). */
+export function runServe(engine: BrainEngine, args: string[] = [], opts: ServeOptions = {}) {
+  return withLocalScope(() => serveBrain(engine, args, opts));
+}
+
+async function serveBrain(
   engine: BrainEngine,
-  args: string[] = [],
-  opts: ServeOptions = {},
+  args: string[],
+  opts: ServeOptions,
 ) {
   // v0.26+: --http dispatches to the full OAuth 2.1 server (serve-http.ts)
   // with admin dashboard, scope enforcement, SSE feed, and the requireBearerAuth
@@ -245,6 +252,8 @@ export async function runServe(
   // verifyAccessToken with legacy access_tokens fallback (so v0.22.7 callers
   // that used `gbrain auth create` keep working unchanged).
   const isHttp = args.includes('--http');
+  // Wakeshift (docs/guides/wakeshift.md): the 5 s wake drainer for stdio and HTTP alike; a no-op tick while reporting back is off.
+  (await import('../core/wakeshift/drain.ts')).startWakeDrain(engine);
 
   // MEMORY_VERBS v1: tool-surface mode. stdio: GBRAIN_SURFACE > --surface >
   // config `mcp_surface` > 'full'; --http ignores GBRAIN_SURFACE (an HTTP
@@ -285,6 +294,16 @@ export async function runServe(
   if (access === 'read-only' && isHttp) {
     throw new Error('--access read-only applies to stdio serve only; for HTTP narrow each token with ' +
       'gbrain auth rescope-token <name> --operations <op,...> (see docs/mcp/ADMIN.md#read-only-stdio-serve)');
+  }
+  // GST-363: --stdio-member binds this one stdio server (the harness entry that starts it) to one member.
+  const stdioMember = parseStdioMemberFlag(args);
+  if (stdioMember !== undefined && isHttp) {
+    throw new Error('--stdio-member binds a stdio serve only; over HTTP bind each key to its person with ' +
+      'gbrain auth create <name> --member <id> (or gbrain auth rescope --token <name> --member <id>)');
+  }
+  const sharedHarness = stdioMember !== undefined ? (await import('./setup-serves.ts')).sharedStdioHarness() : null;
+  if (sharedHarness) {
+    throw new Error(`--stdio-member refused: ${sharedHarness} is installed on this host, and its sessions serve several people, so serve does not start a stdio server bound to one member here; remove the flag from this harness entry (gbrain setup claude-code|codex --no-stdio-member) and give each person their own key over HTTP (gbrain serve --http with gbrain auth create <name> --member <id>)`);
   }
 
   // --source-guard (plugin lanes, EV1): fail-closed write routing for
@@ -469,7 +488,7 @@ export async function runServe(
   }
 
   try {
-    await start(engine, { surface, surfaceSource: resolved.source, ...(resolved.invalidEnv !== undefined ? { invalidSurfaceEnv: resolved.invalidEnv } : {}), ...(sourceGuard ? { sourceGuard } : {}), onBootPhase: phase => { bootPhase = phase; bootProgressAt = Date.now(); }, ...(access === 'read-only' ? { access } : {}), ...(advertise ? { advertise } : {}) });
+    await start(engine, { surface, surfaceSource: resolved.source, ...(resolved.invalidEnv !== undefined ? { invalidSurfaceEnv: resolved.invalidEnv } : {}), ...(sourceGuard ? { sourceGuard } : {}), onBootPhase: phase => { bootPhase = phase; bootProgressAt = Date.now(); }, ...(access === 'read-only' ? { access } : {}), ...(advertise ? { advertise } : {}), ...(stdioMember !== undefined ? { stdioMember } : {}) });
     // `--stdio-idle-timeout` arms its timer during lifecycle installation,
     // but its stdin activity listener must wait until startMcpServer has
     // attached the MCP SDK transport listener. Attaching any `data` listener

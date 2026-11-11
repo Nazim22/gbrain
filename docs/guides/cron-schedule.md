@@ -144,7 +144,8 @@ Rules for the wrapper and everything that calls it:
    Set caller timeouts of at least 10 s in the shell and in the language
    runtime that runs it (a runtime's exec timeout can override the shell's
    without saying so), and turn on the [warm CLI socket](cli-socket.md) so
-   reads skip the cold start.
+   reads skip the cold start. Give fetch or push calls (`gbrain sources
+   git-reconcile`, `refresh`) 15 minutes.
 6. **Quote the env file.** A file a shell sources is shell syntax. An unquoted
    `&` in a URL ends the assignment and backgrounds the rest, so the variable
    silently keeps its old value. Quote every value, keep Postgres URLs to
@@ -159,8 +160,10 @@ Rules for the wrapper and everything that calls it:
 
 On a managed brain the same wrapper runs `gbrain-run sources refresh <id>` on
 a schedule ([the managed cron line](../../skills/cron-scheduler/SKILL.md#managed-brain)).
-Scripts commit the files they write with `gbrain git commit-push -- <paths>`,
-never plain `git commit`, in the managed checkout; see
+Scripts commit the files they write with
+`gbrain git commit-push --path <absolute brain checkout> -- <paths>`, never
+plain `git commit`, in the managed checkout (a wrapper that changes directory
+would otherwise point it at another repository); see
 [shared-checkout git](shared-checkout-git.md#scripts-and-the-managed-checkout).
 `gbrain doctor --only cron_gbrain_home --json` reads the crontab and the scripts
 it names and warns about a line that runs `src/cli.ts` straight from a checkout,

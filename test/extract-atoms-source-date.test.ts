@@ -7,9 +7,12 @@
  * with the extraction input, before the model call, and serialized into the
  * atom's frontmatter `date`, so classic import and managed publication
  * (test/helpers/managed-atoms-contract.ts) store the same date.
- * Regression: dropping the stamp, reading the date after inference, or
- * dating a transcript-derived atom (no source page) by anything but the
- * leading `YYYY-MM-DD` of its file name.
+ * #7268: a transcript-derived atom has no source page; it takes the
+ * transcript's own frontmatter date, else the date in its path (the one that
+ * names its atoms/<date>/ folder), and an undated transcript borrows none.
+ * Regression: dropping the stamp, reading the date after inference, dating
+ * a transcript atom by the extraction run, or borrowing a date for an
+ * undated transcript.
  * Model calls go through the `_chat` seam; persistence is real PGLite.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -72,27 +75,28 @@ describe('#6720 atom content dates', () => {
   }
 
   for (const fx of [
-    { id: 'dated-name', file: '/fake/2026-07-09-call.txt', date: '2026-07-09T00:00:00.000Z', folder: '2026-07-09' },
-    { id: 'undated-name', file: '/fake/call.txt', date: undefined, folder: 'undated' },
-    { id: 'impossible-date', file: '/fake/2026-02-30-call.txt', date: undefined, folder: '2026-02-30' },
+    { id: 'path-filename', filePath: '/fake/2026-07-09-call.txt', head: '', date: '2026-07-09T00:00:00.000Z' },
+    { id: 'path-folder', filePath: '/fake/2026-07-09/call.txt', head: '', date: '2026-07-09T00:00:00.000Z' },
+    { id: 'frontmatter', filePath: '/fake/2026-07-09-call.md', head: '---\ndate: 2026-05-04\n---\n', date: '2026-05-04T00:00:00.000Z' },
+    { id: 'plain-header', filePath: '/fake/2026-07-09-call.txt', head: '--- BEGIN TRANSCRIPT\n', date: '2026-07-09T00:00:00.000Z' },
+    { id: 'undated', filePath: '/fake/call.txt', head: '', date: undefined },
   ]) {
-    test(`a transcript-derived atom is dated only by its file name's leading date (${fx.id})`, async () => {
+    test(`a transcript-derived atom carries the transcript's ${fx.id} date, never the run's`, async () => {
       const sourceId = `atom-date-transcript-${fx.id}`;
       await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
       const result = await runPhaseExtractAtoms(engine, {
-        sourceId, _pages: [], _transcripts: [{ filePath: fx.file, content: body, contentHash: 'ab'.repeat(32) }],
+        sourceId, _pages: [], _transcripts: [{ filePath: fx.filePath, content: fx.head + body, contentHash: 'ab'.repeat(32) }],
         _chat: async () => reply(),
       });
       expect(result.details?.atoms_extracted).toBe(1);
       const atom = await onlyAtom(sourceId);
-      expect(atom.slug.split('/')[1]).toBe(fx.folder);
       expect(atom.frontmatter.date).toBe(fx.date);
-      if (fx.date) {
-        expect(new Date(atom.effective_date!).toISOString()).toBe(fx.date);
-        expect(atom.effective_date_source).toBe('date');
-      } else {
-        expect(atom.effective_date_source).not.toBe('date');
+      if (fx.date === undefined) {
+        expect(atom.effective_date_source).toBe('fallback');
+        return;
       }
+      expect(new Date(atom.effective_date!).toISOString()).toBe(fx.date);
+      expect(atom.effective_date_source).toBe('date');
     }, 60_000);
   }
 });

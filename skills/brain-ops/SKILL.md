@@ -64,9 +64,10 @@ suppresses writes for that turn, including when standing capture is enabled.
 > conversation is observed making the opted-in call.
 >
 > **Choose a readback path that can see the intended visibility.** Trusted local
-> CLI callers can recall and withdraw private facts. Every MCP caller, including
-> stdio, and a thin CLI connected to MCP currently have world-only fact recall
-> and withdrawal. A
+> CLI callers can recall and withdraw private facts. Every other MCP caller, including
+> stdio, and a thin CLI connected to MCP have world-only fact recall
+> and withdrawal; a credential bound to the brain owner (`gbrain access owner`)
+> also recalls private facts. A
 > request to remember does not authorize making real private information
 > world-visible. Use a trusted local write/readback path for private memory
 > when available. If only remote access is available, a successful private
@@ -94,7 +95,8 @@ suppresses writes for that turn, including when standing capture is enabled.
 > | commitment | belief | fact — those five are the frozen protocol enum; the
 > `idea` kind the extractor and DB carry is NOT one of them) and the
 > visibility the envelope's `agent_action` names
-> (default private — pin it; `remember` defaults to world), or author a
+> (default private — pin it; `remember` defaults to world, or to your own
+> member page when your credential is bound to a member), or author a
 > `## Facts` fence on the entity page. A `skipped: extraction_failed` envelope
 > (server-side extractor errored on this turn; `reason` names why) invites the
 > same manual `remember` fallback for that turn — automatic extraction stays
@@ -133,7 +135,7 @@ Before using ANY external API to research a person, company, or topic:
 The brain almost always has something. External APIs fill gaps, not start from scratch.
 Search gbrain before reading, grepping or querying brain files directly; filters
 (`--types`, `--match keyword`, `query --since/--until`, `--source`, `--json`) are
-in the brain-first convention's "Retrieval: gbrain first" block.
+in the brain-first convention's "Which gbrain call for which lookup" table.
 
 **⚠️ NEVER scope/count a corpus with shallow `ls` — query gbrain or `find`.** Federated sources often carry MULTIPLE coexisting directory conventions — a flat legacy layer AND a date-nested `meetings/YYYY/MM/` layer. A non-recursive `ls dir/*.md` sees only one and undercounts massively. Real example: a shallow `ls` of one source's `meetings/` counted 132 files, almost all the user's, and concluded that WAS the corpus — missing thousands of transcripts nested under `meetings/YYYY/MM/`. To count/scope a brain corpus:
   - **Best:** `gbrain sources list` (shows per-source indexed page counts) + `gbrain query`. gbrain indexes ALL federated sources correctly; trust its index, not the filesystem.

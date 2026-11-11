@@ -31,12 +31,13 @@ import { ContentSanityBlockError } from '../content-sanity.ts';
 import { assertPageRevision, type PageSnapshot } from '../page-state/types.ts';
 import { GIT_HOLD_OP, gitHoldFingerprint, gitHoldFix, readGitHold } from './sync-holds.ts';
 import { hostOperatorFix, recordRoute } from './held-reads.ts';
-import { heldFileMessage } from './verb-errors.ts';
+import { heldFileMessage, PAGE_CHANGED_DURING_PREPARATION_MESSAGE, sourceCheckoutMissingRefusal } from './verb-errors.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
 import { assertPurgeParams } from './purge-params.ts';
 import { authorizeWrite, slugDisclosable } from './authority.ts';
+import { remoteReadersChecked, defaultSourceMemberWriter, defaultSourceWriterIsOwner, defaultSourceWriterReaders } from './page-visibility.ts';
 import { findLiveFileClaimants, type FileClaimant, type FileClaimTarget } from './file-claims.ts';
 import { digest, sha256 } from './digest.ts';
 import { replaceableFile } from '../facts/file-body-guard.ts';
@@ -89,7 +90,12 @@ import { pageFencesNormalized } from '../fence-repair/report.ts';
 import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
 import { fenceRepairCommit } from './effect-model.ts';
 import { withoutSafetyAssessments } from './reconcile-safety.ts';
+import { POLICY_KEYS } from './reconcile-additive.ts';
+import { protectedReconcileKey } from './reconcile-merge.ts';
+import { PROTECTED_FRONTMATTER_KEYS } from '../frontmatter-recovery.ts';
 import { preparePagePurge, purgePageInTransaction, type PreparedPagePurge } from './page-purge.ts';
+import { originCommitted } from './sync-markers.ts';
+import { syncDeleteOrigin } from './sync-delete-tombstones.ts';
 import { withTrustKeep } from './context.ts';
 import { isFenceEditWrite, pageGateTrust, pageWriteTrust, recordAgentPageLowering, stampPageTrustMarker, storedPageTier } from '../trust/page-write.ts';
 import { compareTrust, type WriteTrust } from '../trust/tier.ts';
@@ -216,6 +222,7 @@ export function readCanonicalAsImported(bytes: string, sourcePath: string): { co
  */
 export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, bytes: string, snapshot: PageSnapshot,
   sourcePath: string | (() => Promise<string>), activePack?: ParseOpts['activePack']): Promise<boolean> {
+  snapshot = (await materializedSnapshot(engine, snapshot))!;
   const expected = digest(canonical({ ...snapshot.page, frontmatter: withoutSafetyAssessments(snapshot.page.frontmatter ?? {}) }, snapshot.tags));
   const matches = async (content: string, inferred: boolean) => {
     const parsed = parseMarkdown(content, slug, { activePack });
@@ -229,6 +236,51 @@ export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, byt
   if (await matches(bytes, false)) return true;
   const reading = readCanonicalAsImported(bytes, typeof sourcePath === 'string' ? sourcePath : await sourcePath());
   return reading.inferred && await matches(reading.content, true);
+}
+/**
+ * #8109: the file a write publishes over a canonical file that differs from the database only in frontmatter, or null
+ * when the write must refuse as drift. The file and the database must agree on everything but frontmatter (body,
+ * timeline, title, type and tags, as fileMatchesSnapshot compares them), no drifted key may be a policy, protected,
+ * access, lineage or trust-lowering key, and the write must leave the stored frontmatter unchanged. The file then keeps its own frontmatter block and
+ * takes the write's body, so neither side's frontmatter is lost; the drift stays for reconcile.
+ */
+const SPLICE_REFUSED_KEYS = new Set([...PROTECTED_FRONTMATTER_KEYS, 'trust_tier', 'transcript_import', 'source_url', 'clipped_at', 'clipper', 'dream_generated']);
+async function frontmatterDriftWrite(engine: BrainEngine, slug: string, fileText: string, snapshot: PageSnapshot, content: string,
+  activePack?: ParseOpts['activePack']): Promise<string | null> {
+  snapshot = (await materializedSnapshot(engine, snapshot))!;
+  const file = parseMarkdown(fileText, slug, { activePack });
+  const type = importedFileType(file, snapshot.page, false);
+  const bodies = await overlayCanonicalBodies(engine.executeRaw.bind(engine), file.compiled_truth, file.timeline ?? '', snapshot.withdrawals,
+    { sourceId: snapshot.page.source_id, marker: snapshot.globalPurges });
+  const bare = (page: Parameters<typeof canonical>[0], tags: string[]) => digest(canonical({ ...page, frontmatter: {} }, tags));
+  if (bare({ ...file, type, ...bodies }, file.tags) !== bare(snapshot.page, snapshot.tags)) return null;
+  const fileFrontmatter = comparableFrontmatter(withoutSafetyAssessments(file.frontmatter));
+  const stored = comparableFrontmatter(withoutSafetyAssessments(snapshot.page.frontmatter ?? {}));
+  const drifted = [...new Set([...Object.keys(fileFrontmatter), ...Object.keys(stored)])].filter(key => digest(fileFrontmatter[key] ?? null) !== digest(stored[key] ?? null));
+  if (!drifted.length || drifted.some(key => POLICY_KEYS.has(key) || protectedReconcileKey(key) || SPLICE_REFUSED_KEYS.has(key))) return null;
+  const incoming = parseMarkdown(content, slug, { activePack });
+  if (digest(comparableFrontmatter(withoutSafetyAssessments(incoming.frontmatter))) !== digest(stored)
+    || bare({ ...incoming, compiled_truth: '', timeline: '' }, incoming.tags) !== bare({ ...snapshot.page, compiled_truth: '', timeline: '' }, snapshot.tags)) return null;
+  const head = /^\uFEFF?---\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n/;
+  const fileHead = head.exec(fileText), contentHead = head.exec(content);
+  if (!fileHead || !contentHead) return null;
+  const spliced = fileHead[0] + content.slice(contentHead[0].length);
+  const check = parseMarkdown(spliced, slug, { activePack });
+  return digest(check.frontmatter) === digest(file.frontmatter) && check.title === file.title && check.type === incoming.type && digest(check.tags) === digest(file.tags)
+    && check.compiled_truth === incoming.compiled_truth && (check.timeline ?? '') === (incoming.timeline ?? '') ? spliced : null;
+}
+/**
+ * GST-1601: whether a local edit changes what an adoption must never take without a person: the title, the type, or a
+ * policy, protected, access, lineage or trust-lowering frontmatter key (the keys frontmatterDriftWrite never splices).
+ */
+export async function protectedLocalEdit(engine: BrainEngine, slug: string, fileText: string, snapshot: PageSnapshot, activePack?: ParseOpts['activePack']): Promise<boolean> {
+  snapshot = (await materializedSnapshot(engine, snapshot))!;
+  const file = parseMarkdown(fileText, slug, { activePack });
+  if (file.title !== snapshot.page.title || importedFileType(file, snapshot.page, false) !== snapshot.page.type) return true;
+  const fileFrontmatter = comparableFrontmatter(withoutSafetyAssessments(file.frontmatter));
+  const stored = comparableFrontmatter(withoutSafetyAssessments(snapshot.page.frontmatter ?? {}));
+  return [...new Set([...Object.keys(fileFrontmatter), ...Object.keys(stored)])].some(key => digest(fileFrontmatter[key] ?? null) !== digest(stored[key] ?? null)
+    && (POLICY_KEYS.has(key) || protectedReconcileKey(key) || SPLICE_REFUSED_KEYS.has(key) || key === 'slug'));
 }
 /** The type a file's parse compares with (`fileMatchesSnapshot`), after aligning the parse with what its import over `page` stores. */
 function importedFileType(parsed: ParsedMarkdown, page: Pick<Page, 'type' | 'frontmatter'>, inferred: boolean): Page['type'] {
@@ -278,7 +330,7 @@ async function segmentedFileMatches(engine: BrainEngine, slug: string, bytes: By
   const prefix = await inferredHeadPrefix(bytes.subarray(skip, skip + FRONTMATTER_HEAD_MAX_BYTES), await sourcePath());
   return !!prefix?.length && await matches({ prefix, skip }, true) === true;
 }
-export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'> & { operation?: string }, snapshot: PageSnapshot | null,
+export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'> & Partial<Pick<WriteRequest, 'sequence'>> & { operation?: string }, snapshot: PageSnapshot | null,
   content: string | Uint8Array | StreamedFileContent | null, hostId?: string, options: { allowMissing?: boolean; deleting?: boolean; capture?: { path: string; hash: string }; activePack?: ParseOpts['activePack']; remote?: boolean;
     /** #6368: a tombstone purge whose file matches these sync.exclude globs (relative to the source root) owns no file. */
     excludeTombstone?: { patterns: string[]; onExcluded: (path: string) => void };
@@ -313,6 +365,7 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
   if (!binding?.local_path) throw opError('owner_unavailable', 'The canonical worktree is unavailable on this host.',
     `This host does not hold source ${row.source_id}'s canonical worktree (or it has no local path), so the file of ${row.slug} was not written. Inspect the owner before resubmitting; the write publishes on the host that owns the source.`,
     { fix: ownerStatusFix(row.source_id) });
+  if (!existsSync(binding.local_path)) throw sourceCheckoutMissingRefusal(row.source_id, row.slug);
   const root = join(binding.local_path, binding.relative_path);
   // #5622: a new page captured from a file inside the source is published to that file.
   const capturedPath = !snapshot && options.capture ? options.capture.path : recordedPathFromFileUri(snapshot?.page.source_uri, root);
@@ -320,12 +373,12 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
   const recordedPath = snapshot?.page.source_path || snapshot?.page.withheld_source_path || null;
   const mode = recordedPath ? await scannerSlugRootMode(engine, row.source_id, root) : undefined;
   const candidate = resolveSourceLocalFilePath(root, recordedPath, row.slug, mode)
-    ?? (capturedPath ? join(root, capturedPath) : snapshot ? slugPathFile(root, row.slug) : join(root, `${row.slug}.md`));
+    ?? (capturedPath ? join(root, capturedPath) : snapshot ? slugPathFile(root, row.slug, await scannerSlugRootMode(engine, row.source_id, root)) : join(root, `${row.slug}.md`));
   if (isWindowsColonTarget(relative(root, candidate))) {
     if (!options.allowMissing && publishesDatabaseOnly(root, row.slug, snapshot)) return undefined;
     throw colonSlugWindowsRefusal(row.slug, row.source_id);
   }
-  const path = nativeFileTarget(root, candidate);
+  const path = nativeFileTarget(binding.local_path, candidate);
   if (!isWriteTargetContained(path, root)) throw opError('source_changed', 'The canonical file target is outside its registered source.',
     `The file of ${row.slug} resolves outside source ${row.source_id}'s registered root (a symlinked directory or a moved checkout), so nothing was written. Inspect the owner before resubmitting; how to repair the checkout is the user's decision.`,
     { fix: ownerStatusFix(row.source_id) });
@@ -365,10 +418,18 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
 }
 
 /** prepareFileTarget's comparison of the file at `path` (`before`, its bytes or a piecewise reading) with the snapshot. */
-async function compareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>, snapshot: PageSnapshot | null,
+async function compareFileTarget(engine: BrainEngine, row: Parameters<typeof prepareFileTarget>[1], snapshot: PageSnapshot | null,
   content: string | Uint8Array | StreamedFileContent | null, options: Parameters<typeof prepareFileTarget>[5] & object,
   target: { root: string; path: string; mode: Awaited<ReturnType<typeof scannerSlugRootMode>> | undefined; capturedPath: string | null | undefined; before: Buffer | FileBytes | null }): Promise<PreparedMutation['file']> {
   const { root, path, mode, capturedPath, before } = target;
+  // GST-1582: an earlier write to this page held for an import that has not landed goes first, so this one is held behind the
+  // same import (holdForImport) and both are released, in admission order, at its checkpoint; it never commits before the held one.
+  // GST-1623: only a journaled request (one with a sequence) waits, and only on a write admitted before it; an effect or a
+  // maintenance read of the file (Git and withdrawal-mirror effects, lint, drift checks) is never refused by another request's hold.
+  const [heldFirst] = row.sequence == null ? [] : await engine.executeRaw<{ deferred_import_from: string }>(`SELECT r.deferred_import_from FROM persistence_requests r
+    JOIN sources s ON s.id=r.source_id WHERE r.source_id=$1 AND r.slug=$2 AND r.sequence<$3 AND r.state='deferred' AND r.deferred_import_from IS NOT NULL
+      AND COALESCE(s.last_commit,'')=r.deferred_import_from ORDER BY r.sequence LIMIT 1`, [row.source_id, row.slug, String(row.sequence)]);
+  if (heldFirst) throw pendingImportRefusal(row, options.remote === true, heldFirst.deferred_import_from, { root, path });
   const beforeHash = () => before instanceof FileBytes ? before.hash() : sha256(before!);
   if (options.deleting === true && options.sharedOrigin && snapshot && before) {
     const target: FileClaimTarget = { sourceId: row.source_id, slug: row.slug, pageId: snapshot.page.id, root, path, canonicalPath: realpathSync(path),
@@ -377,7 +438,10 @@ async function compareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 's
     if (claimants.length) { options.sharedOrigin.onShared({ target, claimants }); return undefined; }
   }
   // G7a: a page whose file its private transition removed (withheld_source_path) writes it again; the file is absent by design.
-  const withheld = !snapshot?.page.source_path && Boolean(snapshot?.page.withheld_source_path);
+  // So does a strict page that was private from its first write (database_only_reason private, no file ever recorded): it
+  // writes its file for the first time when it turns world.
+  const withheld = !snapshot?.page.source_path && (Boolean(snapshot?.page.withheld_source_path) || (!before && !!snapshot && !snapshot.page.source_uri
+    && isPrivacyClass((await engine.executeRaw<{ reason: string | null }>('SELECT database_only_reason AS reason FROM pages WHERE id=$1', [snapshot.page.id]))[0]?.reason)));
   if (!before && snapshot && !snapshot.page.deleted_at && !options.allowMissing && !withheld) {
     // A declared db_only page has no canonical file by design and publishes to
     // the database only. gbrain.yml is consulted only here, where the write
@@ -420,11 +484,21 @@ async function compareFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 's
       // #6394: a page that never recorded its file reconciles against the file at its slug path only when adopted explicitly.
       const adopt = !snapshot.page.source_path && !snapshot.page.source_uri ? ['--adopt-slug-path'] : [];
       // #6693: a committed Git change sync has not imported yet (another agent's commit), on a page that records its file.
-      if (!adopt.length && await waitingOnWhile(options.clock, 'git', () => committedPendingImport(engine, row.source_id, root, path, options.clock?.signal))) throw pendingImportRefusal(row, options.remote === true);
-      throw opError('source_changed', 'The canonical file contains an uncoordinated local edit.',
+      if (!adopt.length) {
+        // GST-1582: read before the check, so a write held for the import never waits on a commit the check already saw imported.
+        const [source] = await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [row.source_id]);
+        if (await waitingOnWhile(options.clock, 'git', () => committedPendingImport(engine, row.source_id, root, path, options.clock?.signal))) throw pendingImportRefusal(row, options.remote === true, source?.last_commit ?? '', { root, path });
+      }
+      // #8109: drift confined to ordinary frontmatter keys never blocks a write that leaves the frontmatter alone.
+      const spliced = !adopt.length && options.deleting !== true && typeof content === 'string' && before instanceof Buffer && !bodyUnread(snapshot.page) && before.length <= PUSH_SCAN_MAX_FILE_BYTES
+        ? await frontmatterDriftWrite(engine, row.slug, before.toString('utf8'), snapshot, content, options.activePack) : null;
+      if (spliced !== null) return { path, root, content: spliced, expectedBeforeHash: beforeHash() };
+      // GST-1601: the drifted file rides the refusal, so the owner can adopt a one-sided local edit (local-edit-adoption.ts).
+      throw Object.assign(opError('source_changed', 'The canonical file contains an uncoordinated local edit.',
         `On the brain host, run gbrain sources reconcile ${row.source_id} ${row.slug} --brain <brain id, host by default> --preview${adopt.length ? ' --adopt-slug-path (the page records no file of its own, so the preview adopts the file at its slug path)' : ''}, review and apply the resolved preview, then retry this write with a new request_id. Neither copy was overwritten.`,
         { detail: 'file_database_drift', fix: readFix(`Previews how page ${row.slug}'s canonical file and database copy reconcile; a preview never changes canonical content.`,
-          { argv: ['gbrain', 'sources', 'reconcile', row.source_id, row.slug, '--brain', 'host', '--preview', ...adopt] }) });
+          { argv: ['gbrain', 'sources', 'reconcile', row.source_id, row.slug, '--brain', 'host', '--preview', ...adopt] }) }),
+        adopt.length || options.deleting === true ? {} : { localEdit: { root, path } });
     }
   } else if (before && !snapshot && content !== null && beforeHash() !== fileContentHash(content)
     && !(options.capture && beforeHash() === options.capture.hash)) {
@@ -585,8 +659,27 @@ async function prepareDeletePageMutation(engine: BrainEngine, row: WriteRequest,
     error.detail = 'shared_origin';
     throw error;
   }
+  // GST-2201: a retention purge never removes a file committed at the source's last commit or at HEAD. A tombstone sync made
+  // from the file's absence waits for the sync that restores it; a person's tombstone is removed database-only and the file stays.
+  // A person's delete that made this tombstone and never removed its file (`write_through.written: false`: another live page
+  // shared it, the source was unbound, ...) still has the purge finish that removal. Publication re-checks, so a commit made after preparation is kept too.
+  const retentionFile = purge && p.retention === true && snapshot.page.deleted_at != null && !!file && !shared && excludedPath === null;
+  const committedNow = async (exec: BrainEngine) => await originCommitted(exec, row.source_id, snapshot.page.source_path)
+    && (await exec.executeRaw(`SELECT 1 FROM persistence_requests r JOIN pages p ON p.id=$3 WHERE r.source_id=$1 AND r.slug=$2 AND (r.page_id IS NULL OR r.page_id=$3)
+      AND r.operation='delete_page' AND r.state='committed' AND r.outcome->'write_through'->>'written'='false' AND NOT ${syncDeleteOrigin('p')}
+      AND NOT EXISTS (SELECT 1 FROM persistence_requests l WHERE l.source_id=r.source_id AND l.slug=r.slug AND l.state='committed' AND l.sequence > r.sequence
+        AND l.operation IN ('restore_page', 'delete_page')) LIMIT 1`, [row.source_id, row.slug, snapshot.page.id])).length === 0;
+  const committedFile = retentionFile && await committedNow(engine);
+  let keepOrigin = false;
+  if (committedFile) {
+    const [made] = await engine.executeRaw<{ sync: boolean }>(`SELECT ${syncDeleteOrigin('p')} AS sync FROM pages p WHERE p.id=$1`, [snapshot.page.id]);
+    // Only a file on disk can come back through sync: one off disk in working-tree mode is purged database-only instead.
+    if (made?.sync && existsSync(file!.path)) throw pageRefusal('revision_conflict', 'The file of this sync-deleted page is committed again, so the retention purge left the page and the file alone; the next sync restores the page.', row,
+      `Page ${row.slug}'s file is committed in source ${row.source_id}'s checkout.`, pageFix(row.source_id, row.slug));
+    keepOrigin = made?.sync === true;
+  }
   // #6511: the purge's journal sweep runs here, under the preparation budget, never inside the 5 s publication transaction.
-  const preparedPurge: PreparedPagePurge | null = purge ? await preparePagePurge(engine, row, snapshot, clock) : null;
+  const preparedPurge: PreparedPagePurge | null = purge ? { ...await preparePagePurge(engine, row, snapshot, clock), ...(keepOrigin ? { keepOrigin } : {}) } : null;
   // #6948: a page merged into its duplicate holds that page's body, so an owner purge would tombstone the survivor's content.
   if (preparedPurge && !preparedPurge.retention && await isOriginTwinPage(engine, row.source_id, row.slug)) {
     const error = pageRefusal('source_changed', 'The page was merged into a duplicate that holds the same content, so a purge (which tombstones its content source-wide) was refused and nothing was removed, tombstoned or redacted. '
@@ -595,7 +688,7 @@ async function prepareDeletePageMutation(engine: BrainEngine, row: WriteRequest,
     error.detail = 'origin_twin';
     throw error;
   }
-  const prepared: PreparedMutation = { observedRevision, noop, file, ...await pageDatabaseOnlyPublication(engine, row, file),
+  const prepared: PreparedMutation = { observedRevision, noop, file: committedFile ? undefined : file, ...await pageDatabaseOnlyPublication(engine, row, committedFile ? undefined : file),
     // W1: a purge bumps sources.purge_epoch, so it holds the source row exclusively from the start (retention bumps nothing, #26);
     // the derived rows' and cascaded links' streams are locked with the page.
     ...(purge && !preparedPurge?.retention ? { sourceExclusive: true } : {}),
@@ -603,7 +696,12 @@ async function prepareDeletePageMutation(engine: BrainEngine, row: WriteRequest,
     ...(preparedPurge && !preparedPurge.retention ? { afterCommit: async () => { appendPurgeCommitted(row.id); } } : {}),
     ...(preparedPurge?.derivedSlugs.length ? { additionalPageKeys: preparedPurge.derivedSlugs.map(slug => ({ sourceId: row.source_id, slug })) } : {}),
     ...(excludedPath !== null ? { databaseOnlyReason: 'sync_excluded' as const } : {}), ...(shared ? { databaseOnlyReason: 'shared_origin' as const } : {}),
+    ...(committedFile ? { databaseOnlyReason: 'committed_file' as const } : {}),
     ...(shared ? { validate: async (tx: BrainEngine) => { prepared.databaseOnlyWarning = await validateSharedOrigin(tx, row, shared, sharedRetention); } } : {}),
+    ...(retentionFile && !committedFile ? { validate: async (tx: BrainEngine) => {
+      if (await committedNow(tx)) throw pageRefusal('revision_conflict', 'The page\'s file was committed while the retention purge was prepared, so the purge left the page and the file alone; the next run re-reads it.', row,
+        `Page ${row.slug}'s file is committed in source ${row.source_id}'s checkout.`, pageFix(row.source_id, row.slug));
+    } } : {}),
     apply: async tx => {
       if (purge && excludedPath !== null) await assertStillSyncExcluded(tx, row, excludedPath);
       // #7311: the tombstone forgets the survivor's file, as an origin_twin page has, so its purge writes no deletion marker for it.
@@ -672,12 +770,17 @@ async function prepareUnreadRestore(engine: BrainEngine, row: WriteRequest, snap
  * serializePageToMarkdown's bytes for a page whose body was not read back, streamed from its segments by export's
  * serializer: measured here, produced again into the publication's staging file (large-file.ts), never concatenated.
  * A withdrawal mirror of a segmented page (effects.ts, effect-recovery.ts) renders its file the same way, with
- * `between` (its claim renewal) run after each piece each time the file is produced.
+ * `between` (its claim renewal) run after each piece each time the file is produced. The body is read at the snapshot's
+ * revision; a page that moved since refuses `revision_conflict`, as a changed staging hash does, so the request prepares again.
  */
-export async function unreadPageFile(engine: BrainEngine, snapshot: PageSnapshot, between?: () => Promise<void>): Promise<StreamedFileContent> {
+export async function unreadPageFile(engine: BrainEngine, snapshot: PageSnapshot, between?: () => Promise<void>, ledger: BodyLedger = snapshotLedger(snapshot)): Promise<StreamedFileContent> {
   const head = serializePageToMarkdown({ ...withoutBody(snapshot.page), compiled_truth: '', timeline: '' }, snapshot.tags).slice(0, -1);
-  const ledger = snapshotLedger(snapshot);
-  const produce = (exec: BrainEngine) => segmentedExportMarkdown(exec, snapshot.page, ledger, head);
+  const produce = async function* (exec: BrainEngine) {
+    try { yield* segmentedExportMarkdown(exec, snapshot.page, ledger, head, snapshot.revision); } catch (error) {
+      if (!(error instanceof OperationError) || error.canonical !== 'revision_changed') throw error;
+      throw new OperationError('revision_conflict', PAGE_CHANGED_DURING_PREPARATION_MESSAGE, 'Read its current revision and submit the updated intent with a new request_id.');
+    }
+  };
   return StreamedFileContent.measure(engine, !between ? produce : async function* (exec) { for await (const piece of produce(exec)) { yield piece; await between(); } });
 }
 
@@ -804,6 +907,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
   if ((snapshot?.page.id ?? null) !== row.page_id) throw pageIdentityError(snapshot != null || row.page_id === null, 'The accepted page identity changed.');
   const observedRevision = snapshot?.revision ?? null;
   const activePack = pack?.manifest;
+  const replacesTombstone = snapshot?.page.deleted_at != null && (row.operation === 'put_page' || row.operation === 'capture');
   if (row.operation === 'put_page' && snapshot && !snapshot.page.deleted_at && typeof p.content === 'string'
     && `${snapshot.page.compiled_truth}\n${snapshot.page.timeline ?? ''}`.trim()) {
     const incoming = parseMarkdown(p.content, row.slug, { activePack });
@@ -822,7 +926,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
   let content = edited?.content ?? preparedIntent?.content ?? p.content as string;
   const privateRequest = privateRequestGuarded(row.operation, p.kind) && typeof content === 'string' ? readPrivateRequest(content, () => parseMarkdown(content as string, row.slug, { activePack }).frontmatter) : null;
   if (privateRequest) assertPrivateRequestAllowed(row, content as string, privateRequest.frontmatter);
-  let versionTags: string[] | undefined = preparedIntent?.tags;
+  let versionTags: string[] | undefined = replacesTombstone && typeof content === 'string' ? parseMarkdown(content, row.slug, { activePack }).tags : preparedIntent?.tags;
   // A replacement/restore publishes a live page. Only a recorded version may
   // explicitly restore a tombstone; legacy versions leave this state unchanged.
   let targetDeleted = false;
@@ -867,8 +971,8 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
     }
   }
   const projected = !(options.unprojected || row.operation === 'remember' || row.operation.startsWith('takes_') || (row.operation === 'extract_facts' && p.kind === 'managed_facts_entity'));
-  const writer = (row.operation === 'put_page' || row.operation === 'edit_page') && p.kind !== 'managed_maintenance_page'
-    && (preparedIntent !== undefined || typeof p.expected_revision === 'string') ? 'editing' : 'preserving';
+  const writer = replacesTombstone || ((row.operation === 'put_page' || row.operation === 'edit_page') && p.kind !== 'managed_maintenance_page'
+    && (preparedIntent !== undefined || typeof p.expected_revision === 'string')) ? 'editing' : 'preserving';
   // #5969 (D3): only an ordinary put_page intent carries a timeline section; every other writer keeps the shared policy.
   const timelinePolicy = row.operation === 'put_page' ? timelineWritePolicy(p, row.authority.remote, writer) : undefined;
   enterClaimStep(clock, 'timeline_policy', undefined, 'db');
@@ -876,7 +980,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
     slug: row.slug, sourceId: row.source_id, content, prior: snapshot });
   // #5567: database-only timeline rows are written back into the page before
   // the no-op check, digest, rendering and chunking see the body.
-  if (projected && snapshot && typeof content === 'string') {
+  if (projected && snapshot && !replacesTombstone && typeof content === 'string') {
     const parsed = parseMarkdown(content,row.slug);
     enterClaimStep(clock, 'materialize_timeline', undefined, 'db');
     const { timeline, materialized } = await materializeTimeline(engine,parsed,row.slug,snapshot,writer,timelinePolicy);
@@ -902,6 +1006,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
   // #5575: the page's tier, computed once before import so the write gate sees exactly it (ENG-18).
   const trust = provenanceWriteTrust(row, typeof content === 'string' && !isFenceEditWrite(row) ? parseMarkdown(content, row.slug, { activePack }).frontmatter : null, snapshot?.page.frontmatter);
   const gateTrust = pageGateTrust(row, trust, storedTier);
+  const defaultSourceWriter = row.operation === 'restore_page' || row.operation === 'revert_version' ? null : await defaultSourceMemberWriter(engine, row.authority), defaultSourceOwner = await defaultSourceWriterIsOwner(engine, defaultSourceWriter);
   // The apply diet: the publisher's locked read of row.slug is the import base, and one read after the
   // last page write serves the read-back check, the seal, the core notice and the receipt (as sync does).
   const lean = options.coordinated === true && !targetDeleted && row.operation !== 'restore_page' && !versionTags;
@@ -923,6 +1028,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
       provenance = putProvenance(row, snapshot, page);
       suppliedTrustMarker = page.frontmatter.trust_tier;
       stampPageTrustMarker(row, page.frontmatter, trust, storedTier, snapshot?.page.frontmatter);
+      defaultSourceWriterReaders(defaultSourceWriter, page.frontmatter, snapshot?.page, defaultSourceOwner);
       if (privateRequest) assertPrivateRequestKept(row, page.frontmatter);
     },
     prepare: async value => { prepared = value; return value.result; },
@@ -941,7 +1047,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
     if (refusal) throw frontmatterRefusalError(refusal);
     throw opError('invalid_params', 'The content was rejected before publication.', 'Check the content and frontmatter, then submit the corrected content with a new request_id.');
   }
-  const ready = prepared;
+  const ready = await remoteReadersChecked(engine, row.authority, snapshot?.page.frontmatter, prepared);
   if (ready.observedRevision !== observedRevision) throw pageRefusal('revision_conflict', 'The page changed during import preparation.', row,
     `Page ${row.slug} was written by another request while this one was being prepared, so it published nothing. Read the current page and revision, then submit the intended change against it.`,
     pageFix(row.source_id, row.slug));

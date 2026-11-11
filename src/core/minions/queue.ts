@@ -14,7 +14,7 @@ import type {
   MinionJob, MinionJobInput, MinionJobStatus, InboxMessage, TokenUpdate,
   MinionQueueOpts, ChildDoneMessage, ChildOutcome, Attachment, AttachmentInput,
 } from './types.ts';
-import { rowToMinionJob, rowToInboxMessage, rowToAttachment } from './types.ts';
+import { rowToMinionJob, rowToInboxMessage, rowToAttachment, jobActorSql, NO_JOB_ACTOR, type JobActor } from './types.ts';
 import { WATCHDOG_SUSPECT_MARK, releaseWatchdogClaim, requeueCoRunnerStalls, unmarkedJobSql } from './watchdog-attribution.ts';
 export { WATCHDOG_SUSPECT_MARK } from './watchdog-attribution.ts';
 import { coalesceOnIdempotencyKey, decideCoalesce, insertOrCoalesce } from './idempotency-coalesce.ts';
@@ -46,6 +46,7 @@ import {
   logBatchRetry as auditLogBatchRetry,
   logBatchExhausted as auditLogBatchExhausted,
 } from '../audit/batch-retry-audit.ts';
+import { retryOnStalePlan } from '../retry-matcher.ts';
 /** Trusted 4th argument, kept outside user-spread job options. */
 export interface TrustedSubmitOpts {
   submissionAuthority?: SubmissionAuthority;
@@ -560,6 +561,7 @@ export class MinionQueue {
         }
         const parent = rowToMinionJob(parentRows[0]);
         if (parent.submission_authority && parent.submission_authority.kind !== 'application') throw new Error('Remote jobs cannot have descendants');
+        if (!NON_TERMINAL_STATUSES.includes(parent.status)) throw new Error(`parent job ${opts.parent_job_id} is ${parent.status}; a finished job cannot get new children`);
 
         depth = parent.depth + 1;
         if (depth > maxSpawnDepth) {
@@ -772,8 +774,8 @@ export class MinionQueue {
    *
    * Returns the *root* (the job matching id), not an arbitrary descendant.
    */
-  async cancelJob(id: number, opts?: { ownerClientId?: string }): Promise<MinionJob | null> {
-    const cancelled = await this.cancelJobs([id], opts?.ownerClientId ? { ownerClientId: opts.ownerClientId } : undefined);
+  async cancelJob(id: number, opts?: { ownerClientId?: string; ownerActor?: JobActor }): Promise<MinionJob | null> {
+    const cancelled = await this.cancelJobs([id], { rootStatuses: NON_TERMINAL_STATUSES, ...(opts?.ownerClientId ? { ownerClientId: opts.ownerClientId, ownerActor: opts.ownerActor } : {}) });
     const root = cancelled.find(j => j.id === id);
     return root ?? null;
   }
@@ -1032,7 +1034,7 @@ export class MinionQueue {
    * every surface keyed on a reason prefix (jobs stats, doctor) would
    * silently report zero without this parameter.
    */
-  async cancelJobs(ids: number[], opts?: { reason?: string; rootStatuses?: MinionJobStatus[]; ownerClientId?: string }): Promise<MinionJob[]> {
+  async cancelJobs(ids: number[], opts?: { reason?: string; rootStatuses?: MinionJobStatus[]; ownerClientId?: string; ownerActor?: JobActor }): Promise<MinionJob[]> {
     if (ids.length === 0) return [];
     // opts.rootStatuses re-checks each ROOT id's status ATOMICALLY inside the
     // cancel UPDATE's CTE seed. The waiting-TTL sweep passes ['waiting'] to
@@ -1055,7 +1057,7 @@ export class MinionQueue {
           SELECT id, 0 AS d FROM minion_jobs
            WHERE id = ANY($1::int[])
              AND ($3::text[] IS NULL OR status = ANY($3::text[]))
-             AND ($4::text IS NULL OR data->>'__owner_client_id' = $4::text)
+             AND ($4::text IS NULL OR (data->>'__owner_client_id' = $4::text AND ${jobActorSql(5)}))
           UNION ALL
           SELECT m.id, descendants.d + 1
             FROM minion_jobs m
@@ -1077,7 +1079,7 @@ export class MinionQueue {
          WHERE id IN (SELECT id FROM descendants)
            AND status IN ('waiting','active','delayed','waiting-children','paused')
          RETURNING *`,
-        [ids, opts?.reason ?? null, rootStatuses, ownerClientId]
+        [ids, opts?.reason ?? null, rootStatuses, ownerClientId, ...(opts?.ownerActor ?? NO_JOB_ACTOR)]
       );
       if (rows.length === 0) return [];
 
@@ -1716,7 +1718,7 @@ export class MinionQueue {
    * stranding the parent in waiting-children forever.
    */
   async completeJob(id: number, lockToken: string, result?: Record<string, unknown>): Promise<MinionJob | null> {
-    return this.engine.transaction(async (tx) => {
+    return retryOnStalePlan(() => this.engine.transaction(async (tx) => {
       // Peek at parent_job_id before the UPDATE so we can lock the parent row
       // FIRST. Without this SELECT FOR UPDATE, two siblings completing
       // concurrently each see the other as still active (pre-commit snapshot
@@ -1806,7 +1808,7 @@ export class MinionQueue {
       }
 
       return completed;
-    });
+    }));
   }
 
   /**
@@ -1831,7 +1833,7 @@ export class MinionQueue {
     backoffMs?: number,
     result?: Record<string, unknown>,
   ): Promise<MinionJob | null> {
-    return this.engine.transaction(async (tx) => {
+    return retryOnStalePlan(() => this.engine.transaction(async (tx) => {
       // Lock the parent row first so concurrent sibling completions/failures
       // serialize on the parent — same race fix as completeJob.
       const peek = await tx.executeRaw<{ parent_job_id: number | null }>(
@@ -1891,7 +1893,7 @@ export class MinionQueue {
 
         if (failed.on_child_fail === 'fail_parent') {
           await tx.executeRaw(
-            `UPDATE minion_jobs SET status = 'failed',
+            `UPDATE minion_jobs SET status = 'failed', lock_token = NULL, lock_until = NULL,
               error_text = $1, finished_at = now(), updated_at = now()
              WHERE id = $2 AND status = 'waiting-children'`,
             [`child job ${failed.id} failed: ${errorText}`, failed.parent_job_id]
@@ -1943,7 +1945,7 @@ export class MinionQueue {
       }
 
       return failed;
-    });
+    }));
   }
 
   /**
@@ -2257,7 +2259,7 @@ export class MinionQueue {
   /** Fail the parent when a child fails with fail_parent policy. */
   async failParent(parentId: number, childId: number, errorText: string): Promise<MinionJob | null> {
     const rows = await this.engine.executeRaw<Record<string, unknown>>(
-      `UPDATE minion_jobs SET status = 'failed',
+      `UPDATE minion_jobs SET status = 'failed', lock_token = NULL, lock_until = NULL,
         error_text = $1, finished_at = now(), updated_at = now()
        WHERE id = $2 AND status = 'waiting-children'
        RETURNING *`,

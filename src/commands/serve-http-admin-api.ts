@@ -17,6 +17,7 @@ import { mountAdminApiKeys } from './serve-http-api-keys.ts';
 import { mountAdminClients } from './serve-http-clients.ts';
 import { mountAdminRegistration } from './serve-http-registration.ts';
 import { parseAdminGrantRequest, grantHttpStatus, GRANT_TOKEN_IMPLICATIONS, mountAdminGrantDiscovery, mountAdminGrantEdits } from './serve-http-grants.ts';
+import { mountAdminAccess, mountAdminMemoryProposals } from './serve-http-access.ts';
 import { probeHealth } from './serve-http-metrics.ts';
 import type { ServeHttpContext } from './serve-http.ts';
 
@@ -86,7 +87,7 @@ export async function queryHealthIndicators(engine: BrainEngine): Promise<{
   // reported as pending in the last 24 hours later ended without committing.
   const [pending] = await sql`SELECT count(*)::int AS count,
     COALESCE(floor(extract(epoch FROM now() - min(created_at))), 0)::int AS oldest_age_seconds
-    FROM persistence_requests WHERE state IN ('queued', 'running', 'recovering')`;
+    FROM persistence_requests WHERE state IN ('queued', 'deferred', 'running', 'recovering')`;
   const [laterFailed] = await sql`SELECT count(DISTINCT r.id)::int AS count FROM mcp_request_log l
     JOIN persistence_requests r ON r.request_id::text = l.params->>'write_request_id'
     WHERE l.status = 'accepted_pending' AND l.created_at > now() - interval '24 hours'
@@ -610,6 +611,8 @@ function mountAdminClientApi(app: Express, ctx: ServeHttpContext): void {
   });
 
   mountAdminGrantEdits(app, requireAdmin, engine, oauthProvider);
+  mountAdminAccess(app, requireAdmin, engine);
+  mountAdminMemoryProposals(app, requireAdmin, engine);
 
   // Revoke OAuth client
   app.post('/admin/api/revoke-client', requireAdmin, express.json(), async (req: Request, res: Response) => {

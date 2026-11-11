@@ -44,14 +44,16 @@ import { join, relative, resolve, sep } from 'node:path';
 import type { Notice } from '../agent-output.ts';
 import { literalPathspecs } from '../git-env.ts';
 import { OperationError, opError } from '../ops/contract.ts';
-import { commitMessage, git, gitBytes, gitFailure, gitStepTimeoutMs, ignoredTargetError, reclaimAbandonedIndexLock, withSession, type GitSession } from './effect-git.ts';
-import type { GitCommitNote } from './effect-model.ts';
+import { commitMessage, commitMessageArgs, git, gitBytes, gitFailure, gitStepTimeoutMs, ignoredTargetError, reclaimAbandonedIndexLock, stripspace, withSession, type GitSession } from './effect-git.ts';
+import { adoptedBy, type GitCommitNote } from './effect-model.ts';
 import { persistenceHome } from './identity.ts';
 import { ignoreCandidates } from './ignore-rules.ts';
 import { hashFile } from './large-file.ts';
 import type { FileRecoveryRecord, SqlEngine } from './model.ts';
 import { nativeFileTarget } from './native-file-target.ts';
 import type { NativeLockHandle } from './native-lock.ts';
+import { recordCommitAsync } from '../git/commit-ledger.ts';
+import { supersededBy } from './import-deferral.ts';
 import { committedBlob, headBlob, headCommit } from './pending-import.ts';
 
 /** Whether `sourceId` is a strict (git-canonical) source; `lock` reads its row FOR SHARE inside a publication. */
@@ -180,14 +182,6 @@ function rewriteTree(dir: Dir, oidBytes: number): Buffer {
   for (const op of ops) { chunks.push(dir.raw.subarray(at, op.start), op.bytes); at = op.end; }
   chunks.push(dir.raw.subarray(at));
   return Buffer.concat(chunks);
-}
-
-/** Git's whitespace cleanup of a `-m` paragraph, as `git commit -m` applies it: trailing blanks, repeated and edge blank lines go. */
-function stripspace(paragraph: string): string {
-  const lines: string[] = [];
-  for (const line of paragraph.split('\n').map(text => text.replace(/[ \t\r]+$/, ''))) if (line || lines.length && lines[lines.length - 1]) lines.push(line);
-  while (lines.length && !lines[lines.length - 1]) lines.pop();
-  return lines.join('\n');
 }
 
 async function doorCommit(session: GitSession, root: string, files: DoorFile[], onIndexRestored?: (paths: string[]) => void): Promise<string> {
@@ -323,10 +317,13 @@ async function doorCommit(session: GitSession, root: string, files: DoorFile[], 
 
       const noted = new Map(changed.flatMap(target => target.note ? [[target.rel, target.note] as const] : []));
       const message = commitMessage(changed.map(target => target.rel), noted).map(stripspace).filter(Boolean);
-      const commit = await git(session, ['commit-tree', tree, '-p', head, ...message.flatMap(paragraph => ['-m', paragraph])]);
+      const commit = await git(session, ['commit-tree', tree, '-p', head, ...commitMessageArgs(message, scratch)]);
       if (commit.code !== 0) throw gitFailure('Cannot commit the canonical Git target.',
         `git commit-tree failed for ${changed.length} file(s); a missing Git identity (user.name, user.email) in that checkout is one cause to check.`);
       const created = commit.stdout.trim();
+      const trailers = [...noted.values()].flatMap(note => note.trailers ?? []);
+      const supersedes = supersededBy(trailers), adopted = adoptedBy(trailers);
+      await recordCommitAsync(root, { sha: created, writer: 'door', ref: branch, ...(supersedes.length ? { supersedes } : {}), ...(adopted.length ? { adopted } : {}) });
       await doorSeams.beforeUpdateRef?.(root, attempt);
       const moved = await git(session, ['update-ref', '-m', `commit: ${message[0]!.split('\n')[0]}`, branch, created, head]);
       if (moved.code === 0) {

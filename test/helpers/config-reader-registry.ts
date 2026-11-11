@@ -25,6 +25,7 @@ export interface InternalConfigState {
 
 export const INTERNAL_CONFIG_STATE: readonly InternalConfigState[] = [
   { key: 'version', reason: 'schema version stamp written by migrate.ts' },
+  { key: 'access.restrictions_present', reason: 'sticky member-access marker a v282 trigger sets once a page names readers or a member exists (search/private-visibility.ts); clearing it would send remote reads down the unrestricted fast path' },
   { key: '_internal.link_extraction_generation', reason: 'link-extraction watermark generation (link-extraction-watermark.ts)' },
   { key: 'code.cluster_generation', reason: 'code-intel traversal cache generation counter' },
   { key: 'embedding_migration.state', reason: 'gbrain migrate-embeddings resume state' },
@@ -131,6 +132,7 @@ export const UNRESOLVED_CONFIG_READS: readonly UnresolvedConfigRead[] = [
   { file: 'src/core/pace-mode.ts', expr: 'k', why: P },
   { file: 'src/core/page-body/limits.ts', expr: 'key', why: P },
   { file: 'src/core/persistence/group-publish.ts', expr: 'name', why: P },
+  { file: 'src/core/persistence/memory-proposals.ts', expr: 'spec.key', why: 'Object.entries walk over PROPOSAL_LIMIT_KEYS (registered in config-runtime-keys.ts)' },
   { file: 'src/core/persistence/page-mutations.ts', expr: 'name', why: P },
   { file: 'src/core/persistence/sync-drain.ts', expr: 'key', why: P },
   { file: 'src/core/persistence/sync-group.ts', expr: 'key', why: P },

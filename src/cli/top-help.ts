@@ -46,6 +46,8 @@ PAGES
   delete <slug>                      Delete a page
   list [--type T] [--tag T] [--limit N]
                                      List pages
+  find <glob|prefix|name> [--type T] [--source S] [--limit N]
+                                     Find pages by slug, path or title
 
 SEARCH
   search <query>                     Keyword search (tsvector)
@@ -121,6 +123,7 @@ TOOLS
   compile-context --target <t>       Compile a deterministic, scanned, budgeted context
         [--budget N] [--check]       file (claude-code | codex | openclaw)
   decide <status|probe|enable|...>   System One decision support (Jev); every slot off by default
+  memory-proposals list|show|approve|deny  QM's proposed timeline entries and links awaiting your decision
   facts relink [--dry-run]           Link facts saved without an entity to the entity they name
   check-resolvable [--json] [--fix]  Validate skill tree (reachability/MECE/DRY)
   report --type <name> --content ... Save timestamped report to brain/reports/
@@ -191,6 +194,8 @@ JOBS (Minions)
 
 ADMIN
   stats                              Brain statistics
+  stats --by source,type [--since 30d] [--collapse-aliases]
+                                     Live page counts per source and type
   health                             Brain health dashboard
   history <slug> [--json]            Page version history
   revert <slug> <version-id>         Revert to version

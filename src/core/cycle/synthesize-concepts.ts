@@ -37,13 +37,14 @@ import { slugifySegment } from '../sync.ts';
 import { validatePageSlug } from '../ops/context.ts';
 import { privatePagesFilterFragment, strictestVisibility, type Visibility } from '../search/private-visibility.ts';
 import { maintenancePreflight } from '../persistence/prepared-maintenance.ts';
-import { derivedWriteThrough, reportFileHolds } from './derived-write-through.ts';
+import { derivedWriteThrough, reportDerivedWriteThrough } from './derived-write-through.ts';
 import { addSpellingRedirects, canonicalConceptStem, loadConceptRedirects, loadLiveConceptStems } from './concept-redirects.ts';
 import { conceptProvenanceCovers, conceptPublicationHold, stripFenceSections } from './concept-publication.ts';
 import { conceptWriter, type ConceptWrite } from './concept-writes.ts';
 import { readPhaseConfigNumber, SYNTHESIZE_CONCEPTS_BUDGET_KEY, SYNTHESIZE_CONCEPTS_DEFAULT_BUDGET_USD } from './phase-config-values.ts';
 import { ConceptRetryBound, MAX_CONCEPT_ATTEMPTS } from './concept-retry-bound.ts';
 import { ConceptDriftSkips } from '../persistence/drift-conflicts.ts';
+import { throwIfAborted } from '../abort-check.ts';
 
 // Miss policy for the shared resolver (`priceFor`: operator overrides, the
 // claude-cli → Anthropic sibling, canonical rows): assume Sonnet-tier
@@ -151,7 +152,10 @@ export interface SynthesizeConceptsOpts {
   progress?: ProgressReporter;
   /** Wall-clock bound for the per-group loop (default 240s): the dollar budget does not bound a local model. */
   phaseBudgetMs?: number;
-  /** Cooperative cancel, checked before each group so an aborted job cannot orphan its handler. */
+  /**
+   * #7986: the cycle's abort signal (job timeout or cancel, lock loss). Handed to the model call and checked
+   * before each concept's spend and publication, so an aborted run publishes no further concept page.
+   */
   signal?: AbortSignal;
   /** Test seam: alternative chat function. */
   _chat?: typeof gatewayChat;
@@ -369,10 +373,21 @@ export async function runPhaseSynthesizeConcepts(
   };
   const writer = conceptWriter({ engine, maintenance, sourceId: src, importSourceId: opts.sourceId, brainDir: opts.brainDir, writeThrough: conceptFiles !== null,
     retries, publicationDeferred, publicationHeld, linkWarnings, written: countWritten });
+  // #7986: an aborted run publishes nothing more, but keeps the retry counters and the spend of the calls it finished.
+  const stopIfAborted = async (): Promise<void> => {
+    if (!opts.signal?.aborted) return;
+    if (!opts.dryRun) {
+      await retries.save(engine);
+      await upsertExtractRollup(engine, { kind: 'concepts', source_id: src, cost_delta: estimatedSpendUsd });
+    }
+    throwIfAborted(opts.signal, 'synthesize_concepts');
+  };
+  // Local: the wall-clock deadline is a partial run (groups resume next cycle), not an abort; the signal path above throws.
   const phaseBudgetMs = opts.phaseBudgetMs ?? DEFAULT_PHASE_BUDGET_MS, deadline = Date.now() + phaseBudgetMs;
   let groupsSkipped = 0; // groups left for the next cycle by the deadline or signal
   for (const [index, group] of atomGroups.entries()) {
-    if (Date.now() >= deadline || opts.signal?.aborted) { groupsSkipped = atomGroups.length - index; break; }
+    await stopIfAborted();
+    if (Date.now() >= deadline) { groupsSkipped = atomGroups.length - index; break; }
     const conceptSlug = `concepts/${group.conceptSlug}`;
     // A concept page this phase did not write belongs to a human (or another
     // writer). Check before any spend; never replace its body.
@@ -454,6 +469,7 @@ export async function runPhaseSynthesizeConcepts(
               },
             ],
             maxTokens: synthMaxOutputTokens,
+            abortSignal: opts.signal,
           });
           // Post-await yield (T3): the LLM call is the main TTL hazard
           // codex flagged. Throttle inside maybeYield bounds the actual
@@ -479,7 +495,8 @@ export async function runPhaseSynthesizeConcepts(
             retries.fail(`${opts.sourceId ?? 'default'}:${conceptSlug}`, memberHash);
           }
         } catch (err) {
-          if (Date.now() >= deadline || opts.signal?.aborted) { groupsSkipped = atomGroups.length - index; break; } // cancelled: no strike
+          await stopIfAborted();
+          if (Date.now() >= deadline) { groupsSkipped = atomGroups.length - index; break; } // deadline cancel: no strike
           const msg = err instanceof Error ? err.message : String(err);
           // #3044 adoption: a whole-run LLM outage must not overwrite
           // existing concept pages with error_fallback stub narratives.
@@ -515,6 +532,7 @@ export async function runPhaseSynthesizeConcepts(
     }
     if (!grandfathered) synthesisModeCounts[synthesisMode]++;
 
+    await stopIfAborted();
     if (!opts.dryRun) {
       // #5525: tighten-only — a concept already private stays private.
       const prior = await engine.getPage(conceptSlug, { sourceId: src });
@@ -543,6 +561,7 @@ export async function runPhaseSynthesizeConcepts(
       const write: ConceptWrite = { concept: group.conceptSlug, conceptSlug, atomSlugs: group.atomSlugs, visibility, covered, synthesisMode, synthesized, narrative,
         revision: existingSnapshot?.revision ?? null, baseline: existing?.compiled_truth ?? '' };
       // GBRA-60: a managed run's concepts publish in batches (concept-writes.ts), each one publication group on Postgres.
+      await stopIfAborted();
       await (maintenance ? writer.queue(write) : writer.publish(write));
     } else countWritten();
 
@@ -551,6 +570,7 @@ export async function runPhaseSynthesizeConcepts(
     // right cadence (30s instead of every-group).
     await maybeYield();
   }
+  await stopIfAborted();
   // local: no publication after a deadline/signal cancel, including one that landed after the last group; queued concepts re-derive next cycle
   const cancelled = groupsSkipped > 0 || Date.now() >= deadline || !!opts.signal?.aborted;
   const queuedDiscarded = maintenance && cancelled ? writer.queued() : 0;
@@ -598,7 +618,7 @@ export async function runPhaseSynthesizeConcepts(
     });
   }
 
-  return reportFileHolds({
+  return reportDerivedWriteThrough({
     phase: 'synthesize_concepts',
     status: failures.length > 0 || linkWarnings.length > 0 || publicationDeferred.length > 0 || publicationHeld.length > 0 || skippedFileDrift.length > 0 ? 'warn' : 'ok',
     duration_ms: 0,
@@ -644,7 +664,7 @@ export async function runPhaseSynthesizeConcepts(
       pricing_fallback_models: [...pricingFallbackModels],
       dry_run: opts.dryRun ?? false,
     },
-  }, conceptFiles?.held, 'concept');
+  }, conceptFiles, 'concept');
 }
 
 /**

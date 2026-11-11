@@ -6,13 +6,12 @@
  * (including a retained-output retry) store the same `effective_date`
  * instead of the extraction run time. The stored projection wins; a legacy
  * page without one is dated by the same precedence chain import uses.
- * A transcript has no source page: it is dated only by a `YYYY-MM-DD` prefix on
- * its file name (transcriptSourceDate), else it gets no date.
+ * Transcript-derived atoms have no source page: transcriptAtomSourceDate.
  */
-import { basename } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
 import { computeEffectiveDate } from '../effective-date.ts';
+import { transcriptFrontmatter } from './transcript-discovery.ts';
 
 export async function atomSourceDate(engine: Pick<BrainEngine, 'getConfig'>, page: Page | null): Promise<string | null> {
   if (!page) return null;
@@ -26,13 +25,17 @@ export async function atomSourceDate(engine: Pick<BrainEngine, 'getConfig'>, pag
 }
 
 /**
- * The content date of a transcript-derived atom: the leading `YYYY-MM-DD` of the
- * transcript's file name, the same prefix transcript discovery reads as the
- * file's date. A name without that prefix, or with an impossible date, gives null.
+ * #7268: the content date a transcript-derived atom inherits, by the same
+ * precedence chain: the transcript's frontmatter date keys, else `pathDate`
+ * (the date in its path that names its atoms/<date>/ folder). Null when it
+ * carries neither; the extraction run never stands in for it. A failed
+ * timezone read keeps the phase fail-soft and reads the date as UTC.
  */
-export function transcriptSourceDate(filePath: string): string | null {
-  const day = /^(\d{4}-\d{2}-\d{2})/.exec(basename(filePath))?.[1];
-  if (!day) return null;
-  const date = new Date(`${day}T00:00:00.000Z`);
-  return !Number.isNaN(date.getTime()) && date.toISOString().startsWith(day) ? date.toISOString() : null;
+export async function transcriptAtomSourceDate(engine: Pick<BrainEngine, 'getConfig'>, content: string, pathDate: string): Promise<string | null> {
+  const { date } = computeEffectiveDate({
+    slug: '', frontmatter: transcriptFrontmatter(content), filename: pathDate,
+    createdAt: new Date(NaN), updatedAt: new Date(NaN),
+    timeZone: (await engine.getConfig('brain.timezone').catch(() => null)) ?? undefined,
+  });
+  return date ? date.toISOString() : null;
 }
