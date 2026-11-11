@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 287194,
-    "stdoutSha256": "77ce6903a27a21e1913a9b4cd49be328cffda29f27d55ef25465c189461d3af5",
+    "stdoutBytes": 288831,
+    "stdoutSha256": "81fa8f02a98ff0442b02eb9792946ef101083f206aea4ffd609f411c530054ad",
     "toolNames": [
       "remember",
       "entity",
@@ -147,6 +147,7 @@
       "ontology_conflicts",
       "volunteer_chronicle",
       "chronicle_backfill",
+      "reflex_pointers",
       "volunteer_context",
       "extract_entities",
       "extraction_pending",
@@ -6599,6 +6600,53 @@
           "type": "object"
         },
         "scope": "admin"
+      },
+      {
+        "description": "Retrieval Reflex over an op transport: extract salient entities from a turn of user text and resolve them to compact page pointers. Same pipeline, gate, timeout and heartbeat as the context-engine layer — for hosts (per-prompt hooks, non-context-engine agents) that consume the brain over MCP instead of assemble().",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "reflex_pointers",
+        "parameters": {
+          "max_pointers": "number?",
+          "min_trust": "string?",
+          "prior_context": "string?",
+          "text": "string"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "max_pointers": {
+              "description": "Maximum compact pointers to return (default and hard cap follow the reflex pipeline).",
+              "type": "number"
+            },
+            "min_trust": {
+              "description": "Lowest trust tier to return (the connection floor still applies).",
+              "enum": [
+                "user_confirmed",
+                "operator_curated",
+                "tool_observed",
+                "agent_written",
+                "unknown",
+                "external_untrusted"
+              ],
+              "type": "string"
+            },
+            "prior_context": {
+              "description": "Previously assembled context used to suppress already-surfaced pointers.",
+              "type": "string"
+            },
+            "text": {
+              "description": "Current user turn whose salient entities should be resolved to brain pointers.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        "scope": "read"
       },
       {
         "description": "Push-based context: volunteer brain pages relevant to a rolling conversation window WITHOUT being asked. Zero-LLM, confidence-gated (alias 0.9 / exact-title 0.8 / slug-suffix 0.6, +0.05 for multi-turn or newest-turn mentions; default gate 0.7), capped at 3 pages (max 5). Returns pointers with one-line rationales + synopses — open the page (get_page) before relying on details. Pass stats: true for the approximate volunteered-vs-used precision summary (the feedback loop).",
