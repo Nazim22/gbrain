@@ -33,17 +33,20 @@ export async function scan(text: string, c: LeakConfig): Promise<LeakResult> {
 }
 
 // The raw report (it holds the matched values) lives only in a 0600 temp dir that is removed on every path.
+// Never rejects: a failure to create, run, read or remove it is an { error } result (removal failure included, since the
+// report may still be on disk).
 async function gitleaks(text: string, c: LeakConfig): Promise<any[] | { error: string }> {
-  const dir = mkdtempSync(join(c.tmp_dir, 'scan-'));
+  let dir = '', out: any[] | { error: string };
   try {
+    dir = mkdtempSync(join(c.tmp_dir, 'scan-'));
     writeFileSync(join(dir, 'outbound.txt'), text, { mode: 0o600 });
     const report = join(dir, 'report.json');
     const r = await run([c.gitleaks, 'dir', join(dir, 'outbound.txt'), '--no-banner', '--report-format', 'json', '--report-path', report, '--exit-code', '0'], undefined, c.timeout_ms);
-    if (r.code !== 0) return { error: 'gitleaks_failed' };
-    const findings = JSON.parse(readFileSync(report, 'utf8'));
-    return Array.isArray(findings) ? findings : { error: 'gitleaks_failed' };
-  } catch { return { error: 'gitleaks_failed' }; }
-  finally { rmSync(dir, { recursive: true, force: true }); }
+    const findings = r.code === 0 ? JSON.parse(readFileSync(report, 'utf8')) : null;
+    out = Array.isArray(findings) ? findings : { error: 'gitleaks_failed' };
+  } catch { out = { error: 'gitleaks_failed' }; }
+  try { if (dir) rmSync(dir, { recursive: true, force: true }); } catch { return { error: 'gitleaks_cleanup_failed' }; }
+  return out;
 }
 
 /**

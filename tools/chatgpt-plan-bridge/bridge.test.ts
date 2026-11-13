@@ -247,3 +247,26 @@ test('real pinned detectors through the handler: a gitleaks-only false positive 
   expect(c.calls[0].body).toEqual({ model: 'gpt-6-luna', instructions: 'SYS', input: [{ role: 'user', content: 'USER' }], stream: true, store: false, reasoning: { effort: 'medium' } });
   expect(readdirSync(tmp)).toEqual([]);
 }, 90_000);
+
+test('a thrown or rejected scan, mask or rescan latches the halt like a returned error; the next request sends nothing', async () => {
+  const cases: Array<Partial<{ scan: (t: string) => Promise<any>; mask: (p: string[]) => Promise<any> }>> = [];
+  cases.push({ scan: async () => gl, mask: async () => { throw Error('ENOTDIR leak-tmp') } });                       // rejected mask
+  let n1 = 0; cases.push({ scan: async () => { if (n1++) throw Error('rescan boom'); return gl; }, mask: async p => ({ parts: p, rules: ['generic-api-key'], spans: 1 }) }); // rejected rescan
+  cases.push({ scan: (() => { throw Error('sync scan boom'); }) as any });                                          // synchronous throw
+  for (const c of cases) {
+    const s = setup(c);
+    const r = await s.post(ok); expect(r.status).toBe(503); const b = await r.json(); expect(b.error.code).toBe('leak_gate_unavailable');
+    expect(JSON.stringify(b)).not.toContain('boom'); expect(JSON.stringify(b)).not.toContain('ENOTDIR');
+    expect(existsSync(join(s.dir, 'halted.json'))).toBe(true); expect(s.calls.length).toBe(0);
+    expect(readFileSync(join(s.dir, 'requests.jsonl'), 'utf8')).not.toContain('boom');
+    const next = await s.post(ok); expect(next.status).toBe(429); expect((await next.json()).error.code).toBe('bridge_halted'); expect(s.calls.length).toBe(0);
+  }
+});
+
+test('real maskGitleaks and scan return an error result, never reject, when the temp parent is not a directory', async () => {
+  const f = join(mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'leak-notdir-')), 'file');
+  require('node:fs').writeFileSync(f, 'x');
+  const cfg = { python: '/usr/bin/python3', detector_check: join(import.meta.dir, 'detector_check.py'), redactor: '/root/work/dream-s552-vault-atoms/pilot/detector/ingest-session-transcript.py', redactor_sha256: '425615c099e23da64053e1b2d700d252dc52ee193fc45381dfb3bc161aa6ee2d', gitleaks: '/usr/local/bin/gitleaks', tmp_dir: f, timeout_ms: 20_000 };
+  expect(await maskGitleaks(['SYS', 'USER'], cfg)).toEqual({ error: 'gitleaks_failed' });
+  expect(await scan('The parser reads output_item.done.', cfg)).toEqual({ error: 'gitleaks_failed' });
+}, 60_000);

@@ -98,18 +98,20 @@ export function makeHandler(cfg: Config, d: Deps) {
     };
     // S590 mask-and-send: a gitleaks hit is masked once, the final outbound projection is rescanned by both detectors,
     // and only a clean rescan is sent. Redactor hits, unmaskable findings and a dirty rescan quarantine as before.
+    // A thrown or rejected scan/mask is a scanner failure (exception text never logged): it takes the unavailable + latch path.
+    const guard = <T,>(p: () => Promise<T>) => Promise.resolve().then(p).catch(() => ({ error: 'scanner_threw' }) as const);
     let chat = parsed;
     const sendBody = (c: typeof parsed) => paid ? paidResponsesBody(c) : responsesBody(c);   // one projection: rescanned == sent
-    const leak = await d.scan(outbound);
+    const leak = await guard(() => d.scan(outbound));
     if ('error' in leak) return unavailable();
     if (!leak.clean) {
       if (leak.detector !== 'gitleaks') return refuse(leak.detector, leak.rules, 'scan');
-      const m = await d.mask([parsed.instructions, ...parsed.input.map(x => x.content)]);
+      const m = await guard(() => d.mask([parsed.instructions, ...parsed.input.map(x => x.content)]));
       if ('error' in m) return unavailable();
       if ('unmaskable' in m) return refuse(leak.detector, leak.rules, m.unmaskable);
       if (m.parts.length !== parsed.input.length + 1) return refuse(leak.detector, leak.rules, 'part_count');
       chat = { ...parsed, instructions: m.parts[0] + MASK_NOTE, input: parsed.input.map((x, i) => ({ ...x, content: m.parts[i + 1] })) };
-      const again = await d.scan(outboundText(sendBody(chat)));
+      const again = await guard(() => d.scan(outboundText(sendBody(chat))));
       if ('error' in again) return unavailable();
       if (!again.clean) return refuse(again.detector, again.rules, 'rescan');
       base.masked = { rules: m.rules, spans: m.spans };
