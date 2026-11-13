@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { makeHandler, loadConfig } from './bridge.ts';
 import { Limits } from './limits.ts';
-import { scan } from './leakgate.ts';
+import { maskGitleaks, scan } from './leakgate.ts';
 import { holdWriterLock, readKeyFile } from './custody.ts';
 import { sendUpstream } from './upstream.ts';
 import { TokenStore } from '../../eval/chatgpt-plan/auth.ts';
@@ -32,6 +32,6 @@ if (paid) {
   };
 }
 
-const handle = makeHandler(cfg, { accessToken, upstream: sendUpstream, scan: t => scan(t, cfg.leak), limits: new Limits(`${cfg.state_dir}/counters.json`, cfg.ceilings), callerSecret });
+const handle = makeHandler(cfg, { accessToken, upstream: sendUpstream, scan: t => scan(t, cfg.leak), mask: p => maskGitleaks(p, cfg.leak), limits: new Limits(`${cfg.state_dir}/counters.json`, cfg.ceilings), callerSecret });
 Bun.serve({ hostname: '127.0.0.1', port: cfg.port, fetch: handle, idleTimeout: 255 });
 console.log(JSON.stringify({ event: 'listening', host: '127.0.0.1', port: cfg.port, routes: Object.keys(cfg.routes), auth: paid ? 'api_key' : 'plan' }));

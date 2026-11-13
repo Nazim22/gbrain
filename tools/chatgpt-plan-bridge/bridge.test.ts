@@ -1,9 +1,10 @@
 import { expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { makeHandler, type Config } from './bridge.ts';
+import { MASK_NOTE, makeHandler, type Config } from './bridge.ts';
 import { Limits } from './limits.ts';
-import { scan } from './leakgate.ts';
+import { maskGitleaks, scan } from './leakgate.ts';
+import { readdirSync } from 'node:fs';
 import { parseStream, type Upstream } from './upstream.ts';
 
 const SECRET = 'a'.repeat(40);
@@ -15,7 +16,7 @@ const planStream = (text: string, out = 8, model = 'gpt-6-luna-2026-10-01') => e
   + ev('response.output_text.delta', { delta: text }) + ev('response.output_item.done', { item: item(text) })
   + ev('response.completed', { response: { status: 'completed', model, output: [], usage: { input_tokens: 817, output_tokens: out } } });
 
-function setup(over: Partial<{ upstream: (b: any) => Promise<Upstream>; token: () => Promise<string>; scan: (t: string) => Promise<any>; perHour: number; concurrency: number }> = {}) {
+function setup(over: Partial<{ upstream: (b: any) => Promise<Upstream>; token: () => Promise<string>; scan: (t: string) => Promise<any>; mask: (p: string[]) => Promise<any>; perHour: number; concurrency: number }> = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'bridge-test-'));
   const cfg: Config = { port: 0, caller_secret_file: '', state_dir: dir, auth_dir: '', routes: { 'gpt-6-luna': route }, ceilings: { per_hour: over.perHour ?? 100, per_day: 1000, concurrency: over.concurrency ?? 2 }, max_body_bytes: 262_144, upstream: { connect_ms: 1000, request_ms: 1000 }, leak: {} as any };
   const calls: any[] = [];
@@ -24,6 +25,7 @@ function setup(over: Partial<{ upstream: (b: any) => Promise<Upstream>; token: (
     callerSecret: Buffer.from(SECRET), limits,
     accessToken: over.token ?? (async () => 'tok'),
     scan: over.scan ?? (async () => ({ clean: true })),
+    mask: over.mask ?? (async () => ({ unmaskable: 'test_default' })),
     upstream: async (body, token, bounds, maxChars) => { calls.push({ body, token, bounds, maxChars }); return over.upstream ? over.upstream(body) : { status: 200, raw: Buffer.from(planStream('{"atoms":[]}')), charCapHit: false }; },
   });
   const post = (body: unknown, secret = SECRET) => h(new Request('http://127.0.0.1/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${secret}` }, body: JSON.stringify(body) }));
@@ -183,3 +185,65 @@ test('halt latch is re-checked right before dispatch: a request held in scanning
   const ra = await a; expect(ra.status).toBe(429); expect((await ra.json()).error.code).toBe('bridge_halted');
   expect(upstreamCalls).toBe(1);                      // A never dispatched
 });
+
+// ---- S590 mask-and-send ----
+const ledgerRows = (dir: string) => readFileSync(join(dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+const gl = { clean: false, detector: 'gitleaks', rules: ['generic-api-key'] } as const;
+
+test('mask-and-send: a gitleaks hit is masked, the final outbound projection is rescanned, and only the masked text is sent', async () => {
+  const scanned: string[] = []; let n = 0;
+  const s = setup({
+    scan: async t => { scanned.push(t); return n++ === 0 ? gl : { clean: true }; },
+    mask: async p => ({ parts: p.map(x => x.replace('VALUE-1234567890', '[REDACTED-BY-BRIDGE:generic-api-key]')), rules: ['generic-api-key'], spans: 1 }),
+  });
+  const r = await s.post({ ...ok, messages: [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'icon_key: VALUE-1234567890' }] });
+  expect(r.status).toBe(200); expect(r.headers.get('x-bridge-masked')).toBe('generic-api-key');
+  expect(s.calls.length).toBe(1);
+  const body = JSON.stringify(s.calls[0].body);
+  expect(body).not.toContain('VALUE-1234567890'); expect(body).toContain('[REDACTED-BY-BRIDGE:generic-api-key]');
+  expect(s.calls[0].body.instructions).toBe('SYS' + MASK_NOTE);
+  expect(scanned[1]).toBe([s.calls[0].body.instructions, ...s.calls[0].body.input.map((m: any) => m.content)].join('\n\n'));  // rescan = what was sent
+  const row = ledgerRows(s.dir).at(-1); expect(row.status).toBe(200); expect(row.masked).toEqual({ rules: ['generic-api-key'], spans: 1 });
+  expect(JSON.stringify(row)).not.toContain('VALUE-1234567890');
+});
+
+test('mask-and-send refusals send nothing: redactor hit, unmaskable, part-count mismatch, dirty rescan', async () => {
+  let masks = 0;
+  const red = setup({ scan: async () => ({ clean: false, detector: 'redactor', rules: ['2'] }), mask: async () => { masks++; return { parts: [], rules: [], spans: 0 }; } });
+  expect((await red.post(ok)).status).toBe(503); expect(masks).toBe(0); expect(red.calls.length).toBe(0);
+  const un = setup({ scan: async () => gl, mask: async () => ({ unmaskable: 'cross_part_or_unmatched' }) });
+  const r = await un.post(ok); expect(r.status).toBe(503); expect((await r.json()).error.code).toBe('leak_quarantine'); expect(un.calls.length).toBe(0);
+  expect(readFileSync(join(un.dir, 'quarantine.jsonl'), 'utf8')).toContain('"stage":"cross_part_or_unmatched"');
+  const pc = setup({ scan: async () => gl, mask: async () => ({ parts: ['SYS'], rules: ['generic-api-key'], spans: 1 }) });
+  expect((await pc.post(ok)).status).toBe(503); expect(pc.calls.length).toBe(0);
+  const dirty = setup({ scan: async () => gl, mask: async p => ({ parts: p, rules: ['generic-api-key'], spans: 1 }) });
+  expect((await dirty.post(ok)).status).toBe(503); expect(dirty.calls.length).toBe(0);
+  expect(readFileSync(join(dirty.dir, 'quarantine.jsonl'), 'utf8')).toContain('"stage":"rescan"');
+  expect(existsSync(join(dirty.dir, 'halted.json'))).toBe(false);
+});
+
+test('mask-and-send: a scanner error while masking or rescanning trips the halt and sends nothing', async () => {
+  const me = setup({ scan: async () => gl, mask: async () => ({ error: 'gitleaks_failed' }) });
+  const r = await me.post(ok); expect(r.status).toBe(503); expect((await r.json()).error.code).toBe('leak_gate_unavailable');
+  expect(me.calls.length).toBe(0); expect(existsSync(join(me.dir, 'halted.json'))).toBe(true);
+  let n = 0;
+  const re = setup({ scan: async () => (n++ === 0 ? gl : { error: 'redactor_failed' }), mask: async p => ({ parts: p, rules: ['generic-api-key'], spans: 1 }) });
+  expect((await re.post(ok)).status).toBe(503); expect(re.calls.length).toBe(0); expect(existsSync(join(re.dir, 'halted.json'))).toBe(true);
+});
+
+test('real pinned detectors through the handler: a gitleaks-only false positive is masked and sent; a redactor hit and clean text behave as before; temp dirs are removed', async () => {
+  const P = '/root/work/dream-s552-vault-atoms/pilot/detector/ingest-session-transcript.py';
+  if (!existsSync(P)) throw Error('pinned redactor copy missing');
+  const tmp = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'leak-tmp-'));
+  const cfg = { python: '/usr/bin/python3', detector_check: join(import.meta.dir, 'detector_check.py'), redactor: P, redactor_sha256: '425615c099e23da64053e1b2d700d252dc52ee193fc45381dfb3bc161aa6ee2d', gitleaks: '/usr/local/bin/gitleaks', tmp_dir: tmp, timeout_ms: 20_000 };
+  const real = () => setup({ scan: t => scan(t, cfg), mask: p => maskGitleaks(p, cfg) });
+  const fp = 'bev-energy-' + 'Qx7mK2pL9vR4tW8z';  // split so the fixture itself is not a finding in this repo
+  const a = real(); const r = await a.post({ ...ok, messages: [{ role: 'system', content: 'Extract atoms.' }, { role: 'user', content: `product row\n  icon_key: "${fp}"\n  name: Rip It Citrus` }] });
+  expect(r.status).toBe(200); expect(a.calls.length).toBe(1);
+  expect(JSON.stringify(a.calls[0].body)).not.toContain(fp);
+  expect(a.calls[0].body.input[0].content).toBe('product row\n  icon_key: "[REDACTED-BY-BRIDGE:generic-api-key]"\n  name: Rip It Citrus');
+  const b = real(); expect((await b.post({ ...ok, messages: [{ role: 'user', content: 'apiKey = "' + 'Zx81Kq3Lm9Pv2Rt7Wy4Nc6' + '"' }] })).status).toBe(503); expect(b.calls.length).toBe(0);
+  const c = real(); expect((await c.post(ok)).status).toBe(200);
+  expect(c.calls[0].body).toEqual({ model: 'gpt-6-luna', instructions: 'SYS', input: [{ role: 'user', content: 'USER' }], stream: true, store: false, reasoning: { effort: 'medium' } });
+  expect(readdirSync(tmp)).toEqual([]);
+}, 90_000);

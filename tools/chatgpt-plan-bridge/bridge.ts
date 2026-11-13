@@ -9,7 +9,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { ContractError, applyMaxTokens, chatCompletion, costMicro, paidResponsesBody, parseChatRequest, reservationMicro, responsesBody, type Outcome, type Route } from './contract.ts';
 import { parseStream, UpstreamError, type UpstreamSender } from './upstream.ts';
 import { BudgetStateError, Limits, fsyncDir, type Ceilings } from './limits.ts';
-import type { LeakConfig, LeakResult } from './leakgate.ts';
+import { MASK, type LeakConfig, type LeakResult, type MaskResult } from './leakgate.ts';
 
 export type Config = {
   port: number; caller_secret_file: string; state_dir: string; auth_dir: string;
@@ -24,10 +24,14 @@ export type Deps = {
   accessToken: () => Promise<string>;          // load, refresh when near expiry (single owner, flock); throws on failure
   upstream: UpstreamSender;
   scan: (text: string) => Promise<LeakResult>;
+  mask: (parts: string[]) => Promise<MaskResult>;   // gitleaks hits only; see leakgate.ts maskGitleaks
   limits: Limits;
   callerSecret: Buffer;
   now?: () => number;
 };
+// Appended to the instructions of a masked request so the model never states a marker, or what it hid, as a fact.
+export const MASK_NOTE = `\n\n[bridge] Some values in this request were replaced with ${MASK('<rule>')} markers. Treat each marker as an unknown value: never state it, or what it stood for, as a fact.`;
+const outboundText = (b: { instructions: string; input: { content: string }[] }) => [b.instructions, ...b.input.map(m => m.content)].join('\n\n');
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
@@ -83,15 +87,32 @@ export function makeHandler(cfg: Config, d: Deps) {
     let parsed;
     try { parsed = parseChatRequest(JSON.parse(raw), cfg.routes); }
     catch (e) { const c = e instanceof ContractError ? e : new ContractError(400, 'invalid_json_body'); ledger({ id, status: c.status, code: c.code }); return err(c.status, c.code); }
-    const outbound = [parsed.instructions, ...parsed.input.map(m => m.content)].join('\n\n');
-    const base = { id, alias: parsed.alias, model: parsed.route.model, effort: parsed.route.effort, instructions_sha256: sha(parsed.instructions), input_sha256: sha(JSON.stringify(parsed.input)) };
+    const outbound = outboundText(parsed);
+    const base: Record<string, unknown> = { id, alias: parsed.alias, model: parsed.route.model, effort: parsed.route.effort, instructions_sha256: sha(parsed.instructions), input_sha256: sha(JSON.stringify(parsed.input)) };
 
-    const leak = await d.scan(outbound);
-    if ('error' in leak) { ledger({ ...base, status: 503, code: 'leak_gate_unavailable' }); trip('leak_gate_unavailable', id); return err(503, 'leak_gate_unavailable', 'leak gate unavailable; not sent', { 'retry-after': '60' }); }
-    if (!leak.clean) {
-      quarantine({ id, alias: parsed.alias, input_sha256: base.input_sha256, detector: leak.detector, rules: leak.rules });
-      ledger({ ...base, status: 503, code: 'leak_quarantine' });
+    const unavailable = () => { ledger({ ...base, status: 503, code: 'leak_gate_unavailable' }); trip('leak_gate_unavailable', id); return err(503, 'leak_gate_unavailable', 'leak gate unavailable; not sent', { 'retry-after': '60' }); };
+    const refuse = (detector: string, rules: string[], stage: string) => {
+      quarantine({ id, alias: parsed.alias, input_sha256: base.input_sha256, detector, rules, stage });
+      ledger({ ...base, status: 503, code: 'leak_quarantine', stage });
       return err(503, 'leak_quarantine', 'outbound text matched the leak gate; not sent', { 'retry-after': '3600' });
+    };
+    // S590 mask-and-send: a gitleaks hit is masked once, the final outbound projection is rescanned by both detectors,
+    // and only a clean rescan is sent. Redactor hits, unmaskable findings and a dirty rescan quarantine as before.
+    let chat = parsed;
+    const sendBody = (c: typeof parsed) => paid ? paidResponsesBody(c) : responsesBody(c);   // one projection: rescanned == sent
+    const leak = await d.scan(outbound);
+    if ('error' in leak) return unavailable();
+    if (!leak.clean) {
+      if (leak.detector !== 'gitleaks') return refuse(leak.detector, leak.rules, 'scan');
+      const m = await d.mask([parsed.instructions, ...parsed.input.map(x => x.content)]);
+      if ('error' in m) return unavailable();
+      if ('unmaskable' in m) return refuse(leak.detector, leak.rules, m.unmaskable);
+      if (m.parts.length !== parsed.input.length + 1) return refuse(leak.detector, leak.rules, 'part_count');
+      chat = { ...parsed, instructions: m.parts[0] + MASK_NOTE, input: parsed.input.map((x, i) => ({ ...x, content: m.parts[i + 1] })) };
+      const again = await d.scan(outboundText(sendBody(chat)));
+      if ('error' in again) return unavailable();
+      if (!again.clean) return refuse(again.detector, again.rules, 'rescan');
+      base.masked = { rules: m.rules, spans: m.spans };
     }
 
     // Paid mode: the request's maximum cost is reserved durably here, with the call counters, before anything is sent.
@@ -129,7 +150,7 @@ export function makeHandler(cfg: Config, d: Deps) {
       const h2 = halted();
       if (h2) { ledger({ ...base, status: 429, code: 'bridge_halted', halted_by: h2.code }); return err(429, 'bridge_halted', `bridge halted by ${h2.code}; operator must clear halted.json`, { 'retry-after': '3600' }); }
       let up;
-      try { up = await d.upstream(paid ? paidResponsesBody(parsed) : responsesBody(parsed), token, { connect: cfg.upstream.connect_ms, request: cfg.upstream.request_ms }, parsed.route.max_output_chars); }
+      try { up = await d.upstream(sendBody(chat), token, { connect: cfg.upstream.connect_ms, request: cfg.upstream.request_ms }, parsed.route.max_output_chars); }
       catch (e) { const code = e instanceof UpstreamError ? e.code : 'TRANSPORT-UNKNOWN'; ledger({ ...base, ...money, status: 502, code: 'unknown_completion', detail: code, latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion', code); }
       if (up.status !== 200) {
         let code = 'upstream_error';
@@ -148,7 +169,7 @@ export function makeHandler(cfg: Config, d: Deps) {
       }
       const o = applyMaxTokens(p.outcome, parsed.maxTokens);
       ledger({ ...base, status: 200, finish: o.finish, served: o.served ?? null, usage: o.usage ?? null, char_cap_hit: up.charCapHit, latency_ms: now() - started, ...settleFrom(p.outcome) });
-      return json(200, chatCompletion(o, parsed.alias, id), { 'x-bridge-request-id': id, 'x-bridge-effort': parsed.route.effort, 'x-bridge-served-model': o.served ?? parsed.route.model });
+      return json(200, chatCompletion(o, parsed.alias, id), { 'x-bridge-request-id': id, 'x-bridge-effort': parsed.route.effort, 'x-bridge-served-model': o.served ?? parsed.route.model, ...(base.masked ? { 'x-bridge-masked': (base.masked as { rules: string[] }).rules.join(',') } : {}) });
     } finally { adm.release(); }
   };
 }
