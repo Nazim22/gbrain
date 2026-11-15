@@ -3,11 +3,14 @@
  * real ones; only the upstream sender, the leak scan and the clock are injected. No network, no paid call.
  */
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { afterAll } from 'bun:test';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig, makeHandler, type Config } from './bridge.ts';
 import { costMicro, reservationMicro } from './contract.ts';
 import { BudgetStateError, Limits } from './limits.ts';
+import { CustodyError, readKeyFile } from './custody.ts';
+import { parseStream } from './upstream.ts';
 import type { Upstream } from './upstream.ts';
 
 const SECRET = 'a'.repeat(40);
@@ -96,6 +99,10 @@ test('missing, corrupt or spend-less counters refuse every paid request; nothing
     expect(r.status).toBe(503); expect((await r.json()).error.code).toBe('budget_state_unavailable');
     expect(s.calls.length).toBe(0);
     expect(existsSync(join(s.dir, 'counters.json')) ? readFileSync(join(s.dir, 'counters.json'), 'utf8') : null).toBe(before);
+    // untrusted spend state is an invariant breach: it latches until an operator clears it
+    expect(JSON.parse(readFileSync(join(s.dir, 'halted.json'), 'utf8')).code).toBe('budget_invariant');
+    const again = await s.post();
+    expect(again.status).toBe(429); expect((await again.json()).error.code).toBe('bridge_halted');
   }
 });
 
@@ -123,6 +130,16 @@ test('invariant breach (usage over the maxima, or a tier that is not "default") 
   }
 });
 
+test('strict state: negative or fractional counters and impossible dates refuse', async () => {
+  const c = (o: object) => JSON.stringify({ hour_start: 1, hour: 0, day_start: 1, day: 0, spend: {}, ...o });
+  for (const counters of [c({ hour: -1 }), c({ day: 0.5 }), c({ hour_start: -5 }), c({ spend: { '2026-13-40': 5 } }), c({ spend: { '2026-02-30': 5 } })]) {
+    const s = setup({ counters });
+    expect((await s.post()).status).toBe(503);
+    expect(s.calls.length).toBe(0);
+    expect(readFileSync(join(s.dir, 'counters.json'), 'utf8')).toBe(counters);
+  }
+});
+
 test('UTC admission day: a call admitted before midnight settles into ITS day; the next day starts from its own total', async () => {
   let t = Date.parse('2026-11-15T23:59:59Z');
   const s = setup({ now: () => t, spend: { '2026-11-14': 5_000_000 }, upstream: async () => { t = Date.parse('2026-11-16T00:00:05Z'); return ok200(); } });
@@ -132,14 +149,63 @@ test('UTC admission day: a call admitted before midnight settles into ITS day; t
   expect(state(s.dir).spend).toEqual({ '2026-11-14': 5_000_000, '2026-11-15': 211, '2026-11-16': 211 });
 });
 
-test('settlement is checked against the current state and can only lower a reservation', () => {
-  const s = setup({ spend: { '2026-11-15': RES } });
-  expect(() => s.limits.settle('2026-11-15', RES, RES + 1)).toThrow(BudgetStateError);
-  expect(() => s.limits.settle('2026-11-14', RES, 1)).toThrow(BudgetStateError);   // no such day on record
-  expect(() => s.limits.settle('2026-11-15', RES + 1, 1)).toThrow(BudgetStateError); // more than is recorded
-  expect(state(s.dir).spend).toEqual({ '2026-11-15': RES });
-  s.limits.settle('2026-11-15', RES, 211);
-  expect(state(s.dir).spend).toEqual({ '2026-11-15': 211 });
+test('a settlement belongs to its own admission, works once, and can only lower that reservation', () => {
+  const s = setup();
+  const a = s.limits.admit(RES), b = s.limits.admit(RES);
+  if (!a.ok || !b.ok) throw Error('admission');
+  expect(state(s.dir).spend).toEqual({ '2026-11-15': 2 * RES });
+  expect(() => a.settle!(RES + 1)).toThrow(BudgetStateError);     // more than the reservation: refused, and the settlement is spent
+  expect(() => a.settle!(211)).toThrow(BudgetStateError);
+  expect(state(s.dir).spend).toEqual({ '2026-11-15': 2 * RES });
+  b.settle!(211);
+  expect(state(s.dir).spend).toEqual({ '2026-11-15': RES + 211 });
+  expect(() => b.settle!(211)).toThrow(BudgetStateError);         // a second settlement cannot eat the other call's reservation
+  expect(state(s.dir).spend).toEqual({ '2026-11-15': RES + 211 });
+  expect((s.limits.admit() as any).settle).toBeUndefined();       // plan mode has nothing to settle
+});
+
+test('a tier that is not "default" halts even when the usage is missing or malformed', async () => {
+  for (const usage of [undefined, null, { input_tokens: 'x' }]) {
+    const s = setup({ upstream: async () => ok200(usage, 'priority') });
+    expect((await s.post()).status).toBe(200);
+    expect(rows(s.dir)[0]).toMatchObject({ settled: false, unsettled: 'service_tier_not_default', reserved_micro: RES });
+    expect(state(s.dir).spend['2026-11-15']).toBe(RES);
+    expect(JSON.parse(readFileSync(join(s.dir, 'halted.json'), 'utf8')).code).toBe('budget_invariant');
+  }
+});
+
+test('a halt that cannot be written to disk still stops this process: the next request is refused before upstream', async () => {
+  const s = setup({ upstream: async () => ok200(undefined, 'priority') });
+  symlinkSync(join(s.dir, 'nowhere', 'x'), join(s.dir, 'halted.json'));   // dangling link: reads as "no latch", cannot be created
+  await expect(s.post()).rejects.toThrow();
+  const r = await s.post();
+  expect(r.status).toBe(429); expect((await r.json()).error.code).toBe('bridge_halted');
+  expect(s.calls.length).toBe(1);
+  expect(state(s.dir).spend['2026-11-15']).toBe(RES);
+});
+
+test('a stream the bridge cut itself (character bound, no terminal event) keeps the reservation and does not halt', async () => {
+  const s = setup({ upstream: async () => ({ status: 200, raw: Buffer.from(ev('response.output_text.delta', { delta: 'abc' })), charCapHit: true }) });
+  const r = await s.post();
+  expect(r.status).toBe(200); expect((await r.json()).choices[0].finish_reason).toBe('length');
+  expect(rows(s.dir)[0]).toMatchObject({ settled: false, unsettled: 'stream_cut_before_terminal' });
+  expect(state(s.dir).spend['2026-11-15']).toBe(RES);
+  expect(existsSync(join(s.dir, 'halted.json'))).toBe(false);
+});
+
+test('response.incomplete is trusted only as a complete terminal envelope; anything else keeps the reservation', async () => {
+  const inc = (response: object) => ev('response.output_item.done', { item: item('part') }) + ev('response.incomplete', { response });
+  const good = { status: 'incomplete', model: 'm', output: [], usage: { input_tokens: 817, output_tokens: 8 }, service_tier: 'default' };
+  expect(parseStream(inc(good))).toMatchObject({ kind: 'completed', outcome: { finish: 'length', text: 'part' } });
+  for (const bad of [{ ...good, status: 'in_progress' }, { ...good, status: 'completed' }, { ...good, output: undefined }, { ...good, output: [item('other')] }]) {
+    expect(parseStream(inc(bad)).kind).toBe('unknown');
+    const s = setup({ upstream: async () => ({ status: 200, raw: Buffer.from(inc(bad)), charCapHit: false }) });
+    expect((await s.post()).status).toBe(502);
+    expect(state(s.dir).spend['2026-11-15']).toBe(RES);
+  }
+  const s = setup({ upstream: async () => ({ status: 200, raw: Buffer.from(inc(good)), charCapHit: false }) });
+  expect((await s.post()).status).toBe(200);
+  expect(state(s.dir).spend['2026-11-15']).toBe(211);
 });
 
 test('a settlement that no longer fits the spend state halts instead of guessing', async () => {
@@ -187,27 +253,87 @@ test('config validation: paid mode needs a key file path, integer prices and max
   for (const bad of [0, -1, 0.25, null]) expect(load(c => { c.routes['gpt-6-luna'].price_micro_per_mtok.input = bad; })).toThrow('CONFIG-ROUTE-PAID');
   expect(load(c => { delete c.routes['gpt-6-luna'].price_micro_per_mtok; })).toThrow('CONFIG-ROUTE-PAID');
   expect(load(c => { c.ceilings.usd_micro_per_day = 2 * RES - 1; })).toThrow('CONFIG-BUDGET-UNUSABLE');
+  // the reviewed numbers are pinned: a config may be more conservative, never less
+  expect(load(c => { c.ceilings.usd_micro_per_day = CAP + 1; })).toThrow('CONFIG-BUDGET');
+  expect(load(c => { c.ceilings.usd_micro_per_day = 20_000_000; })).toThrow('CONFIG-BUDGET');
+  expect(load(c => { c.routes['gpt-6-luna'].model = 'some-other-model'; })).toThrow('CONFIG-ROUTE-PAID-MODEL');
+  expect(load(c => { c.routes['gpt-6-luna'].price_micro_per_mtok.input = 1; })).toThrow('CONFIG-ROUTE-PAID-PIN');
+  expect(load(c => { c.routes['gpt-6-luna'].price_micro_per_mtok.output = 749_999; })).toThrow('CONFIG-ROUTE-PAID-PIN');
+  expect(load(c => { c.routes['gpt-6-luna'].max_input_tokens = 1; })).toThrow('CONFIG-ROUTE-PAID-PIN');
+  expect(load(c => { c.routes['gpt-6-luna'].max_input_tokens = 1_049_999; })).toThrow('CONFIG-ROUTE-PAID-PIN');
+  expect(load(c => { c.routes['gpt-6-luna'].max_output_tokens = 16_001; })).toThrow('CONFIG-ROUTE-PAID-PIN');
+  expect(load(c => { c.routes['gpt-6-luna'].price_micro_per_mtok.input = 2_000_000_000; })).toThrow('CONFIG-ROUTE-PAID');
+  for (const bad of [0, -1, 1.5, null]) expect(load(c => { c.ceilings.concurrency = bad; })).toThrow('CONFIG-CEILINGS');
+  expect(load(c => { c.routes['gpt-6-luna'].max_output_tokens = 8_000; c.routes['gpt-6-luna'].price_micro_per_mtok.input = 300_000; })().routes['gpt-6-luna'].max_output_tokens).toBe(8_000);
+  expect(() => costMicro(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)).toThrow(RangeError);
+  expect(() => costMicro(1.5, 1)).toThrow(RangeError);
   expect(load(c => { c.ceilings.usd_micro_per_day = 2 * RES; })().ceilings.usd_micro_per_day).toBe(2 * RES);
 });
 
-test('main.ts in paid mode: bad key file refuses to start without echoing it; no OAuth store is needed; a second paid writer on the same state is refused', async () => {
-  const dir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'budget-main-'));
+// Key custody needs directories nobody else can write, which the shared /tmp is not: these fixtures live beside the tests.
+const SAFE = mkdtempSync(join(import.meta.dir, '.custody-test-'));
+afterAll(() => rmSync(SAFE, { recursive: true, force: true }));
+const UID = process.getuid!();
+const GOOD_KEY = 'sk-' + 'k'.repeat(60);
+
+test('key custody: only a regular, owner-held, at most 0640 file behind safe directories is read; every refusal is the same generic error', () => {
+  const d = join(SAFE, 'k1'); mkdirSync(d, { mode: 0o755 });
+  const put = (name: string, text: string, mode = 0o640) => { const f = join(d, name); writeFileSync(f, text); chmodSync(f, mode); return f; };
+  const read = (f: string, o: object = {}) => readKeyFile(f, { ownerUid: UID, ...o });
+  expect(read(put('ok', GOOD_KEY + '\n'))).toBe(GOOD_KEY);
+  expect(read(put('ok600', GOOD_KEY, 0o600))).toBe(GOOD_KEY);
+  const refused = (f: string, o: object = {}) => { let e: any; try { read(f, o); } catch (x) { e = x; } expect(e).toBeInstanceOf(CustodyError); expect(e.message).toBe('API-KEY-FILE-INVALID'); };
+  refused(put('world', GOOD_KEY, 0o644));
+  refused(put('groupw', GOOD_KEY, 0o660));
+  refused(put('exec', GOOD_KEY, 0o740));
+  refused(put('short', 'sk-short'));
+  refused(put('long', 'k'.repeat(401)));
+  refused(put('huge', 'k'.repeat(100_000)));
+  refused(put('space', 'sk-' + 'k'.repeat(30) + ' ' + 'k'.repeat(30)));
+  refused(put('ctrl', 'sk-' + 'k'.repeat(30) + '\u0007' + 'k'.repeat(30)));
+  refused(put('crlf', GOOD_KEY + '\r\n'));
+  refused(put('nonascii', 'sk-' + 'k'.repeat(30) + '\u00e9' + 'k'.repeat(30)));
+  refused(join(d, 'missing'));
+  refused(d);                                                              // a directory
+  symlinkSync(join(d, 'ok'), join(d, 'link')); refused(join(d, 'link'));   // a link to a good key is still refused
+  const linked = join(SAFE, 'k1-link'); symlinkSync(d, linked); refused(join(linked, 'ok'));   // a linked directory on the way
+  refused(`${d}/../k1/ok`);                                               // not a normalised absolute path
+  refused('relative/key');
+  const open = join(SAFE, 'open'); mkdirSync(open); chmodSync(open, 0o777);
+  const inOpen = join(open, 'key'); writeFileSync(inOpen, GOOD_KEY); chmodSync(inOpen, 0o640); refused(inOpen);   // an ancestor others can write
+  refused(join(d, 'ok'), { ownerUid: UID + 1 });                           // not the expected owner
+  refused(join(d, 'ok'), { forbiddenDir: d });                             // inside the bridge's own state
+  refused(join(d, 'ok'), { forbiddenDir: SAFE });
+});
+
+// main.ts always requires a ROOT-owned key, so the start-up path can only be exercised as root.
+test.skipIf(UID !== 0)('main.ts in paid mode: a bad key file refuses to start without echoing it; no OAuth store is needed; one paid writer per state directory, with no stale takeover', async () => {
+  const dir = join(SAFE, 'main'), keys = join(SAFE, 'main-keys'); mkdirSync(dir); mkdirSync(keys);
   const secret = join(dir, 'caller'); writeFileSync(secret, SECRET);
   const cfgFile = (keyFile: string) => { const f = join(dir, `cfg-${Math.random()}.json`); writeFileSync(f, JSON.stringify({ port: 0, caller_secret_file: secret, state_dir: dir, auth_dir: join(dir, 'no-such-auth-dir'), routes: { 'gpt-6-luna': route }, ceilings: { per_hour: 600, per_day: 6000, concurrency: 2, usd_micro_per_day: CAP }, max_body_bytes: 262_144, upstream: { connect_ms: 1000, request_ms: 1000, auth: 'api_key', api_key_file: keyFile }, leak: {} })); return f; };
   const start = (cfg: string) => Bun.spawn(['bun', join(import.meta.dir, 'main.ts'), cfg], { stdout: 'pipe', stderr: 'pipe' });
-  const badKey = join(dir, 'bad'); writeFileSync(badKey, 'sk-short with space SECRETVALUE');
-  const bad = start(cfgFile(badKey)); expect(await bad.exited).not.toBe(0);
-  const errText = await new Response(bad.stderr).text();
-  expect(errText).toContain('API-KEY-FILE-INVALID'); expect(errText).not.toContain('SECRETVALUE');
-  const key = join(dir, 'key'); writeFileSync(key, 'sk-' + 'k'.repeat(60) + '\n');
+  const firstLine = (p: ReturnType<typeof start>) => new Promise<string>(res => { const rd = p.stdout.getReader(); rd.read().then(c => res(new TextDecoder().decode(c.value))); });
+  const mk = (name: string, text: string, mode: number, where = keys) => { const f = join(where, name); writeFileSync(f, text); chmodSync(f, mode); return f; };
+  for (const badKey of [mk('bad', 'sk-short with space SECRETVALUE', 0o640), mk('wide', GOOD_KEY + 'SECRETVALUE', 0o644), mk('in-state', GOOD_KEY + 'SECRETVALUE', 0o640, dir)]) {
+    const bad = start(cfgFile(badKey)); expect(await bad.exited).not.toBe(0);
+    const errText = await new Response(bad.stderr).text();
+    expect(errText).toContain('API-KEY-FILE-INVALID'); expect(errText).not.toContain('SECRETVALUE');
+  }
+  const key = mk('key', GOOD_KEY + '\n', 0o640);
+  writeFileSync(join(dir, 'paid-writer.lock'), '');                        // a leftover lock FILE from a dead writer holds nothing
+  writeFileSync(join(dir, 'paid-writer.pid'), '1');                        // nor does an old pid file naming a live process
   const a = start(cfgFile(key));
-  const first = await new Promise<string>(res => { const rd = a.stdout.getReader(); rd.read().then(c => res(new TextDecoder().decode(c.value))); });
+  const first = await firstLine(a);
   expect(JSON.parse(first.trim().split('\n')[0])).toMatchObject({ event: 'listening', auth: 'api_key' });   // started with NO auth dir on disk
   expect(first).not.toContain('kkkk');
-  expect(readFileSync(join(dir, 'paid-writer.pid'), 'utf8')).toBe(String(a.pid));
-  const b = start(cfgFile(key)); expect(await b.exited).not.toBe(0);
+  const [b, c] = [start(cfgFile(key)), start(cfgFile(key))];               // two more at once: neither may displace the holder
+  expect(await b.exited).not.toBe(0); expect(await c.exited).not.toBe(0);
   expect(await new Response(b.stderr).text()).toContain('PAID-WRITER-ALREADY-RUNNING');
-  a.kill('SIGTERM'); await a.exited;
-  expect(existsSync(join(dir, 'paid-writer.pid'))).toBe(false);
+  expect(await new Response(c.stderr).text()).toContain('PAID-WRITER-ALREADY-RUNNING');
+  expect(a.exitCode).toBeNull();                                           // the first writer is still running
+  a.kill('SIGKILL'); await a.exited;                                       // killed outright: the kernel drops the lock with it
+  const d2 = start(cfgFile(key));
+  expect(JSON.parse((await firstLine(d2)).trim().split('\n')[0])).toMatchObject({ event: 'listening' });
+  d2.kill('SIGTERM'); await d2.exited;
   expect(existsSync(join(dir, 'no-such-auth-dir'))).toBe(false);
-}, 30_000);
+}, 60_000);

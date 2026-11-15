@@ -9,7 +9,12 @@ export type Route = {
   max_input_tokens?: number; max_output_tokens?: number; price_micro_per_mtok?: { input: number; output: number };
 };
 /** Micro-dollars for `tokens` at `microPerMtok`, rounded UP. */
-export const costMicro = (tokens: number, microPerMtok: number) => Math.ceil((tokens * microPerMtok) / 1_000_000);
+export const costMicro = (tokens: number, microPerMtok: number) => {
+  if (!Number.isSafeInteger(tokens) || !Number.isSafeInteger(microPerMtok) || tokens < 0 || microPerMtok < 0) throw new RangeError('cost operands');
+  const c = (BigInt(tokens) * BigInt(microPerMtok) + 999_999n) / 1_000_000n;   // exact: no float product before the round-up
+  if (c > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError('cost out of range');
+  return Number(c);
+};
 /** A request's maximum cost in API-key mode: the model's full input maximum plus the output cap, each rounded up. */
 export const reservationMicro = (r: Route) => costMicro(r.max_input_tokens!, r.price_micro_per_mtok!.input) + costMicro(r.max_output_tokens!, r.price_micro_per_mtok!.output);
 export type ChatRequest = { route: Route; alias: string; instructions: string; input: Array<{ role: 'user' | 'assistant'; content: string }>; maxTokens?: number };
@@ -59,7 +64,8 @@ export function paidResponsesBody(r: ChatRequest) {
   return { ...responsesBody(r), max_output_tokens: r.route.max_output_tokens, service_tier: 'default', prompt_cache_options: { mode: 'explicit' } };
 }
 
-export type Outcome = { text: string; finish: 'stop' | 'length' | 'content_filter'; served?: string; usage?: { input_tokens?: number; output_tokens?: number }; tier?: unknown };
+/** `cut`: the bridge stopped the stream itself (character bound) before any terminal event, so there is no usage or tier to judge. */
+export type Outcome = { text: string; finish: 'stop' | 'length' | 'content_filter'; served?: string; usage?: { input_tokens?: number; output_tokens?: number }; tier?: unknown; cut?: true };
 
 /** Token side of max_tokens: judged on the upstream's own output count; over it, the answer is delivered as `length` (truncated, not published by gbrain). */
 export function applyMaxTokens(o: Outcome, maxTokens?: number): Outcome {

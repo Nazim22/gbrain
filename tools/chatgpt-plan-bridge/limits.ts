@@ -3,16 +3,21 @@
  * (write-temp + fsync + rename on every admission; synchronous, so admissions cannot interleave inside the process).
  */
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 /** usd_micro_per_day (API-key mode only): a STRICT ceiling on reserved-plus-settled spend per UTC admission day, in micro-dollars. */
 export type Ceilings = { per_hour: number; per_day: number; concurrency: number; usd_micro_per_day?: number };
 type State = { hour_start: number; hour: number; day_start: number; day: number; spend?: Record<string, number> };
-export type Admission = { ok: true; release: () => void; day?: string; reserved?: number }
+/** `settle` (API-key mode only) belongs to this one admission and works once: it replaces THIS reservation by the actual cost. */
+export type Admission = { ok: true; release: () => void; day?: string; reserved?: number; settle?: (actualMicro: number) => void }
   | { ok: false; code: 'runaway_guard' | 'busy' | 'daily_budget' | 'budget_state_unavailable'; retryAfterS: number };
 /** The spend state is missing, unreadable or malformed, or a settlement does not fit it. Never repaired or reset in code. */
 export class BudgetStateError extends Error { constructor(m: string) { super(m); } }
 export const utcDay = (t: number) => new Date(t).toISOString().slice(0, 10);
 const isMicro = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
+const isDay = (k: string) => /^\d{4}-\d{2}-\d{2}$/.test(k) && !Number.isNaN(Date.parse(`${k}T00:00:00Z`)) && utcDay(Date.parse(`${k}T00:00:00Z`)) === k;
+/** A rename is durable only once its directory entry is: fsync the parent directory too. */
+export function fsyncDir(dir: string) { const fd = openSync(dir, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } }
 const HOUR = 3_600_000, DAY = 86_400_000;
 
 export class Limits {
@@ -26,14 +31,15 @@ export class Limits {
     const tmp = `${this.path}.tmp`, fd = openSync(tmp, 'w', 0o600);
     try { writeSync(fd, JSON.stringify(s)); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(tmp, this.path);
+    fsyncDir(dirname(this.path));
   }
   /** API-key mode read: no fresh start. A missing file, bad JSON, bad counters or a bad spend map all refuse. */
   private readStrict(): State & { spend: Record<string, number> } {
     let s: any;
     try { s = JSON.parse(readFileSync(this.path, 'utf8')); } catch { throw new BudgetStateError('counters unreadable'); }
-    if (!s || typeof s !== 'object' || ![s.hour_start, s.hour, s.day_start, s.day].every(Number.isFinite)) throw new BudgetStateError('counters malformed');
+    if (!s || typeof s !== 'object' || ![s.hour_start, s.hour, s.day_start, s.day].every(isMicro)) throw new BudgetStateError('counters malformed');
     if (!s.spend || typeof s.spend !== 'object' || Array.isArray(s.spend)) throw new BudgetStateError('spend state missing');
-    for (const [k, v] of Object.entries(s.spend)) if (!/^\d{4}-\d{2}-\d{2}$/.test(k) || !isMicro(v)) throw new BudgetStateError('spend state malformed');
+    for (const [k, v] of Object.entries(s.spend)) if (!isDay(k) || !isMicro(v)) throw new BudgetStateError('spend state malformed');
     return s;
   }
   /**
@@ -64,13 +70,19 @@ export class Limits {
     s.hour++; s.day++; this.write(s);
     this.inflight++;
     let released = false;
-    return { ok: true, day, reserved: reserveMicro, release: () => { if (!released) { released = true; this.inflight--; } } };
+    let settled = false;
+    const settle = reserveMicro === undefined ? undefined : (actualMicro: number) => {
+      if (settled) throw new BudgetStateError('reservation already settled');
+      settled = true;   // spent even when the write below refuses: this reservation is never refunded twice
+      this.settleOnce(day!, reserveMicro, actualMicro);
+    };
+    return { ok: true, day, reserved: reserveMicro, settle, release: () => { if (!released) { released = true; this.inflight--; } } };
   }
   /**
    * Replace one reservation by the actual cost (never more than the reservation), read-modify-write against the CURRENT
    * state. Only the admission day's entry changes, whatever today's date is. Synchronous: settlements cannot interleave.
    */
-  settle(day: string, reservedMicro: number, actualMicro: number) {
+  private settleOnce(day: string, reservedMicro: number, actualMicro: number) {
     if (!isMicro(reservedMicro) || !isMicro(actualMicro) || actualMicro > reservedMicro) throw new BudgetStateError('settlement out of range');
     const s = this.readStrict();
     const spent = s.spend[day];

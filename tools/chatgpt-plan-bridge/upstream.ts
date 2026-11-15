@@ -60,7 +60,12 @@ export function parseStream(raw: string, charCapHit = false): Parsed {
       if (!['response.completed', 'response.failed', 'response.incomplete', 'error'].includes(d.type)) return;
       if (sawTerminal) { malformed = true; return; } sawTerminal = true;
       const r = d.response;
-      if (d.type === 'response.incomplete') { terminal = { kind: 'completed', outcome: { text: textOf(r?.output?.length ? r.output : items), finish: 'length', served: r?.model, usage: usageOf(r), tier: r?.service_tier } }; return; }
+      if (d.type === 'response.incomplete') {
+        // Same envelope rules as a completed answer: its own terminal status and a consistent output, or it is not trusted.
+        if (r?.status !== 'incomplete' || !Array.isArray(r.output)) { malformed = true; return; }
+        if (r.output.length && items.length && JSON.stringify(r.output) !== JSON.stringify(items)) { malformed = true; return; }
+        terminal = { kind: 'completed', outcome: { text: textOf(r.output.length ? r.output : items), finish: 'length', served: r.model, usage: usageOf(r), tier: r.service_tier } }; return;
+      }
       if (d.type !== 'response.completed') { const c = r?.error?.code ?? d.code ?? d.error?.code; terminal = { kind: 'failed', code: typeof c === 'string' && SAFE.has(c) ? c : 'UNKNOWN' }; return; }
       if (r?.status !== 'completed' || !Array.isArray(r.output)) { malformed = true; return; }
       if (r.output.length && items.length && JSON.stringify(r.output) !== JSON.stringify(items)) { malformed = true; return; }
@@ -72,7 +77,7 @@ export function parseStream(raw: string, charCapHit = false): Parsed {
   } });
   try { p.feed(raw); p.reset({ consume: true }); } catch { malformed = true; }
   // The character bound stops the stream before any terminal event: deliver what was streamed, marked truncated.
-  if (charCapHit && !sawTerminal && !malformed) return { kind: 'completed', outcome: { text: partial, finish: 'length' } };
+  if (charCapHit && !sawTerminal && !malformed) return { kind: 'completed', outcome: { text: partial, finish: 'length', cut: true } };
   return malformed ? { kind: 'unknown' } : terminal ?? { kind: 'unknown' };
 }
 function textOf(out: any[]) { return out.filter((o: any) => o?.type === 'message').flatMap((o: any) => o.content ?? []).filter((c: any) => c.type === 'output_text' && typeof c.text === 'string').map((c: any) => c.text).join(''); }

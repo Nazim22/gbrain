@@ -69,7 +69,7 @@ test('max_tokens: an answer over the caller limit by the upstream count is deliv
 
 test('character bound: a stream cut at max_output_chars before its terminal event is delivered as length with the streamed text', () => {
   const raw = ev('response.created', { response: { status: 'in_progress', output: [] } }) + ev('response.output_text.delta', { delta: 'abc' });
-  expect(parseStream(raw, true)).toEqual({ kind: 'completed', outcome: { text: 'abc', finish: 'length' } });
+  expect(parseStream(raw, true)).toEqual({ kind: 'completed', outcome: { text: 'abc', finish: 'length', cut: true } });
   expect(parseStream(raw, false)).toEqual({ kind: 'unknown' });
 });
 
