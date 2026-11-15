@@ -114,6 +114,7 @@ cat > /etc/chatgpt-plan-bridge/config.json <<EOF
   "routes": { "gpt-6-luna@medium": { "model": "gpt-6-luna", "effort": "medium", "max_output_chars": 64000 } },
   "ceilings": { "per_hour": 600, "per_day": 6000, "concurrency": 2 }, "max_body_bytes": 262144,
   "upstream": { "connect_ms": 10000, "request_ms": 300000 },
+  "halt_on": ["leak_gate_unavailable", "auth_unavailable", "upstream_auth", "runaway_guard"],
   "leak": { "python": "/usr/bin/python3", "detector_check": "$OPT/detectors/detector_check.py", "redactor": "$OPT/detectors/redactor.py",
             "redactor_sha256": "425615c099e23da64053e1b2d700d252dc52ee193fc45381dfb3bc161aa6ee2d", "gitleaks": "/usr/local/bin/gitleaks",
             "tmp_dir": "/srv/chatgpt-plan-bridge/tmp", "timeout_ms": 20000 } }
