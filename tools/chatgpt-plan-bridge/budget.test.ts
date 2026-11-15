@@ -164,6 +164,31 @@ test('a settlement belongs to its own admission, works once, and can only lower 
   expect((s.limits.admit() as any).settle).toBeUndefined();       // plan mode has nothing to settle
 });
 
+test('a reasoning item whose opaque blob differs between the streamed item and the terminal copy does not reject the answer; a differing message still does', async () => {
+  // Shape of the real stream captured 2026-11-15: output = [reasoning, message], streamed items the same except reasoning.encrypted_content.
+  const reasoning = (blob: string) => ({ id: 'rs_1', type: 'reasoning', encrypted_content: blob, summary: [] });
+  const msg = (text: string) => ({ id: 'msg_1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', annotations: [], text }] });
+  const full = (streamed: object[], terminal: object[], type = 'response.completed', status = 'completed') => streamed.map(i => ev('response.output_item.done', { item: i })).join('')
+    + ev(type, { response: { status, model: 'gpt-6-luna-2026-10-01', output: terminal, usage: { input_tokens: 110, output_tokens: 90 }, service_tier: 'default' } });
+  const good = full([reasoning('AAAA-streamed'), msg('{"queries":["a"]}')], [reasoning('AAAA-terminal'), msg('{"queries":["a"]}')]);
+  expect(parseStream(good)).toMatchObject({ kind: 'completed', outcome: { text: '{"queries":["a"]}', finish: 'stop', tier: 'default' } });
+  const s = setup({ upstream: async () => ({ status: 200, raw: Buffer.from(good), charCapHit: false }) });
+  const r = await s.post();
+  expect(r.status).toBe(200); expect((await r.json()).choices[0].message.content).toBe('{"queries":["a"]}');
+  expect(rows(s.dir)[0]).toMatchObject({ status: 200, settled: true, settled_micro: costMicro(110, 250_000) + costMicro(90, 750_000) });
+  expect(state(s.dir).spend['2026-11-15']).toBe(28 + 68);
+  // the answer itself must still agree: text, order, count, and a message present in only one copy
+  for (const bad of [full([reasoning('x'), msg('one')], [reasoning('x'), msg('two')]), full([msg('a'), msg('b')], [msg('b'), msg('a')]),
+    full([reasoning('x'), msg('a')], [reasoning('x'), msg('a'), msg('extra')]), full([reasoning('x'), msg('a'), msg('extra')], [reasoning('x'), msg('a')])]) {
+    expect(parseStream(bad).kind).toBe('unknown');
+    const t = setup({ upstream: async () => ({ status: 200, raw: Buffer.from(bad), charCapHit: false }) });
+    expect((await t.post()).status).toBe(502); expect(state(t.dir).spend['2026-11-15']).toBe(RES);
+  }
+  // same rule for an incomplete answer
+  expect(parseStream(full([reasoning('s'), msg('part')], [reasoning('t'), msg('part')], 'response.incomplete', 'incomplete'))).toMatchObject({ kind: 'completed', outcome: { finish: 'length', text: 'part' } });
+  expect(parseStream(full([reasoning('s'), msg('part')], [reasoning('t'), msg('other')], 'response.incomplete', 'incomplete')).kind).toBe('unknown');
+});
+
 test('a tier that is not "default" halts even when the usage is missing or malformed', async () => {
   for (const usage of [undefined, null, { input_tokens: 'x' }]) {
     const s = setup({ upstream: async () => ok200(usage, 'priority') });
