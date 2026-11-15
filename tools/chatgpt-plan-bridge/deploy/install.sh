@@ -21,7 +21,8 @@ if [[ $MODE == paid ]]; then
   [[ ! -e /srv/chatgpt-plan-bridge/state/halted.json && ! -L /srv/chatgpt-plan-bridge/state/halted.json ]] || { echo "REFUSE: a halt latch is present; its reason needs its own recorded disposition first (never cleared here)"; exit 1; }
   systemctl disable --now chatgpt-plan-bridge.service
   [[ $(systemctl is-active chatgpt-plan-bridge.service || true) == inactive ]] || { echo "REFUSE: bridge unit is not inactive"; exit 1; }
-  if pgrep -u cpbridge >/dev/null; then echo "REFUSE: a cpbridge process is still running"; pgrep -u cpbridge -a | cut -c1-120; exit 1; fi
+  source "$SRC/deploy/canary_lib.sh"
+  no_bridge_process || { echo "REFUSE: a cpbridge process is still running, or the process list could not be read"; exit 1; }
   # Preimages for rollback: the plan config as installed and the bundle 'current' pointed at. Taken once, never replaced.
   E=/etc/chatgpt-plan-bridge
   if grep -q '"api_key"' $E/config.json; then
@@ -32,6 +33,7 @@ if [[ $MODE == paid ]]; then
     # First paid install on this host. The stopped state is recorded BEFORE anything changes: it is what rollback
     # restores and what proves this is the first paid initialisation of the counters.
     [[ -s $E/verify-baseline.pre-paid ]] || { echo "REFUSE: runbook step 0 was not run (no $E/verify-baseline.pre-paid)"; exit 1; }
+    baseline_stage_ok $E/verify-baseline.pre-paid || { echo "REFUSE: the step-0 verifier baseline did not reach the expected stage; it cannot serve as the rollback reference"; exit 1; }
     [[ -f /srv/chatgpt-plan-bridge/state/requests.jsonl && ! -L /srv/chatgpt-plan-bridge/state/requests.jsonl ]] || { echo "REFUSE: the request ledger is missing; first-paid initialisation cannot be shown"; exit 1; }
     install -d -m 0750 -o root -g cpbridge $E/units.pre-paid
     for u in chatgpt-plan-bridge.service chatgpt-plan-bridge-egress.service chatgpt-plan-bridge-egress.timer; do install -m 0644 /etc/systemd/system/$u $E/units.pre-paid/$u; done

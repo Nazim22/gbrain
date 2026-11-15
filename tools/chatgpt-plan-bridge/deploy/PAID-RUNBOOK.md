@@ -20,7 +20,9 @@ ls -la $S; cat $S/counters.json; ls $S/halted.json         # a present halted.js
 python3 -I $OLDW/tools/chatgpt-plan-bridge/deploy/verify_install.py $OLDW > $E/verify-baseline.pre-paid 2>&1; cat $E/verify-baseline.pre-paid
 ```
 
-The baseline verifier output is the rollback reference, and `install.sh paid` refuses without it. On this host it is expected to stop at `config.json` (the live plan
+The baseline verifier output is the rollback reference, and `install.sh paid` refuses without it. It must show every bundle,
+runtime, helper and unit line as `ok` and then end either `VERIFIED` or with the single refusal at `config.json`; a baseline
+that stops earlier (for example at `bridge.js`) is refused by `install.sh paid` and by rollback, and the install does not start. On this host it is expected to stop at `config.json` (the live plan
 config carries two recorded hand edits: a `halt_on` list and detector paths); that exact output is what rollback must reproduce.
 Hourly/daily call counters are taken as they are. If they would refuse a call, the canary waits; they are not reset.
 

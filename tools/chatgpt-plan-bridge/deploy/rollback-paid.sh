@@ -9,10 +9,12 @@ set -euo pipefail
 OLDW=$1 OLD=$2; E=/etc/chatgpt-plan-bridge; OLDOPT=/opt/chatgpt-plan-bridge/$OLD
 UNITS="chatgpt-plan-bridge.service chatgpt-plan-bridge-egress.service chatgpt-plan-bridge-egress.timer"
 step() { echo "== $(date -u +%FT%TZ) $*"; }
+source "$(cd "$(dirname "$0")" && pwd)/canary_lib.sh"
 [[ $(git -C "$OLDW" rev-parse HEAD) == "$OLD" && -z $(git -C "$OLDW" status --porcelain) ]] || { echo "REFUSE: $OLDW is not clean at $OLD"; exit 1; }
 for f in config.json.pre-paid current.pre-paid pre-paid-baseline.json verify-baseline.pre-paid; do [[ -s $E/$f && ! -L $E/$f ]] || { echo "REFUSE: pre-paid baseline piece $f is missing"; exit 1; }; done
 for u in $UNITS; do [[ -s $E/units.pre-paid/$u && ! -L $E/units.pre-paid/$u ]] || { echo "REFUSE: saved unit $u is missing"; exit 1; }; done
 [[ $(< $E/current.pre-paid) == "$OLDOPT" && -d $OLDOPT && ! -L $OLDOPT ]] || { echo "REFUSE: the recorded previous bundle is $(< $E/current.pre-paid), not $OLDOPT"; exit 1; }
+baseline_stage_ok $E/verify-baseline.pre-paid || { echo "REFUSE: the step-0 verifier baseline did not reach the expected stage"; exit 1; }
 # The saved pieces must still be the ones the baseline recorded.
 python3 -I - "$E" <<'PY'
 import hashlib, json, sys
@@ -25,7 +27,7 @@ PY
 step "stop"
 systemctl disable --now chatgpt-plan-bridge.service
 systemctl stop cpbridge-paid-canary.service 2>/dev/null || true
-if pgrep -u cpbridge >/dev/null; then echo "REFUSE: a cpbridge process is still running"; exit 1; fi
+no_bridge_process || { echo "REFUSE: a cpbridge process is still running, or the process list could not be read"; exit 1; }
 step "restore config bytes, bundle link and unit bytes"
 install -m 0640 -o root -g cpbridge $E/config.json.pre-paid $E/config.json.rollback-tmp && mv $E/config.json.rollback-tmp $E/config.json
 ln -sfn "$OLDOPT" /opt/chatgpt-plan-bridge/current
@@ -39,8 +41,11 @@ for u in $UNITS; do cmp /etc/systemd/system/$u $E/units.pre-paid/$u; done; echo 
 # The old verifier binds bundle, runtime, detector_check, egress.sh and units to the old source, then stops at config.json
 # on this host (recorded hand edits). Its output must equal the step-0 baseline byte for byte, refusal included.
 V=$(mktemp $E/.rollback-verify.XXXXXX); trap 'rm -f "$V"' EXIT
-python3 -I "$OLDW/tools/chatgpt-plan-bridge/deploy/verify_install.py" "$OLDW" > "$V" 2>&1 || true
+VRC=0; python3 -I "$OLDW/tools/chatgpt-plan-bridge/deploy/verify_install.py" "$OLDW" > "$V" 2>&1 || VRC=$?
 cat "$V"
+baseline_stage_ok $E/verify-baseline.pre-paid; baseline_stage_ok "$V"
+if grep -q '^REFUSE' "$V"; then [[ $VRC == 1 ]]; else [[ $VRC == 0 ]]; fi
+echo "ok  old verifier (exit $VRC) passed every bundle, runtime, helper and unit check and ended at the expected stage"
 cmp "$V" $E/verify-baseline.pre-paid; echo "ok  old verifier output identical to the step-0 baseline"
 # What that verifier does not reach when it stops at config.json: the detector files the restored config names, the
 # redactor pin, and the owner/mode of the home, leaf dirs, secret and config.
@@ -57,6 +62,7 @@ assert hashlib.sha256(open(L['redactor'], 'rb').read()).hexdigest() == L['redact
 SRV = '/srv/chatgpt-plan-bridge'; owned(SRV, 'root', 'root', 0o755)
 for d in ('auth', 'state', 'tmp'): owned(f'{SRV}/{d}', 'cpbridge', 'cpbridge', 0o700)
 owned(f'{E}/caller.secret', 'root', 'cpbridge', 0o640); owned(f'{E}/config.json', 'root', 'cpbridge', 0o640)
+assert os.path.getsize(f'{E}/caller.secret') > 0, 'caller.secret is empty'
 k = json.load(open(f'{SRV}/state/counters.json'))
 print('ok  detector files present, redactor pinned, owners and modes as installed; counters kept:', {a: (v if a != 'spend' else f'{len(v)} day(s)') for a, v in k.items()})
 PY

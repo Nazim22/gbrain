@@ -72,7 +72,7 @@ clean() {   # <is-active answer> <pgrep exit> <incoming rc>  -> prints "rc=<n> f
 #!/bin/bash
 [[ \$1 == is-active ]] && { echo $1; exit 0; }; exit ${4:-0}
 EOS
-    printf '#!/bin/bash\nexit %s\n' "$2" > pgrep.stub; printf '#!/bin/bash\ntouch %s/fence.removed\n' "$T" > egress.stub; printf '#!/bin/bash\nexit 0\n' > nop.stub; chmod +x *.stub
+    printf '#!/bin/bash\nexit %s\n' "$2" > pgrep.stub; printf '#!/bin/bash\n[[ %s == 0 ]] || exit %s\ntouch %s/fence.removed\n' "${EGRESS_RC:-0}" "${EGRESS_RC:-0}" "$T" > egress.stub; printf '#!/bin/bash\nexit 0\n' > nop.stub; chmod +x *.stub
     SYSTEMCTL="$T/sysctl.stub" PGREP="$T/pgrep.stub" NFT="$T/nop.stub" SLEEP="$T/nop.stub"; source "$D/canary_lib.sh"
     canary_cleanup "$3" unit "$T/egress.stub" "$T/canary.json" "$T" > "$T/clean.out" 2>&1; rc=$?
     echo "rc=$rc fence=$([[ -e fence.removed ]] && echo removed || echo kept) cfg=$([[ -e canary.json ]] && echo kept || echo removed)" )
@@ -83,6 +83,30 @@ expect "unit still active: fence and config KEPT, rc forced non-zero" "$(clean a
 expect "a cpbridge process survives: fence and config KEPT, rc forced non-zero" "$(clean inactive 0 0)" "rc=1 fence=kept cfg=kept"
 expect "failed unit with a survivor and earlier failure: KEPT, rc kept" "$(clean failed 0 3)" "rc=3 fence=kept cfg=kept"
 expect "unknown unit state: KEPT" "$(clean unknown 1 0)" "rc=1 fence=kept cfg=kept"
+for prc in 2 3 127; do expect "process list unreadable (pgrep exit $prc): KEPT, rc forced non-zero" "$(clean inactive $prc 0)" "rc=1 fence=kept cfg=kept"; done
+expect "stop proven but fence removal fails: rc forced non-zero, config kept" "$(EGRESS_RC=42 clean inactive 1 0)" "rc=1 fence=kept cfg=kept"
+expect "  and the output does not claim removal" "$(grep -c 'egress fence removed' "$T/clean.out")" 0
+expect "  and it says teardown failed" "$(grep -c 'TEARDOWN FAILED' "$T/clean.out")" 1
+expect "stop proven, removal fails, earlier failure: rc kept" "$(EGRESS_RC=42 clean inactive 1 5)" "rc=5 fence=kept cfg=kept"
+
+# baseline_stage_ok: only a baseline that passed every bundle/runtime/helper/unit check and ended at config.json or VERIFIED
+stage() { ( source "$D/canary_lib.sh"; baseline_stage_ok "$T/base.txt" >/dev/null 2>&1; echo $? ); }
+OKS='ok  installed dir /opt/x
+ok  bridge.js (fresh bundle of the reviewed tools)  aaaa
+ok  bun runtime  bbbb
+ok  detector_check.py  cccc
+ok  egress.sh  dddd
+ok  chatgpt-plan-bridge.service  eeee
+ok  chatgpt-plan-bridge-egress.service  ffff
+ok  chatgpt-plan-bridge-egress.timer  gggg'
+printf '%s\nREFUSE: config.json differs from install.sh for /opt/x: [%s]\n' "$OKS" "'halt_on', 'leak'" > "$T/base.txt"; expect "baseline that stops at config.json is accepted" "$(stage)" 0
+printf '%s\nok  config.json == install.sh heredoc\nok  redactor.py pinned\nVERIFIED: the installed bridge is the reviewed bytes\n' "$OKS" > "$T/base.txt"; expect "fully verified baseline is accepted" "$(stage)" 0
+printf 'ok  installed dir /opt/x\nREFUSE: bridge.js (fresh bundle of the reviewed tools) differs from the reviewed bytes (/opt/x/bridge.js)\n' > "$T/base.txt"; expect "baseline that stops at the bundle is refused" "$(stage)" 1
+printf '%s\n' "$OKS" | grep -v egress.timer > "$T/base.txt"; echo "REFUSE: config.json differs from install.sh for /opt/x: ['halt_on']" >> "$T/base.txt"; expect "baseline missing a unit check is refused" "$(stage)" 1
+printf '%s\n' "$OKS" > "$T/base.txt"; expect "baseline with neither a verdict nor the config refusal is refused" "$(stage)" 1
+printf 'REFUSE: current is not a symlink\n' > "$T/base.txt"; expect "early refusal is refused" "$(stage)" 1
+: > "$T/base.txt"; expect "empty baseline is refused" "$(stage)" 1
+( source "$D/canary_lib.sh"; for c in 0 1 2 127; do printf '#!/bin/bash\nexit %s\n' $c > "$T/pg.stub"; chmod +x "$T/pg.stub"; PGREP="$T/pg.stub"; no_bridge_process; echo -n "$c:$? "; done ) > "$T/nbp.out"; expect "no_bridge_process: only pgrep exit 1 proves none" "$(cat "$T/nbp.out")" "0:1 1:0 2:2 127:2 "
 
 # The previous plan bundle's Limits must keep a spend map through its own admissions (rollback keeps paid accounting).
 if [[ -n $OLDW ]]; then

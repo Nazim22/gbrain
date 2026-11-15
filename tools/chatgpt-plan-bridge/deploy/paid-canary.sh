@@ -14,6 +14,7 @@ W=$1 WANT=$2 OUT=$3
 SRC=$W/tools/chatgpt-plan-bridge; E=/etc/chatgpt-plan-bridge; S=/srv/chatgpt-plan-bridge/state; OPT=/opt/chatgpt-plan-bridge/$WANT
 CPORT=18796 UNIT=cpbridge-paid-canary
 step() { echo "== $(date -u +%FT%TZ) $*"; }
+source "$SRC/deploy/canary_lib.sh"
 [[ $(git -C "$W" rev-parse HEAD) == "$WANT" && -z $(git -C "$W" status --porcelain) ]] || { echo "REFUSE: $W is not clean at $WANT"; exit 1; }
 [[ $(readlink /opt/chatgpt-plan-bridge/current) == "$OPT" ]] || { echo "REFUSE: current is not $OPT"; exit 1; }
 [[ -d $OUT && -z $(ls -A "$OUT") ]] || { echo "REFUSE: evidence dir must exist and be empty"; exit 1; }
@@ -23,7 +24,7 @@ step "preconditions"
 python3 -I "$SRC/deploy/verify_install.py" "$W" paid
 [[ $(systemctl is-active chatgpt-plan-bridge.service || true) == inactive ]] || { echo "REFUSE: the live bridge unit is not inactive"; exit 1; }
 [[ $(systemctl is-active $UNIT.service || true) == inactive ]] || { echo "REFUSE: a canary unit already exists"; exit 1; }
-if pgrep -u cpbridge >/dev/null; then echo "REFUSE: a cpbridge process is running"; exit 1; fi
+no_bridge_process || { echo "REFUSE: a cpbridge process is running, or the process list could not be read"; exit 1; }
 [[ ! -e $S/halted.json && ! -L $S/halted.json ]] || { echo "REFUSE: a halt latch is present"; exit 1; }
 ( set -o noclobber; date -u +%FT%TZ > "$E/paid-canary.attempted" ) 2>/dev/null || { echo "REFUSE: a paid canary was already attempted ($(cat "$E/paid-canary.attempted")); a second needs a new reviewed decision"; exit 1; }
 
@@ -44,7 +45,6 @@ install -m 0600 "$S/counters.json" "$OUT/pre-counters.json"
 PRE_LINES=$(wc -l < "$S/requests.jsonl")
 echo "pre: ledger lines $PRE_LINES, counters $(cat "$OUT/pre-counters.json")"
 
-source "$SRC/deploy/canary_lib.sh"
 cleanup() { local rc=$?; set +e; canary_cleanup "$rc" "$UNIT" "$OPT/egress.sh" "$E/paid-canary.json" "$OUT"; exit $?; }
 trap cleanup EXIT
 
