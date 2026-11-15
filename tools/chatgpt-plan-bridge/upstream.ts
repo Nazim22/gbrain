@@ -47,7 +47,7 @@ export const sendUpstream: UpstreamSender = (body, accessToken, bounds, maxChars
  * both present and different, or an item after the terminal event = malformed.
  */
 export type Parsed = { kind: 'completed'; outcome: Outcome } | { kind: 'failed'; code: string } | { kind: 'unknown' };
-const SAFE = new Set(['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable', 'invalid_request_error', 'unsupported_parameter', 'server_error', 'rate_limit_exceeded']);
+const SAFE = new Set(['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable', 'invalid_request_error', 'unsupported_parameter', 'server_error', 'rate_limit_exceeded', 'insufficient_quota', 'billing_hard_limit_reached']);
 export function parseStream(raw: string, charCapHit = false): Parsed {
   let terminal: Parsed | undefined, malformed = false, sawTerminal = false, partial = '';
   const items: any[] = [];
@@ -60,14 +60,14 @@ export function parseStream(raw: string, charCapHit = false): Parsed {
       if (!['response.completed', 'response.failed', 'response.incomplete', 'error'].includes(d.type)) return;
       if (sawTerminal) { malformed = true; return; } sawTerminal = true;
       const r = d.response;
-      if (d.type === 'response.incomplete') { terminal = { kind: 'completed', outcome: { text: textOf(r?.output?.length ? r.output : items), finish: 'length', served: r?.model, usage: usageOf(r) } }; return; }
+      if (d.type === 'response.incomplete') { terminal = { kind: 'completed', outcome: { text: textOf(r?.output?.length ? r.output : items), finish: 'length', served: r?.model, usage: usageOf(r), tier: r?.service_tier } }; return; }
       if (d.type !== 'response.completed') { const c = r?.error?.code ?? d.code ?? d.error?.code; terminal = { kind: 'failed', code: typeof c === 'string' && SAFE.has(c) ? c : 'UNKNOWN' }; return; }
       if (r?.status !== 'completed' || !Array.isArray(r.output)) { malformed = true; return; }
       if (r.output.length && items.length && JSON.stringify(r.output) !== JSON.stringify(items)) { malformed = true; return; }
       const out = r.output.length ? r.output : items;
       const contents = out.filter((o: any) => o?.type === 'message').flatMap((o: any) => o.content ?? []);
-      if (contents.some((c: any) => c.type === 'refusal')) { terminal = { kind: 'completed', outcome: { text: '', finish: 'content_filter', served: r.model, usage: usageOf(r) } }; return; }
-      terminal = { kind: 'completed', outcome: { text: textOf(out), finish: 'stop', served: r.model, usage: usageOf(r) } };
+      if (contents.some((c: any) => c.type === 'refusal')) { terminal = { kind: 'completed', outcome: { text: '', finish: 'content_filter', served: r.model, usage: usageOf(r), tier: r?.service_tier } }; return; }
+      terminal = { kind: 'completed', outcome: { text: textOf(out), finish: 'stop', served: r.model, usage: usageOf(r), tier: r?.service_tier } };
     } catch { malformed = true; }
   } });
   try { p.feed(raw); p.reset({ consume: true }); } catch { malformed = true; }

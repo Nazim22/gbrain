@@ -4,9 +4,15 @@
  */
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
 
-export type Ceilings = { per_hour: number; per_day: number; concurrency: number };
-type State = { hour_start: number; hour: number; day_start: number; day: number };
-export type Admission = { ok: true; release: () => void } | { ok: false; code: 'runaway_guard' | 'busy'; retryAfterS: number };
+/** usd_micro_per_day (API-key mode only): a STRICT ceiling on reserved-plus-settled spend per UTC admission day, in micro-dollars. */
+export type Ceilings = { per_hour: number; per_day: number; concurrency: number; usd_micro_per_day?: number };
+type State = { hour_start: number; hour: number; day_start: number; day: number; spend?: Record<string, number> };
+export type Admission = { ok: true; release: () => void; day?: string; reserved?: number }
+  | { ok: false; code: 'runaway_guard' | 'busy' | 'daily_budget' | 'budget_state_unavailable'; retryAfterS: number };
+/** The spend state is missing, unreadable or malformed, or a settlement does not fit it. Never repaired or reset in code. */
+export class BudgetStateError extends Error { constructor(m: string) { super(m); } }
+export const utcDay = (t: number) => new Date(t).toISOString().slice(0, 10);
+const isMicro = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
 const HOUR = 3_600_000, DAY = 86_400_000;
 
 export class Limits {
@@ -21,17 +27,56 @@ export class Limits {
     try { writeSync(fd, JSON.stringify(s)); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(tmp, this.path);
   }
-  admit(): Admission {
+  /** API-key mode read: no fresh start. A missing file, bad JSON, bad counters or a bad spend map all refuse. */
+  private readStrict(): State & { spend: Record<string, number> } {
+    let s: any;
+    try { s = JSON.parse(readFileSync(this.path, 'utf8')); } catch { throw new BudgetStateError('counters unreadable'); }
+    if (!s || typeof s !== 'object' || ![s.hour_start, s.hour, s.day_start, s.day].every(Number.isFinite)) throw new BudgetStateError('counters malformed');
+    if (!s.spend || typeof s.spend !== 'object' || Array.isArray(s.spend)) throw new BudgetStateError('spend state missing');
+    for (const [k, v] of Object.entries(s.spend)) if (!/^\d{4}-\d{2}-\d{2}$/.test(k) || !isMicro(v)) throw new BudgetStateError('spend state malformed');
+    return s;
+  }
+  /**
+   * `reserveMicro` (API-key mode): this request's MAXIMUM cost is added to the admission day's spend in the SAME durable
+   * write as the call counters, before anything is sent. Over the ceiling = refused, nothing written.
+   */
+  admit(reserveMicro?: number): Admission {
     if (this.inflight >= this.c.concurrency) return { ok: false, code: 'busy', retryAfterS: 5 };
-    const t = this.now(), s = this.read();
+    const t = this.now();
+    let s: State;
+    if (reserveMicro === undefined) s = this.read();
+    else {
+      const cap = this.c.usd_micro_per_day;
+      if (!isMicro(reserveMicro) || !isMicro(cap)) return { ok: false, code: 'budget_state_unavailable', retryAfterS: 3600 };
+      try { s = this.readStrict(); } catch (e) { if (e instanceof BudgetStateError) return { ok: false, code: 'budget_state_unavailable', retryAfterS: 3600 }; throw e; }
+    }
     if (t - s.hour_start >= HOUR) { s.hour_start = t; s.hour = 0; }
     if (t - s.day_start >= DAY) { s.day_start = t; s.day = 0; }
     if (s.hour >= this.c.per_hour) return { ok: false, code: 'runaway_guard', retryAfterS: Math.ceil((s.hour_start + HOUR - t) / 1000) };
     if (s.day >= this.c.per_day) return { ok: false, code: 'runaway_guard', retryAfterS: Math.ceil((s.day_start + DAY - t) / 1000) };
+    let day: string | undefined;
+    if (reserveMicro !== undefined) {
+      day = utcDay(t);
+      const spent = s.spend![day] ?? 0;
+      if (spent + reserveMicro > this.c.usd_micro_per_day!) return { ok: false, code: 'daily_budget', retryAfterS: Math.ceil((Date.parse(`${day}T00:00:00Z`) + DAY - t) / 1000) };
+      s.spend![day] = spent + reserveMicro;
+    }
     s.hour++; s.day++; this.write(s);
     this.inflight++;
     let released = false;
-    return { ok: true, release: () => { if (!released) { released = true; this.inflight--; } } };
+    return { ok: true, day, reserved: reserveMicro, release: () => { if (!released) { released = true; this.inflight--; } } };
+  }
+  /**
+   * Replace one reservation by the actual cost (never more than the reservation), read-modify-write against the CURRENT
+   * state. Only the admission day's entry changes, whatever today's date is. Synchronous: settlements cannot interleave.
+   */
+  settle(day: string, reservedMicro: number, actualMicro: number) {
+    if (!isMicro(reservedMicro) || !isMicro(actualMicro) || actualMicro > reservedMicro) throw new BudgetStateError('settlement out of range');
+    const s = this.readStrict();
+    const spent = s.spend[day];
+    if (!isMicro(spent) || spent < reservedMicro) throw new BudgetStateError('settlement does not fit the recorded spend');
+    s.spend[day] = spent - reservedMicro + actualMicro;
+    this.write(s);
   }
   snapshot() { return { ...this.read(), inflight: this.inflight, ceilings: this.c }; }
 }

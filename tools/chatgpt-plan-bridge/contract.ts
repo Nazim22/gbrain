@@ -3,7 +3,15 @@
  * Nothing a caller asks for is silently dropped: a field the plan route cannot honour is refused with 400.
  */
 /** max_output_chars is a CHARACTER bound on delivered text, never a token equivalent (the plan route has no output-token parameter). */
-export type Route = { model: string; effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; max_output_chars: number };
+export type Route = {
+  model: string; effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; max_output_chars: number;
+  /** API-key mode only. Token maxima the reservation is priced on, and integer prices in micro-dollars per 1M tokens. */
+  max_input_tokens?: number; max_output_tokens?: number; price_micro_per_mtok?: { input: number; output: number };
+};
+/** Micro-dollars for `tokens` at `microPerMtok`, rounded UP. */
+export const costMicro = (tokens: number, microPerMtok: number) => Math.ceil((tokens * microPerMtok) / 1_000_000);
+/** A request's maximum cost in API-key mode: the model's full input maximum plus the output cap, each rounded up. */
+export const reservationMicro = (r: Route) => costMicro(r.max_input_tokens!, r.price_micro_per_mtok!.input) + costMicro(r.max_output_tokens!, r.price_micro_per_mtok!.output);
 export type ChatRequest = { route: Route; alias: string; instructions: string; input: Array<{ role: 'user' | 'assistant'; content: string }>; maxTokens?: number };
 export class ContractError extends Error { constructor(readonly status: number, readonly code: string) { super(code); } }
 
@@ -42,8 +50,16 @@ function textOf(c: unknown): string {
 export function responsesBody(r: ChatRequest) {
   return { model: r.route.model, instructions: r.instructions, input: r.input.map(m => ({ role: m.role, content: m.content })), stream: true, store: false, reasoning: { effort: r.route.effort } };
 }
+/**
+ * The paid (API-key) body: the plan body plus the three fields the dollar ceiling relies on. An enforceable output bound;
+ * the standard processing tier named explicitly (omitted would mean the project's default, which may be a dearer tier);
+ * and explicit prompt caching with no breakpoints, which creates no cache use and no cache writes.
+ */
+export function paidResponsesBody(r: ChatRequest) {
+  return { ...responsesBody(r), max_output_tokens: r.route.max_output_tokens, service_tier: 'default', prompt_cache_options: { mode: 'explicit' } };
+}
 
-export type Outcome = { text: string; finish: 'stop' | 'length' | 'content_filter'; served?: string; usage?: { input_tokens?: number; output_tokens?: number } };
+export type Outcome = { text: string; finish: 'stop' | 'length' | 'content_filter'; served?: string; usage?: { input_tokens?: number; output_tokens?: number }; tier?: unknown };
 
 /** Token side of max_tokens: judged on the upstream's own output count; over it, the answer is delivered as `length` (truncated, not published by gbrain). */
 export function applyMaxTokens(o: Outcome, maxTokens?: number): Outcome {

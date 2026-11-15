@@ -6,15 +6,16 @@
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { ContractError, applyMaxTokens, chatCompletion, parseChatRequest, responsesBody, type Route } from './contract.ts';
+import { ContractError, applyMaxTokens, chatCompletion, costMicro, paidResponsesBody, parseChatRequest, reservationMicro, responsesBody, type Route } from './contract.ts';
 import { parseStream, UpstreamError, type UpstreamSender } from './upstream.ts';
-import { Limits, type Ceilings } from './limits.ts';
+import { BudgetStateError, Limits, type Ceilings } from './limits.ts';
 import type { LeakConfig, LeakResult } from './leakgate.ts';
 
 export type Config = {
   port: number; caller_secret_file: string; state_dir: string; auth_dir: string;
   routes: Record<string, Route>; ceilings: Ceilings; max_body_bytes: number;
-  upstream: { connect_ms: number; request_ms: number }; leak: LeakConfig;
+  /** auth 'api_key' = paid OpenAI API mode: bearer from api_key_file, paid request body, dollar ceiling. Default 'plan'. */
+  upstream: { connect_ms: number; request_ms: number; auth?: 'plan' | 'api_key'; api_key_file?: string }; leak: LeakConfig;
   /** Response codes that trip the durable halt latch: every later request is refused before any upstream call. */
   halt_on?: string[];
 };
@@ -37,7 +38,9 @@ export function makeHandler(cfg: Config, d: Deps) {
   const now = d.now ?? Date.now;
   const ledger = (row: Record<string, unknown>) => appendFileSync(join(cfg.state_dir, 'requests.jsonl'), JSON.stringify({ ts: new Date(now()).toISOString(), ...row }) + '\n', { mode: 0o600 });
   const quarantine = (row: Record<string, unknown>) => appendFileSync(join(cfg.state_dir, 'quarantine.jsonl'), JSON.stringify({ ts: new Date(now()).toISOString(), ...row }) + '\n', { mode: 0o600 });
-  const haltOn = new Set(cfg.halt_on ?? DEFAULT_HALT_ON);
+  const paid = cfg.upstream.auth === 'api_key';
+  // budget_invariant always latches in paid mode, whatever halt_on says: it means the ceiling's assumptions were broken.
+  const haltOn = new Set([...(cfg.halt_on ?? DEFAULT_HALT_ON), ...(paid ? ['budget_invariant'] : [])]);
   const haltFile = join(cfg.state_dir, 'halted.json');
   const trip = (code: string, id: string) => {
     if (!haltOn.has(code) || existsSync(haltFile)) return;
@@ -81,35 +84,54 @@ export function makeHandler(cfg: Config, d: Deps) {
       return err(503, 'leak_quarantine', 'outbound text matched the leak gate; not sent', { 'retry-after': '3600' });
     }
 
-    const adm = d.limits.admit();
-    if (!adm.ok) { ledger({ ...base, status: 429, code: adm.code }); trip(adm.code, id); return err(429, adm.code, adm.code, { 'retry-after': String(adm.retryAfterS) }); }
+    // Paid mode: the request's maximum cost is reserved durably here, with the call counters, before anything is sent.
+    const adm = d.limits.admit(paid ? reservationMicro(parsed.route) : undefined);
+    if (!adm.ok) {
+      const status = adm.code === 'budget_state_unavailable' ? 503 : 429;
+      ledger({ ...base, status, code: adm.code }); trip(adm.code, id);
+      return err(status, adm.code, adm.code, { 'retry-after': String(adm.retryAfterS) });
+    }
+    const money = paid ? { reserved_micro: adm.reserved, spend_day: adm.day } : {};
+    // Every ending except a 200 with complete in-bound usage keeps the full reservation (it may have been billed).
+    const settleFrom = (o: { usage?: { input_tokens?: number; output_tokens?: number }; tier?: unknown }): Record<string, unknown> => {
+      if (!paid) return {};
+      const r = parsed.route, u = o.usage ?? {}, i = u.input_tokens, out = u.output_tokens;
+      const ints = Number.isSafeInteger(i) && Number.isSafeInteger(out) && (i as number) >= 0 && (out as number) >= 0;
+      if (!ints) return { ...money, settled: false, unsettled: 'usage_missing_or_malformed' };
+      if ((i as number) > r.max_input_tokens! || (out as number) > r.max_output_tokens!) { trip('budget_invariant', id); return { ...money, settled: false, unsettled: 'usage_over_bound' }; }
+      if (o.tier !== 'default') { trip('budget_invariant', id); return { ...money, settled: false, unsettled: 'service_tier_not_default' }; }
+      const actual = costMicro(i as number, r.price_micro_per_mtok!.input) + costMicro(out as number, r.price_micro_per_mtok!.output);
+      try { d.limits.settle(adm.day!, adm.reserved!, actual); }
+      catch (e) { if (!(e instanceof BudgetStateError)) throw e; trip('budget_invariant', id); return { ...money, settled: false, unsettled: 'spend_state_invalid' }; }
+      return { ...money, settled: true, settled_micro: actual };
+    };
     try {
       let token: string;
       try { token = await d.accessToken(); }
-      catch { ledger({ ...base, status: 401, code: 'auth_unavailable' }); trip('auth_unavailable', id); return err(401, 'auth_unavailable', 'oauth session expired or unavailable'); }
+      catch { ledger({ ...base, ...money, status: 401, code: 'auth_unavailable' }); trip('auth_unavailable', id); return err(401, 'auth_unavailable', 'oauth session expired or unavailable'); }
       // Re-check the latch immediately before dispatch: another request may have tripped it while this one was scanning.
       const h2 = halted();
       if (h2) { ledger({ ...base, status: 429, code: 'bridge_halted', halted_by: h2.code }); return err(429, 'bridge_halted', `bridge halted by ${h2.code}; operator must clear halted.json`, { 'retry-after': '3600' }); }
       let up;
-      try { up = await d.upstream(responsesBody(parsed), token, { connect: cfg.upstream.connect_ms, request: cfg.upstream.request_ms }, parsed.route.max_output_chars); }
-      catch (e) { const code = e instanceof UpstreamError ? e.code : 'TRANSPORT-UNKNOWN'; ledger({ ...base, status: 502, code: 'unknown_completion', detail: code, latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion', code); }
+      try { up = await d.upstream(paid ? paidResponsesBody(parsed) : responsesBody(parsed), token, { connect: cfg.upstream.connect_ms, request: cfg.upstream.request_ms }, parsed.route.max_output_chars); }
+      catch (e) { const code = e instanceof UpstreamError ? e.code : 'TRANSPORT-UNKNOWN'; ledger({ ...base, ...money, status: 502, code: 'unknown_completion', detail: code, latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion', code); }
       if (up.status !== 200) {
         let code = 'upstream_error';
         try { const b = JSON.parse(up.raw.toString()); if (typeof b?.error?.code === 'string') code = b.error.code; } catch { /* keep generic */ }
         const status = up.status === 429 ? 429 : up.status === 503 ? 503 : up.status === 401 || up.status === 403 ? 401 : up.status === 400 ? 400 : 502;
-        ledger({ ...base, status, code, upstream_status: up.status, latency_ms: now() - started });
+        ledger({ ...base, ...money, status, code, upstream_status: up.status, latency_ms: now() - started });
         if (up.status === 401 || up.status === 403) trip('upstream_auth', id);
         return err(status, code, code, up.retryAfter ? { 'retry-after': up.retryAfter } : {});
       }
       const p = parseStream(up.raw.toString(), up.charCapHit);
-      if (p.kind === 'unknown') { ledger({ ...base, status: 502, code: 'unknown_completion', latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion'); }
+      if (p.kind === 'unknown') { ledger({ ...base, ...money, status: 502, code: 'unknown_completion', latency_ms: now() - started }); trip('unknown_completion', id); return err(502, 'unknown_completion'); }
       if (p.kind === 'failed') {
-        const status = p.code === 'subscription_sharing_usage_limit_exceeded' || p.code === 'rate_limit_exceeded' ? 429 : p.code === 'subscription_sharing_usage_unavailable' ? 503 : 502;
-        ledger({ ...base, status, code: p.code, latency_ms: now() - started });
+        const status = ['subscription_sharing_usage_limit_exceeded', 'rate_limit_exceeded', 'insufficient_quota', 'billing_hard_limit_reached'].includes(p.code) ? 429 : p.code === 'subscription_sharing_usage_unavailable' ? 503 : 502;
+        ledger({ ...base, ...money, status, code: p.code, latency_ms: now() - started });
         return err(status, p.code);
       }
       const o = applyMaxTokens(p.outcome, parsed.maxTokens);
-      ledger({ ...base, status: 200, finish: o.finish, served: o.served ?? null, usage: o.usage ?? null, char_cap_hit: up.charCapHit, latency_ms: now() - started });
+      ledger({ ...base, status: 200, finish: o.finish, served: o.served ?? null, usage: o.usage ?? null, char_cap_hit: up.charCapHit, latency_ms: now() - started, ...settleFrom(p.outcome) });
       return json(200, chatCompletion(o, parsed.alias, id), { 'x-bridge-request-id': id, 'x-bridge-effort': parsed.route.effort, 'x-bridge-served-model': o.served ?? parsed.route.model });
     } finally { adm.release(); }
   };
@@ -119,5 +141,17 @@ export function loadConfig(path: string): Config {
   const c = JSON.parse(readFileSync(path, 'utf8')) as Config;
   if (!Number.isInteger(c.port) || !c.routes || !Object.keys(c.routes).length) throw Error('CONFIG');
   for (const r of Object.values(c.routes)) if (!r.model || !r.effort || !(r.max_output_chars > 0)) throw Error('CONFIG-ROUTE');
+  const auth = c.upstream?.auth ?? 'plan';
+  if (auth !== 'plan' && auth !== 'api_key') throw Error('CONFIG-AUTH');
+  if (auth === 'api_key') {
+    const pos = (v: unknown) => Number.isSafeInteger(v) && (v as number) > 0;
+    if (typeof c.upstream.api_key_file !== 'string' || !c.upstream.api_key_file.startsWith('/')) throw Error('CONFIG-API-KEY-FILE');
+    if (!pos(c.ceilings?.usd_micro_per_day)) throw Error('CONFIG-BUDGET');
+    for (const r of Object.values(c.routes)) {
+      if (!pos(r.max_input_tokens) || !pos(r.max_output_tokens) || !pos(r.price_micro_per_mtok?.input) || !pos(r.price_micro_per_mtok?.output)) throw Error('CONFIG-ROUTE-PAID');
+      // Usable only if every concurrent request can hold its FULL (input + output) reservation inside the day's ceiling.
+      if (reservationMicro(r) * c.ceilings.concurrency > c.ceilings.usd_micro_per_day!) throw Error('CONFIG-BUDGET-UNUSABLE');
+    }
+  }
   return c;
 }
