@@ -2,8 +2,11 @@
 bridge process stopped. Adds "spend": {} to an EXISTING, VALID plan-mode counters file and changes nothing else.
 Fail closed: a missing, unreadable, linked or malformed file refuses; an existing spend map is validated and left
 byte-identical (it is never emptied, repaired or recreated); evidence of earlier paid use without a spend map refuses.
-Usage: init_spend.py <counters.json> [<requests.jsonl>]     exit 0 = initialised or already valid, 1 = refused"""
-import json, os, re, stat, sys
+A NEW spend map is written only against the stopped pre-paid baseline taken by install.sh: the counters bytes and the
+ledger must be exactly what that baseline recorded (nothing ran since), and the ledger must exist and hold no paid row.
+A ledger without paid rows is not by itself proof of "never paid" (a reservation is written before its ledger row).
+Usage: init_spend.py <counters.json> <requests.jsonl> <pre-paid-baseline.json>     exit 0 = initialised or already valid, 1 = refused"""
+import hashlib, json, os, re, stat, sys
 
 def refuse(msg): print(f'REFUSE: {msg}'); sys.exit(1)
 def micro(v): return type(v) is int and 0 <= v <= 2**53 - 1
@@ -13,8 +16,7 @@ def day_ok(k):
     try: datetime.date.fromisoformat(k); return True
     except ValueError: return False
 
-def main(path, ledger=None):
-    ledger = ledger or os.path.join(os.path.dirname(path), 'requests.jsonl')
+def main(path, ledger, baseline):
     try: fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as e: refuse(f'counters file cannot be opened without following a link ({e.strerror})')
     try:
@@ -34,10 +36,13 @@ def main(path, ledger=None):
         if type(sp) is not dict or not all(day_ok(k) and micro(v) for k, v in sp.items()): refuse('existing spend map is malformed; it is not repaired here')
         print(f'ok  spend map already present ({len(sp)} day(s)); file left untouched'); return
     # No spend map. It may be created only if this state never ran paid: a ledger row carrying a reservation says it did.
-    try:
-        with open(ledger, 'rb') as f:
-            if any(b'"reserved_micro"' in line for line in f): refuse('the request ledger shows earlier paid use but the spend map is gone; never recreated as empty')
-    except FileNotFoundError: pass
+    try: led = open(ledger, 'rb').read()
+    except OSError: refuse('the request ledger is missing or unreadable; first-paid initialisation cannot be shown')
+    if b'"reserved_micro"' in led: refuse('the request ledger shows earlier paid use but the spend map is gone; never recreated as empty')
+    try: base = json.load(open(baseline))
+    except (OSError, ValueError): refuse('the stopped pre-paid baseline is missing or unreadable')
+    if base.get('counters_sha256') != hashlib.sha256(raw).hexdigest(): refuse('counters changed since the stopped pre-paid baseline')
+    if base.get('ledger_sha256') != hashlib.sha256(led).hexdigest(): refuse('the ledger changed since the stopped pre-paid baseline')
     s['spend'] = {}
     d = os.path.dirname(path) or '.'
     tmp = path + '.init-spend.tmp'
@@ -54,5 +59,5 @@ def main(path, ledger=None):
     print('ok  spend map initialised empty; every existing counter and key preserved')
 
 if __name__ == '__main__':
-    if len(sys.argv) not in (2, 3): refuse('usage: init_spend.py <counters.json> [<requests.jsonl>]')
+    if len(sys.argv) != 4: refuse('usage: init_spend.py <counters.json> <requests.jsonl> <pre-paid-baseline.json>')
     main(*sys.argv[1:])

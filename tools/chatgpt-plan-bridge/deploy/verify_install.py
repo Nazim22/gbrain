@@ -79,14 +79,23 @@ if PAID:
     print('ok  key file custody (content not shown)')
     cpath = f"{want['state_dir']}/counters.json"
     owned(cpath, 'cpbridge', 'cpbridge', 0o600)
-    c = json.load(open(cpath))
+    if not stat.S_ISREG(os.lstat(cpath).st_mode): fail('counters.json is not a regular file')
+    def no_dup(pairs):
+        if len({k for k, _ in pairs}) != len(pairs): fail('counters.json has a duplicate key')
+        return dict(pairs)
+    c = json.loads(open(cpath, 'rb').read(), object_pairs_hook=no_dup)
+    import datetime
+    def real_day(k):
+        try: datetime.date.fromisoformat(k); return True
+        except ValueError: return False
     nn = lambda v: type(v) is int and 0 <= v <= 2**53 - 1
     if not all(nn(c.get(k)) for k in ('hour_start', 'hour', 'day_start', 'day')): fail('counters.json counters are not non-negative integers')
     sp = c.get('spend')
-    if type(sp) is not dict or not all(re.fullmatch(r'\d{4}-\d{2}-\d{2}', k) and nn(v) for k, v in sp.items()): fail('counters.json has no valid spend map')
+    if type(sp) is not dict or not all(re.fullmatch(r'\d{4}-\d{2}-\d{2}', k) and real_day(k) and nn(v) for k, v in sp.items()): fail('counters.json has no valid spend map')
     if any(v > want['ceilings']['usd_micro_per_day'] for v in sp.values()): fail('a recorded day exceeds the configured ceiling')
     print(f'ok  counters.json spend map valid ({len(sp)} day(s))')
-    for pre in ('config.json.pre-paid', 'current.pre-paid'):
+    for pre in ('config.json.pre-paid', 'current.pre-paid', 'pre-paid-baseline.json', 'verify-baseline.pre-paid'):
         if not os.path.isfile(f'{ETC}/{pre}') or os.path.islink(f'{ETC}/{pre}') or os.path.getsize(f'{ETC}/{pre}') == 0: fail(f'rollback preimage {pre} is missing')
-    print('ok  rollback preimages present')
+    if not os.path.isdir(f'{ETC}/units.pre-paid') or os.path.islink(f'{ETC}/units.pre-paid'): fail('rollback unit preimages are missing')
+    print('ok  rollback preimages and stopped pre-paid baseline present')
 print(f"VERIFIED: the installed bridge is the reviewed bytes{' (paid mode)' if PAID else ''}")

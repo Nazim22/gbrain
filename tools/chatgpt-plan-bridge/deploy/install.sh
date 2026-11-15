@@ -29,8 +29,27 @@ if [[ $MODE == paid ]]; then
   elif [[ -e $E/config.json.pre-paid ]]; then
     cmp -s $E/config.json.pre-paid $E/config.json || { echo "REFUSE: a pre-paid config preimage exists and differs from the installed plan config"; exit 1; }
   else
+    # First paid install on this host. The stopped state is recorded BEFORE anything changes: it is what rollback
+    # restores and what proves this is the first paid initialisation of the counters.
+    [[ -s $E/verify-baseline.pre-paid ]] || { echo "REFUSE: runbook step 0 was not run (no $E/verify-baseline.pre-paid)"; exit 1; }
+    [[ -f /srv/chatgpt-plan-bridge/state/requests.jsonl && ! -L /srv/chatgpt-plan-bridge/state/requests.jsonl ]] || { echo "REFUSE: the request ledger is missing; first-paid initialisation cannot be shown"; exit 1; }
+    install -d -m 0750 -o root -g cpbridge $E/units.pre-paid
+    for u in chatgpt-plan-bridge.service chatgpt-plan-bridge-egress.service chatgpt-plan-bridge-egress.timer; do install -m 0644 /etc/systemd/system/$u $E/units.pre-paid/$u; done
+    python3 -I - > $E/pre-paid-baseline.json <<'PY'
+import hashlib, json, os, time
+S = '/srv/chatgpt-plan-bridge/state'; E = '/etc/chatgpt-plan-bridge'
+sha = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
+led = open(f'{S}/requests.jsonl', 'rb').read()
+if b'"reserved_micro"' in led: raise SystemExit('REFUSE: the ledger already holds paid rows; this is not a first paid install')
+print(json.dumps({'taken_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'counters_sha256': sha(f'{S}/counters.json'),
+    'ledger_lines': led.count(b'\n'), 'ledger_sha256': hashlib.sha256(led).hexdigest(), 'config_sha256': sha(f'{E}/config.json'),
+    'current': os.readlink('/opt/chatgpt-plan-bridge/current'),
+    'units_sha256': {u: sha(f'/etc/systemd/system/{u}') for u in ('chatgpt-plan-bridge.service', 'chatgpt-plan-bridge-egress.service', 'chatgpt-plan-bridge-egress.timer')}}))
+PY
+    chown root:cpbridge $E/pre-paid-baseline.json; chmod 0640 $E/pre-paid-baseline.json
     install -m 0640 -o root -g cpbridge $E/config.json $E/config.json.pre-paid; readlink /opt/chatgpt-plan-bridge/current > $E/current.pre-paid
   fi
+  [[ -s $E/pre-paid-baseline.json && -d $E/units.pre-paid ]] || { echo "REFUSE: the pre-paid baseline is incomplete"; exit 1; }
   echo "preimage: $(sha256sum /etc/chatgpt-plan-bridge/config.json.pre-paid | cut -c1-16) current was $(< /etc/chatgpt-plan-bridge/current.pre-paid)"
 fi
 
@@ -102,7 +121,7 @@ chown root:cpbridge /etc/chatgpt-plan-bridge/config.json; chmod 0640 /etc/chatgp
 
 if [[ $MODE == paid ]]; then
   step "paid: first-paid spend initialisation (fail closed; existing counters preserved)"
-  runuser -u cpbridge -- python3 -I "$OPT/init_spend.py" /srv/chatgpt-plan-bridge/state/counters.json
+  runuser -u cpbridge -- python3 -I "$OPT/init_spend.py" /srv/chatgpt-plan-bridge/state/counters.json /srv/chatgpt-plan-bridge/state/requests.jsonl /etc/chatgpt-plan-bridge/pre-paid-baseline.json
   step "paid: units installed, NOT started"
   install -m 0644 "$SRC/deploy/chatgpt-plan-bridge.service" /etc/systemd/system/chatgpt-plan-bridge.service
   install -m 0644 "$SRC/deploy/chatgpt-plan-bridge-egress.service" /etc/systemd/system/chatgpt-plan-bridge-egress.service

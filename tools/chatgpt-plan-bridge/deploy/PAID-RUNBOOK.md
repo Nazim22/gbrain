@@ -8,7 +8,8 @@ step 5. No step clears a halt latch, resets a counter or retries a call.
 ## States
 
 `plan-installed` → (step 2) `paid-installed, stopped` → (step 3) `canary judged, stopped` → (step 4) `receipt accepted`
-→ (step 5) `paid-live`. Any refusal or STOP leaves the bridge stopped where it is; step R returns to `plan-installed, stopped`.
+→ (step 5) `paid-live`. A refusal BEFORE the stop in step 2 (for example a halt latch) leaves the bridge as it was, still
+running in plan mode. From the stop onward, any refusal or STOP leaves it stopped where it is; step R returns to `plan-installed, stopped`.
 
 ## 0. Baseline (read-only)
 
@@ -19,7 +20,7 @@ ls -la $S; cat $S/counters.json; ls $S/halted.json         # a present halted.js
 python3 -I $OLDW/tools/chatgpt-plan-bridge/deploy/verify_install.py $OLDW > $E/verify-baseline.pre-paid 2>&1; cat $E/verify-baseline.pre-paid
 ```
 
-The baseline verifier output is the rollback reference. On this host it is expected to stop at `config.json` (the live plan
+The baseline verifier output is the rollback reference, and `install.sh paid` refuses without it. On this host it is expected to stop at `config.json` (the live plan
 config carries two recorded hand edits: a `halt_on` list and detector paths); that exact output is what rollback must reproduce.
 Hourly/daily call counters are taken as they are. If they would refuse a call, the canary waits; they are not reset.
 
@@ -36,10 +37,12 @@ tools/chatgpt-plan-bridge/deploy/paid_delivery.test.sh $OLDW
 tools/chatgpt-plan-bridge/deploy/install.sh $W $NEW paid
 ```
 
-It refuses on a halt latch; disables and stops the unit and proves no bridge process runs; saves the plan config and the
-`current` target as rollback preimages (once); installs the bundle; writes the key from the local vault to
+It refuses on a halt latch; disables and stops the unit and proves no bridge process runs; in that stopped state records
+the pre-paid baseline once (config bytes, `current`, the three unit files, and the hashes of `counters.json` and the ledger);
+installs the bundle; writes the key from the local vault to
 `/etc/chatgpt-plan-bridge/openai-api.key` (root:cpbridge 0640; an existing different key refuses); writes the paid config;
-runs `init_spend.py` as the bridge user; installs the units without starting them; runs `verify_install.py $W paid`.
+runs `init_spend.py` as the bridge user, which writes a new spend map only if counters and ledger still equal that
+baseline and the ledger holds no paid row; installs the units without starting them; runs `verify_install.py $W paid`.
 End state: stopped and disabled. The sign-in directory is untouched.
 
 ## 3. The one paid canary
@@ -58,6 +61,12 @@ recomputed from usage; no halt latch; `spend[admission day] == before + settled_
 The service tier is not observed directly: the bridge settles only after seeing tier `default`, so `settled true` is the
 evidence, and the receipt says so. Every other outcome is STOP: no second call, the reservation and any latch stay as they are.
 The script refuses to run twice; a second canary needs a new reviewed decision.
+
+Attended premise: nobody else calls the bridge during the run. The machine does not enforce this (the caller secret works on
+the canary port too); an extra completed request makes the judge STOP, an extra request killed mid-flight would not be seen.
+
+On the way out the script proves the canary bridge has stopped before it removes the egress fence. If it cannot prove it,
+the fence and the canary config stay in place, the script exits non-zero, and the operator stops the unit by hand first.
 
 What this does and does not show about sign-in traffic: the running bytes are the reviewed paid bundle (step 2 verifier),
 whose paid branch never constructs the sign-in store, and the egress chain listing at the end of the run is kept. The fence
@@ -86,7 +95,9 @@ Expect `active`, status 200 with `"halted":null`, verifier VERIFIED. Then watch 
 tools/chatgpt-plan-bridge/deploy/rollback-paid.sh $OLDW $OLD
 ```
 
-Restores the saved plan config bytes, the previous bundle link and the previous units; leaves the key file and the spend
+Refuses unless the complete pre-paid baseline exists and still matches. Restores the saved plan config bytes, the previous
+bundle link and the saved unit bytes; reads back config, link, units, the old verifier's output against the step-0 baseline,
+the detector files and redactor pin the restored config names, and owners and modes; leaves the key file and the spend
 map in place (the previous bundle keeps a spend map it does not know: `paid_delivery.test.sh`); clears nothing; ends
 STOPPED and disabled. The plan service is started by hand only when its own prerequisites hold.
 

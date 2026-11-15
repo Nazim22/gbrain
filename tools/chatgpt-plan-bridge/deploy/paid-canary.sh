@@ -5,6 +5,9 @@
 # sends exactly ONE request; stops it; judges the result from the ledger and counters (canary_check.py).
 # Whatever the outcome the bridge is left STOPPED, nothing is retried, cleared or reset. Worst case kept: one reservation.
 # A second run refuses: the attempt marker is removed only by a new reviewed decision.
+# Attended premise, not enforced by the machine: no other client calls the bridge during the run. The canary port and
+# the transient unit keep ordinary callers away (they use the live port), but anyone holding the caller secret could
+# reach port 18796 on loopback; an extra completed request is detected (the judge needs exactly one new ledger row).
 # Usage: paid-canary.sh <bridge-worktree> <reviewed-head-sha> <evidence-dir>
 set -euo pipefail
 W=$1 WANT=$2 OUT=$3
@@ -41,17 +44,8 @@ install -m 0600 "$S/counters.json" "$OUT/pre-counters.json"
 PRE_LINES=$(wc -l < "$S/requests.jsonl")
 echo "pre: ledger lines $PRE_LINES, counters $(cat "$OUT/pre-counters.json")"
 
-cleanup() {
-  local rc=$?; set +e
-  systemctl stop $UNIT.service 2>/dev/null
-  for _ in $(seq 20); do [[ $(systemctl is-active $UNIT.service) == inactive || $(systemctl is-active $UNIT.service) == failed ]] && break; sleep 1; done
-  nft list chain inet filter cpbridge_egress > "$OUT/egress-chain-at-end.txt" 2>&1
-  "$OPT/egress.sh" remove
-  rm -f "$E/paid-canary.json"
-  echo "== $(date -u +%FT%TZ) cleanup: canary unit $(systemctl is-active $UNIT.service), cpbridge processes $(pgrep -u cpbridge -c), egress chain $(nft list chain inet filter cpbridge_egress >/dev/null 2>&1 && echo PRESENT || echo removed), live unit $(systemctl is-active chatgpt-plan-bridge.service)"
-  systemctl reset-failed $UNIT.service 2>/dev/null
-  exit $rc
-}
+source "$SRC/deploy/canary_lib.sh"
+cleanup() { local rc=$?; set +e; canary_cleanup "$rc" "$UNIT" "$OPT/egress.sh" "$E/paid-canary.json" "$OUT"; exit $?; }
 trap cleanup EXIT
 
 step "egress fence for the canary port, then the installed bundle as cpbridge with the service's own sandbox"
@@ -73,9 +67,7 @@ REQ=$(awk 'tolower($1)=="x-bridge-request-id:"{print $2}' "$OUT/response-headers
 echo "http $CODE request id ${REQ:-none}"
 
 step "stop the canary bridge, then judge"
-systemctl stop $UNIT.service || true
-for _ in $(seq 20); do pgrep -u cpbridge >/dev/null || break; sleep 1; done
-if pgrep -u cpbridge >/dev/null; then echo "STOP: a cpbridge process survived the stop"; exit 1; fi
+canary_ceased "$UNIT" || { echo "STOP: the canary bridge could not be proven stopped; not judging"; exit 1; }
 set +e
 python3 -I "$SRC/deploy/canary_check.py" "$E/config.json" "$OUT/pre-counters.json" "$PRE_LINES" "$CODE" "$OUT/response.json" "${REQ:-}" "$OUT/receipt.json"
 RC=$?; set -e
