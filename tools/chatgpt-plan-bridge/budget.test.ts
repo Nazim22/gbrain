@@ -184,6 +184,17 @@ test('a reasoning item whose opaque blob differs between the streamed item and t
     const t = setup({ upstream: async () => ({ status: 200, raw: Buffer.from(bad), charCapHit: false }) });
     expect((await t.post()).status).toBe(502); expect(state(t.dir).spend['2026-11-15']).toBe(RES);
   }
+  // only the blob string is excused: any other reasoning difference (id, summary, count, order, blob missing or not a string) still rejects
+  const r1 = reasoning('s'), m = msg('a');
+  const reasoningBad: [object[], object[]][] = [
+    [[r1, m], [{ ...reasoning('t'), id: 'rs_2' }, m]], [[r1, m], [{ ...reasoning('t'), summary: [{ type: 'summary_text', text: 'b' }] }, m]],
+    [[r1, m], [reasoning('t'), reasoning('t'), m]], [[r1, m], [m, reasoning('t')]],
+    [[r1, m], [{ id: 'rs_1', type: 'reasoning', summary: [] }, m]], [[r1, m], [{ ...reasoning('t'), encrypted_content: null }, m]],
+  ];
+  for (const [streamed, terminal] of reasoningBad) for (const [type, status] of [['response.completed', 'completed'], ['response.incomplete', 'incomplete']]) {
+    expect(parseStream(full(streamed, terminal, type, status)).kind).toBe('unknown');
+    expect(parseStream(full(terminal, streamed, type, status)).kind).toBe('unknown');
+  }
   // same rule for an incomplete answer
   expect(parseStream(full([reasoning('s'), msg('part')], [reasoning('t'), msg('part')], 'response.incomplete', 'incomplete'))).toMatchObject({ kind: 'completed', outcome: { finish: 'length', text: 'part' } });
   expect(parseStream(full([reasoning('s'), msg('part')], [reasoning('t'), msg('other')], 'response.incomplete', 'incomplete')).kind).toBe('unknown');

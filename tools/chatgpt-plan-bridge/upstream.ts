@@ -44,16 +44,19 @@ export const sendUpstream: UpstreamSender = (body, accessToken, bounds, maxChars
 /**
  * Terminal parse of a plan-route stream into answer text (rules of the reviewed parseLuna, generalised to text):
  * exactly one terminal event; text from output_item.done when completed.output is [] (the P7 finding);
- * both present and their MESSAGE items different, or an item after the terminal event = malformed.
- * Only message items are compared: they are what becomes the answer. A reasoning item carries an opaque encrypted blob
- * that the upstream emits differently in the streamed item and in the terminal copy of the same answer (seen on the paid
- * API 2026-11-15: every other byte equal), so comparing whole items rejected good answers.
+ * both present and different, or an item after the terminal event = malformed.
+ * One exception to "different": a reasoning item's opaque `encrypted_content` string, which the upstream emits differently
+ * in the streamed item and in the terminal copy of the same answer (seen on the paid API 2026-11-15: every other byte equal).
+ * Count, order, type, id and every other field of every item are still compared.
  */
 export type Parsed = { kind: 'completed'; outcome: Outcome } | { kind: 'failed'; code: string } | { kind: 'unknown' };
 const SAFE = new Set(['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable', 'invalid_request_error', 'unsupported_parameter', 'server_error', 'rate_limit_exceeded', 'insufficient_quota', 'billing_hard_limit_reached']);
-const messagesOf = (a: any[]) => JSON.stringify(a.filter((o: any) => o?.type === 'message'));
-/** The terminal output and the streamed items must agree on the answer: same message items, in the same order. */
-const answerDiffers = (output: any[], items: any[]) => messagesOf(output) !== messagesOf(items);
+/** Whole-array comparison; only a string `encrypted_content` present on BOTH aligned reasoning items is left out of it. */
+const answerDiffers = (output: any[], items: any[]) => output.length !== items.length || output.some((o: any, i: number) => {
+  const s = items[i];
+  const blob = o?.type === 'reasoning' && s?.type === 'reasoning' && typeof o.encrypted_content === 'string' && typeof s.encrypted_content === 'string';
+  return JSON.stringify(blob ? { ...o, encrypted_content: '' } : o) !== JSON.stringify(blob ? { ...s, encrypted_content: '' } : s);
+});
 export function parseStream(raw: string, charCapHit = false): Parsed {
   let terminal: Parsed | undefined, malformed = false, sawTerminal = false, partial = '';
   const items: any[] = [];
