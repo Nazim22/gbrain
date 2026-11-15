@@ -6,7 +6,7 @@
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { ContractError, applyMaxTokens, chatCompletion, costMicro, paidResponsesBody, parseChatRequest, reservationMicro, responsesBody, type Route } from './contract.ts';
+import { ContractError, applyMaxTokens, chatCompletion, costMicro, paidResponsesBody, parseChatRequest, reservationMicro, responsesBody, type Outcome, type Route } from './contract.ts';
 import { parseStream, UpstreamError, type UpstreamSender } from './upstream.ts';
 import { BudgetStateError, Limits, fsyncDir, type Ceilings } from './limits.ts';
 import type { LeakConfig, LeakResult } from './leakgate.ts';
@@ -105,7 +105,7 @@ export function makeHandler(cfg: Config, d: Deps) {
     }
     const money = paid ? { reserved_micro: adm.reserved, spend_day: adm.day } : {};
     // Every ending except a 200 with complete in-bound usage keeps the full reservation (it may have been billed).
-    const settleFrom = (o: { usage?: { input_tokens?: number; output_tokens?: number }; tier?: unknown }): Record<string, unknown> => {
+    const settleFrom = (o: Outcome): Record<string, unknown> => {
       if (!paid) return {};
       // The bridge cut the stream itself before a terminal event: nothing to judge, the full reservation stays.
       if (o.cut) return { ...money, settled: false, unsettled: 'stream_cut_before_terminal' };
