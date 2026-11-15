@@ -5,10 +5,16 @@ On disk only (canary.sh V adds the live checks: units active, egress drop, 401/2
 - detector_check.py, egress.sh and the 3 systemd units == the worktree copies; bun == the runtime that just built the bundle;
 - redactor.py == the pin, config.json == install.sh's own heredoc rendered for that dir (one source: install.sh);
 - owner/mode of the home, leaf dirs, secret and config as install.sh sets them.
-Exit 1 at the first mismatch. Usage: verify_install.py <worktree> [<opt_root> <etc_dir> <unit_dir>]  (roots: tests only)"""
+paid (GBRAIN-S593): config.json == install.sh's PAID heredoc; the API key file passes the same custody the bridge enforces at
+start (custody.ts: regular file, root:cpbridge 0640, bounded printable ASCII, real root-owned ancestors nobody else can write,
+outside the state dir) and is never printed or hashed; counters.json holds a valid spend map; the rollback preimages exist.
+Exit 1 at the first mismatch. Usage: verify_install.py <worktree> [paid] [<opt_root> <etc_dir> <unit_dir>]  (roots: tests only)"""
 import hashlib, json, os, re, stat, subprocess, sys, tempfile
 W = sys.argv[1]
-OPT_ROOT, ETC, UNITS = (sys.argv[2:5] if len(sys.argv) == 5 else ['/opt/chatgpt-plan-bridge', '/etc/chatgpt-plan-bridge', '/etc/systemd/system'])
+PAID = len(sys.argv) > 2 and sys.argv[2] == 'paid'
+ROOTS = sys.argv[3:] if PAID else sys.argv[2:]
+if len(ROOTS) not in (0, 3): print('usage: verify_install.py <worktree> [paid] [<opt_root> <etc_dir> <unit_dir>]'); sys.exit(1)
+OPT_ROOT, ETC, UNITS = (ROOTS if ROOTS else ['/opt/chatgpt-plan-bridge', '/etc/chatgpt-plan-bridge', '/etc/systemd/system'])
 SRC = f'{W}/tools/chatgpt-plan-bridge'; BUN = os.path.realpath('/root/.bun/bin/bun'); SRV = '/srv/chatgpt-plan-bridge'
 
 def fail(msg): print(f'REFUSE: {msg}'); sys.exit(1)
@@ -37,17 +43,18 @@ with tempfile.TemporaryDirectory() as t:   # root-only (0700) temp dir: nothing 
 same(f'{opt}/bun', BUN, 'bun runtime')
 same(f'{opt}/detectors/detector_check.py', f'{SRC}/detector_check.py', 'detector_check.py')
 same(f'{opt}/egress.sh', f'{SRC}/deploy/egress.sh', 'egress.sh')
+if PAID: same(f'{opt}/init_spend.py', f'{SRC}/deploy/init_spend.py', 'init_spend.py')
 for u in ['chatgpt-plan-bridge.service', 'chatgpt-plan-bridge-egress.service', 'chatgpt-plan-bridge-egress.timer']:
     same(f'{UNITS}/{u}', f'{SRC}/deploy/{u}', u)
 
 inst = open(f'{SRC}/deploy/install.sh').read()
-tpl = re.search(r"cat > /etc/chatgpt-plan-bridge/config.json <<EOF\n(.*?)\nEOF\n", inst, re.S)
+tpl = re.search(r"cat > /etc/chatgpt-plan-bridge/config.json <<EOF_PAID\n(.*?)\nEOF_PAID\n" if PAID else r"cat > /etc/chatgpt-plan-bridge/config.json <<EOF\n(.*?)\nEOF\n", inst, re.S)
 port = re.search(r'\bPORT=(\d+)\b', inst)
 if not tpl or not port: fail('cannot find the config heredoc / PORT in install.sh')
 want = json.loads(tpl.group(1).replace('$PORT', port.group(1)).replace('$OPT', opt))
 got = json.load(open(f'{ETC}/config.json'))
 if got != want: fail(f'config.json differs from install.sh for {opt}: {sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))}')
-print('ok  config.json == install.sh heredoc')
+print(f"ok  config.json == install.sh {'PAID ' if PAID else ''}heredoc")
 if sha(f'{opt}/detectors/redactor.py') != want['leak']['redactor_sha256']: fail('redactor.py differs from its pin')
 print(f'ok  redactor.py pinned {want["leak"]["redactor_sha256"][:16]}')
 
@@ -56,4 +63,30 @@ for d in ['auth', 'state', 'tmp']: owned(f'{SRV}/{d}', 'cpbridge', 'cpbridge', 0
 owned(f'{ETC}/caller.secret', 'root', 'cpbridge', 0o640)
 if os.path.getsize(f'{ETC}/caller.secret') == 0: fail('caller.secret is empty')
 owned(f'{ETC}/config.json', 'root', 'cpbridge', 0o640)
-print('VERIFIED: the installed bridge is the reviewed bytes')
+if PAID:
+    key = want['upstream']['api_key_file']
+    if os.path.normpath(key) != key or not key.startswith(ETC + '/') or key.startswith(want['state_dir'] + '/'): fail('api_key_file is not a normalised path under the config dir, outside the state dir')
+    d = os.path.dirname(key)
+    while True:   # every ancestor: a real directory, root-owned, not writable by group or others (custody.ts)
+        a = os.lstat(d)
+        if not stat.S_ISDIR(a.st_mode) or a.st_uid != 0 or stat.S_IMODE(a.st_mode) & 0o022: fail(f'key ancestor {d} is not a root-owned directory closed to group/other writes')
+        if d == '/': break
+        d = os.path.dirname(d)
+    owned(key, 'root', 'cpbridge', 0o640)
+    if not stat.S_ISREG(os.lstat(key).st_mode): fail('key file is not a regular file')
+    kb = open(key, 'rb').read(402)
+    if not re.fullmatch(rb'[\x21-\x7e]{20,400}\n?', kb): fail('key file content is not 20..400 printable ASCII characters')   # content never printed or hashed
+    print('ok  key file custody (content not shown)')
+    cpath = f"{want['state_dir']}/counters.json"
+    owned(cpath, 'cpbridge', 'cpbridge', 0o600)
+    c = json.load(open(cpath))
+    nn = lambda v: type(v) is int and 0 <= v <= 2**53 - 1
+    if not all(nn(c.get(k)) for k in ('hour_start', 'hour', 'day_start', 'day')): fail('counters.json counters are not non-negative integers')
+    sp = c.get('spend')
+    if type(sp) is not dict or not all(re.fullmatch(r'\d{4}-\d{2}-\d{2}', k) and nn(v) for k, v in sp.items()): fail('counters.json has no valid spend map')
+    if any(v > want['ceilings']['usd_micro_per_day'] for v in sp.values()): fail('a recorded day exceeds the configured ceiling')
+    print(f'ok  counters.json spend map valid ({len(sp)} day(s))')
+    for pre in ('config.json.pre-paid', 'current.pre-paid'):
+        if not os.path.isfile(f'{ETC}/{pre}') or os.path.islink(f'{ETC}/{pre}') or os.path.getsize(f'{ETC}/{pre}') == 0: fail(f'rollback preimage {pre} is missing')
+    print('ok  rollback preimages present')
+print(f"VERIFIED: the installed bridge is the reviewed bytes{' (paid mode)' if PAID else ''}")
