@@ -16,7 +16,7 @@ if [[ ${1:-} == --rollback-to ]]; then
   R=${2:?usage: install.sh --rollback-to <sha>}; step() { echo "== $(date -u +%FT%TZ) $*"; }
   [[ $R =~ ^[0-9a-f]{40}$ && -d $OPTROOT/$R && ! -L $OPTROOT/$R ]] || { echo "REFUSE: no bundle $OPTROOT/$R"; exit 1; }
   [[ $(sed -n 's/^# sha //p' $E/rollback.manifest) == "$R" ]] || { echo "REFUSE: $R is not the pinned rollback target in $E/rollback.manifest"; exit 1; }
-  grep -v '^#' $E/rollback.manifest > /tmp/s603-rb.$$; manifest_ok $OPTROOT/$R /tmp/s603-rb.$$ || { rm -f /tmp/s603-rb.$$; exit 1; }; rm -f /tmp/s603-rb.$$
+  manifest_ok $OPTROOT/$R <(grep -v '^#' $E/rollback.manifest) || exit 1   # no temp file: root never writes a predictable /tmp path
   [[ $(sha256sum < $E/rollback.config.json | cut -c1-64) == "$(sed -n 's/^# config //p' $E/rollback.manifest)" ]] || { echo "REFUSE: rollback.config.json differs from its pinned hash"; exit 1; }
   step "ROLLBACK (deliberate) to $R: stop, prove no bridge process, restore its config, swap"
   systemctl disable --now chatgpt-plan-bridge.service
