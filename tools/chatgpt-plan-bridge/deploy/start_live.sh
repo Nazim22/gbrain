@@ -48,6 +48,9 @@ $SYSTEMCTL enable --now chatgpt-plan-bridge.service chatgpt-plan-bridge-egress.t
 PID=0
 for _ in $(seq 1 20); do PID=$($SYSTEMCTL show -p MainPID --value chatgpt-plan-bridge.service || echo 0); [[ $PID =~ ^[1-9][0-9]*$ ]] && break; PID=0; $SLEEP 0.5; done
 [[ $PID != 0 ]] || fail "no main PID"
+# systemd reports MainPID at fork; while the executor sets up the sandbox, /proc/<pid>/cmdline shows a placeholder such as
+# "(bun)" until the real exec (reproduced S603 deploy 03:56Z). Wait for the exec, then bind exactly once.
+for _ in $(seq 1 40); do c=$(tr '\0' ' ' < "$PROC/$PID/cmdline" 2>/dev/null || true); [[ -n $c && $c != \(* ]] && break; $SLEEP 0.25; done
 $BIND "$PID" "$OPTROOT" "$SHA" "$E/config.json" "$PIN" "$SWAP" || fail "the running process does not bind to $SHA"
 echo "bound: pid $PID runs $OPTROOT/$SHA (script, start after swap, interpreter, config)"
 

@@ -29,10 +29,14 @@ cat > /dev/null; printf '%s\n%s' "$(cat "$FAKE/body")" "$(cat "$FAKE/code")"
 EOF
 cat > "$T/bind" <<'EOF'
 #!/bin/bash
+# a real bind would read /proc: refuse while the placeholder is still there
+[[ -e $FAKE/proc/4242/cmdline ]] && [[ $(tr '\0' ' ' < "$FAKE/proc/4242/cmdline") == \(* ]] && exit 1
 exit $(cat "$FAKE/bind_rc")
 EOF
 cat > "$T/sleep" <<'EOF'
 #!/bin/bash
+# simulates the exec: the first sleep after the placeholder appears turns it into the real cmdline (unless "stuck")
+[[ -e $FAKE/proc/4242/cmdline && ! -e $FAKE/stuck ]] && printf '%s\0' real-exec > "$FAKE/proc/4242/cmdline"
 exit 0
 EOF
 chmod +x "$T"/{systemctl,pgrep,curl,bind,sleep}
@@ -46,7 +50,7 @@ case_() {   # <name> <want-rc: 0|1> <grep-pattern-that-must-appear> [setup files
   echo 200 > "$F/code"; echo 0 > "$F/bind_rc"
   printf '{"halted":null,"routes":["gpt-6-luna@medium"],"identity":{"script_sha256":"%s","config_sha256":"%s"}}' "$JS" "$PIN" > "$F/body"
   for s in "$@"; do eval "$s"; done
-  FAKE=$F OPTROOT=$F/opt ETC=$F/etc LEDGER=$F/ledger SYSTEMCTL=$T/systemctl PGREP=$T/pgrep CURL=$T/curl BIND=$T/bind SLEEP=$T/sleep \
+  FAKE=$F PROC=$F/proc OPTROOT=$F/opt ETC=$F/etc LEDGER=$F/ledger SYSTEMCTL=$T/systemctl PGREP=$T/pgrep CURL=$T/curl BIND=$T/bind SLEEP=$T/sleep \
     bash "$HERE/start_live.sh" "$SHA" > "$T/out" 2>&1; local rc=$?
   if { [[ $want == 0 && $rc == 0 ]] || [[ $want != 0 && $rc != 0 ]]; } && grep -q -- "$pat" "$T/out"; then ok "$name"; else bad "$name (rc=$rc)"; fi
 }
@@ -63,6 +67,8 @@ case_ 'halted latch in status is contained' 1 'STOP: status or startup identity 
 case_ 'stop failure: CONTAINMENT UNKNOWN' 1 'CONTAINMENT UNKNOWN: systemctl stop failed' 'echo 1 > $F/bind_rc' 'touch $F/stop_fail'
 case_ 'unit still active after stop: CONTAINMENT UNKNOWN' 1 'CONTAINMENT UNKNOWN: unit not inactive' 'echo 1 > $F/bind_rc' 'touch $F/stop_noop'
 case_ 'process remains after stop: CONTAINMENT UNKNOWN' 1 'CONTAINMENT UNKNOWN: a cpbridge process remains' 'echo 1 > $F/bind_rc' 'touch $F/proc_left'
+case_ 'pre-exec placeholder clears: waits, then binds' 0 'live on' 'mkdir -p $F/proc/4242' "printf '%s\\0' '(bun)' > \$F/proc/4242/cmdline"
+case_ 'placeholder never clears: bind refused and contained' 1 'contained: unit inactive' 'mkdir -p $F/proc/4242' "printf '%s\\0' '(bun)' > \$F/proc/4242/cmdline" 'touch $F/stuck'
 grep -q '{"b":2}' "$T/out" && { echo "FAIL old ledger rows printed as 'since start'"; fails=$((fails+1)); } || echo "PASS only rows written since start are printed"
 
 echo "$fails failure(s)"; exit $(( fails > 0 ))
