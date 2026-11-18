@@ -74,7 +74,7 @@ require_descendant() {   # <repo> <deployed-sha> <head-sha>
 }
 # Hashes of every file the bundle runs with, relative to the bundle dir, plus the system gitleaks by absolute path.
 manifest_of() {   # <bundle-dir>
-  (cd "$1" && sha256sum bridge.js bun detectors/* && sha256sum "$GITLEAKS")
+  (cd "$1" && sha256sum bridge.js bun egress.sh init_spend.py detectors/* && sha256sum "$GITLEAKS")   # every file root or the bridge executes
 }
 manifest_ok() {   # <bundle-dir> <manifest-file>
   (cd "$1" && sha256sum --quiet -c "$2") || { echo "REFUSE: $1 does not match $2" >&2; return 1; }
@@ -108,5 +108,24 @@ import hashlib, json, sys
 c = json.load(open(sys.argv[1]))['leak']; b = sys.argv[2]
 assert c['redactor'] == f'{b}/detectors/redactor.py' and c['detector_check'] == f'{b}/detectors/detector_check.py'
 assert hashlib.sha256(open(c['redactor'], 'rb').read()).hexdigest() == c['redactor_sha256']
+PY
+}
+
+# Upgrade: keep every setting of the running config and repoint ONLY leak.redactor / leak.detector_check, which must be
+# exactly the deployed bundle's. Written to a 0640-umask temp file, fsynced, then renamed over the config.
+repoint_config() {   # <config> <old-bundle-dir> <new-bundle-dir>
+  python3 -I - "$1" "$2" "$3" <<'PY'
+import json, os, sys
+path, old, new = sys.argv[1:]; os.umask(0o027)
+c = json.load(open(path))
+assert c.get('upstream', {}).get('auth') == 'api_key', 'not a paid config'
+for k, f in (('redactor', 'redactor.py'), ('detector_check', 'detector_check.py')):
+    assert c['leak'][k] == f'{old}/detectors/{f}', f'leak.{k} = {c["leak"][k]!r} is not the deployed bundle\'s'
+    c['leak'][k] = f'{new}/detectors/{f}'
+tmp = path + '.s603-new'
+with open(tmp, 'w') as fh:
+    json.dump(c, fh, indent=2); fh.write('\n'); fh.flush(); os.fsync(fh.fileno())
+os.replace(tmp, path)
+print('config preserved; detector paths ->', new)
 PY
 }

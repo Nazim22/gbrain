@@ -10,7 +10,7 @@
 # S603: install.sh --rollback-to <sha>  = deliberate rollback to the bundle pinned in rollback.manifest (no build, no
 # HEAD checks); it leaves the bridge STOPPED. start_live.sh starts either direction and binds the running process.
 set -euo pipefail
-OPTROOT=/opt/chatgpt-plan-bridge; E=/etc/chatgpt-plan-bridge
+OPTROOT=${OPTROOT:-/opt/chatgpt-plan-bridge}; E=${ETC:-/etc/chatgpt-plan-bridge}   # overridable only for install_guard.test.sh
 source "$(cd "$(dirname "$0")" && pwd)/canary_lib.sh"
 if [[ ${1:-} == --rollback-to ]]; then
   R=${2:?usage: install.sh --rollback-to <sha>}; step() { echo "== $(date -u +%FT%TZ) $*"; }
@@ -32,7 +32,7 @@ W=$1 WANT=$2 MODE=${3:-plan}
 [[ $MODE == plan || $MODE == paid ]] || { echo "mode must be plan or paid"; exit 1; }
 HEAD=$(git -C "$W" rev-parse HEAD); [[ $HEAD == "$WANT" ]] || { echo "HEAD $HEAD != expected $WANT"; exit 1; }
 [[ -z $(git -C "$W" status --porcelain) ]] || { echo "worktree not clean"; exit 1; }
-SRC=$W/tools/chatgpt-plan-bridge; OPT=/opt/chatgpt-plan-bridge/$HEAD; PORT=18795
+SRC=$W/tools/chatgpt-plan-bridge; OPT=$OPTROOT/$HEAD; PORT=18795
 step() { echo "== $(date -u +%FT%TZ) $*"; }
 # S603 guards: a known deployed identity, the candidate must contain it, and an existing bundle is never rebuilt.
 if [[ -e $OPTROOT/current || -L $OPTROOT/current ]]; then
@@ -42,7 +42,11 @@ if [[ -e $OPTROOT/current || -L $OPTROOT/current ]]; then
 else
   DEPLOYED=""; echo "first install: no current bundle"
 fi
+# S603 (Pebble SOURCE HOLD): the plan path starts the service directly, without start_live's containment and binding.
+# This host has run paid since S593, so a plan install over a deployed bundle is refused rather than left unguarded.
+[[ $MODE == paid || -z $DEPLOYED ]] || { echo "REFUSE: plan-mode install over a deployed bundle is unsupported (use paid, or --rollback-to)"; exit 1; }
 [[ ! -e $OPT ]] || { echo "REFUSE: $OPT already exists; a bundle is never rebuilt in place"; exit 1; }
+[[ ${S603_GUARDS_ONLY:-} != 1 ]] || { echo "GUARDS PASSED (test seam: stopping before any system change)"; exit 0; }
 
 if [[ $MODE == paid ]]; then
   step "paid: stop the bridge and prove nothing of it runs (no writer may touch the state during migration)"
@@ -146,6 +150,11 @@ else
   sync "$tmpkey"; mv -n "$tmpkey" "$KEY"; sync /etc/chatgpt-plan-bridge; echo "key file installed (root:cpbridge 0640)"
 fi
 rm -f "$tmpkey"; trap - EXIT; umask 022
+if [[ -n $DEPLOYED ]]; then
+# S603: an upgrade keeps every setting of the running config and repoints ONLY the two detector paths, which must be the
+# deployed bundle's own. Anything else unexpected refuses before the file is replaced.
+repoint_config "$E/config.json" "$OPTROOT/$DEPLOYED" "$OPT" || { echo "REFUSE: the running config is not a paid config whose detector paths are the deployed bundle's"; exit 1; }
+else
 cat > /etc/chatgpt-plan-bridge/config.json <<EOF_PAID
 { "port": $PORT, "caller_secret_file": "/etc/chatgpt-plan-bridge/caller.secret",
   "state_dir": "/srv/chatgpt-plan-bridge/state", "auth_dir": "/srv/chatgpt-plan-bridge/auth",
@@ -158,6 +167,7 @@ cat > /etc/chatgpt-plan-bridge/config.json <<EOF_PAID
             "redactor_sha256": "425615c099e23da64053e1b2d700d252dc52ee193fc45381dfb3bc161aa6ee2d", "gitleaks": "/usr/local/bin/gitleaks",
             "tmp_dir": "/srv/chatgpt-plan-bridge/tmp", "timeout_ms": 20000 } }
 EOF_PAID
+fi
 else
 cat > /etc/chatgpt-plan-bridge/config.json <<EOF
 { "port": $PORT, "caller_secret_file": "/etc/chatgpt-plan-bridge/caller.secret",

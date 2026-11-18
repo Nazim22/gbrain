@@ -9,7 +9,7 @@ expect() { local want=$1 name=$2; shift 2; if "$@" >/dev/null 2>&1; then [[ $wan
 export PROC=$T/proc GITLEAKS=$T/gitleaks CLK_TCK=100
 source "$HERE/canary_lib.sh"
 OPT=$T/opt; A=$(printf 'a%.0s' {1..40}); B=$(printf 'b%.0s' {1..40}); echo gl > $GITLEAKS
-for s in $A $B; do mkdir -p $OPT/$s/detectors; echo "js-$s" > $OPT/$s/bridge.js; echo bun > $OPT/$s/bun; echo "redactor-$s" > $OPT/$s/detectors/redactor.py; echo dc > $OPT/$s/detectors/detector_check.py; done
+for s in $A $B; do mkdir -p $OPT/$s/detectors; echo "js-$s" > $OPT/$s/bridge.js; echo bun > $OPT/$s/bun; echo "redactor-$s" > $OPT/$s/detectors/redactor.py; echo dc > $OPT/$s/detectors/detector_check.py; echo eg > $OPT/$s/egress.sh; echo is > $OPT/$s/init_spend.py; done
 ln -s $OPT/$B $OPT/current
 cfg() { python3 -I -c "import hashlib,json,sys; b=sys.argv[1]; r=f'{b}/detectors/redactor.py'; print(json.dumps({'leak':{'redactor':r,'detector_check':f'{b}/detectors/detector_check.py','redactor_sha256':hashlib.sha256(open(r,'rb').read()).hexdigest()}}))" "$1"; }
 CFG=$T/config.json; cfg $OPT/$B > $CFG; PIN=$(sha256sum < $CFG | cut -c1-64)
