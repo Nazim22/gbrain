@@ -27,6 +27,7 @@ export type Deps = {
   mask: (parts: string[]) => Promise<MaskResult>;   // gitleaks hits only; see leakgate.ts maskGitleaks
   limits: Limits;
   callerSecret: Buffer;
+  identity?: Record<string, string>;   // S603: startup hashes of the loaded script + config (main.ts), reported on status
   now?: () => number;
 };
 // Appended to the instructions of a masked request so the model never states a marker, or what it hid, as a fact.
@@ -76,7 +77,7 @@ export function makeHandler(cfg: Config, d: Deps) {
   return async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     if (!authorized(req)) return err(401, 'caller_unauthorized');
-    if (req.method === 'GET' && url.pathname === '/v1/bridge/status') return json(200, { limits: d.limits.snapshot(), routes: Object.keys(cfg.routes), halted: halted() });
+    if (req.method === 'GET' && url.pathname === '/v1/bridge/status') return json(200, { limits: d.limits.snapshot(), routes: Object.keys(cfg.routes), halted: halted(), identity: d.identity ?? null });
     if (req.method !== 'POST' || url.pathname !== '/v1/chat/completions') return err(404, 'not_found');
     const id = randomUUID(), started = now();
     // Halt latch: once a stop-class event happened, nothing reaches upstream until an operator clears halted.json.
@@ -91,10 +92,12 @@ export function makeHandler(cfg: Config, d: Deps) {
     const base: Record<string, unknown> = { id, alias: parsed.alias, model: parsed.route.model, effort: parsed.route.effort, instructions_sha256: sha(parsed.instructions), input_sha256: sha(JSON.stringify(parsed.input)) };
 
     const unavailable = () => { ledger({ ...base, status: 503, code: 'leak_gate_unavailable' }); trip('leak_gate_unavailable', id); return err(503, 'leak_gate_unavailable', 'leak gate unavailable; not sent', { 'retry-after': '60' }); };
+    // S603: a refusal is final for this content (the same bytes are refused again), so it is a 400 content block that
+    // callers retire, never a retryable 503. innererror.code is the OpenAI/Azure content-policy shape gbrain classifies.
     const refuse = (detector: string, rules: string[], stage: string) => {
       quarantine({ id, alias: parsed.alias, input_sha256: base.input_sha256, detector, rules, stage });
-      ledger({ ...base, status: 503, code: 'leak_quarantine', stage });
-      return err(503, 'leak_quarantine', 'outbound text matched the leak gate; not sent', { 'retry-after': '3600' });
+      ledger({ ...base, status: 400, code: 'leak_quarantine', stage });
+      return json(400, { error: { code: 'leak_quarantine', message: 'outbound text matched the leak gate; not sent', type: 'invalid_request_error', innererror: { code: 'content_policy_violation' } } });
     };
     // S590 mask-and-send: a gitleaks hit is masked once, the final outbound projection is rescanned by both detectors,
     // and only a clean rescan is sent. Redactor hits, unmaskable findings and a dirty rescan quarantine as before.
@@ -188,8 +191,8 @@ export const PAID_ROUTES: Record<string, { min_input_tokens: number; max_output_
 export const OWNER_CAP_MICRO = 10_000_000;
 const SANE_MAX = 1_000_000_000;   // keeps every product and sum far inside exact integer range
 
-export function loadConfig(path: string): Config {
-  const c = JSON.parse(readFileSync(path, 'utf8')) as Config;
+export function loadConfig(path: string, text = readFileSync(path, 'utf8')): Config {
+  const c = JSON.parse(text) as Config;
   if (!Number.isInteger(c.port) || !c.routes || !Object.keys(c.routes).length) throw Error('CONFIG');
   for (const r of Object.values(c.routes)) if (!r.model || !r.effort || !(r.max_output_chars > 0)) throw Error('CONFIG-ROUTE');
   const auth = c.upstream?.auth ?? 'plan';

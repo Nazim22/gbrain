@@ -75,10 +75,12 @@ test('character bound: a stream cut at max_output_chars before its terminal even
   expect(parseStream(raw, false)).toEqual({ kind: 'unknown' });
 });
 
-test('leak hit quarantines: transient 503, nothing sent, a quarantine row without text', async () => {
+test('S603 leak hit quarantines: final 400 content block (no retry-after), nothing sent, a quarantine row without text', async () => {
   const s = setup({ scan: async () => ({ clean: false, detector: 'redactor', rules: ['3'] }) });
   const r = await s.post({ ...ok, messages: [{ role: 'user', content: 'SECRET-MARKER-xyz' }] });
-  expect(r.status).toBe(503); expect((await r.json()).error.code).toBe('leak_quarantine'); expect(s.calls.length).toBe(0);
+  expect(r.status).toBe(400); expect(r.headers.get('retry-after')).toBeNull(); expect(s.calls.length).toBe(0);
+  expect((await r.json()).error).toEqual({ code: 'leak_quarantine', message: 'outbound text matched the leak gate; not sent', type: 'invalid_request_error', innererror: { code: 'content_policy_violation' } });
+  expect(ledgerRows(s.dir).at(-1)).toMatchObject({ status: 400, code: 'leak_quarantine', stage: 'scan' });
   const q = readFileSync(join(s.dir, 'quarantine.jsonl'), 'utf8'); expect(q).toContain('"detector":"redactor"'); expect(q).not.toContain('SECRET-MARKER');
   expect(readFileSync(join(s.dir, 'requests.jsonl'), 'utf8')).not.toContain('SECRET-MARKER');
 });
@@ -155,7 +157,7 @@ test('halt latch: the first stop-class event trips it; later requests never reac
 
 test('halt latch: non-stop errors (busy, leak quarantine, provider limits) do not trip it', async () => {
   const s = setup({ scan: async () => ({ clean: false, detector: 'redactor', rules: ['2'] }) });
-  expect((await s.post(ok)).status).toBe(503);
+  expect((await s.post(ok)).status).toBe(400);
   const { existsSync: ex } = await import('node:fs');
   expect(ex(join(s.dir, 'halted.json'))).toBe(false);
 });
@@ -210,14 +212,14 @@ test('mask-and-send: a gitleaks hit is masked, the final outbound projection is 
 test('mask-and-send refusals send nothing: redactor hit, unmaskable, part-count mismatch, dirty rescan', async () => {
   let masks = 0;
   const red = setup({ scan: async () => ({ clean: false, detector: 'redactor', rules: ['2'] }), mask: async () => { masks++; return { parts: [], rules: [], spans: 0 }; } });
-  expect((await red.post(ok)).status).toBe(503); expect(masks).toBe(0); expect(red.calls.length).toBe(0);
+  expect((await red.post(ok)).status).toBe(400); expect(masks).toBe(0); expect(red.calls.length).toBe(0);
   const un = setup({ scan: async () => gl, mask: async () => ({ unmaskable: 'cross_part_or_unmatched' }) });
-  const r = await un.post(ok); expect(r.status).toBe(503); expect((await r.json()).error.code).toBe('leak_quarantine'); expect(un.calls.length).toBe(0);
+  const r = await un.post(ok); expect(r.status).toBe(400); expect((await r.json()).error.innererror.code).toBe('content_policy_violation'); expect(un.calls.length).toBe(0);
   expect(readFileSync(join(un.dir, 'quarantine.jsonl'), 'utf8')).toContain('"stage":"cross_part_or_unmatched"');
   const pc = setup({ scan: async () => gl, mask: async () => ({ parts: ['SYS'], rules: ['generic-api-key'], spans: 1 }) });
-  expect((await pc.post(ok)).status).toBe(503); expect(pc.calls.length).toBe(0);
+  expect((await pc.post(ok)).status).toBe(400); expect(pc.calls.length).toBe(0);
   const dirty = setup({ scan: async () => gl, mask: async p => ({ parts: p, rules: ['generic-api-key'], spans: 1 }) });
-  expect((await dirty.post(ok)).status).toBe(503); expect(dirty.calls.length).toBe(0);
+  expect((await dirty.post(ok)).status).toBe(400); expect(dirty.calls.length).toBe(0);
   expect(readFileSync(join(dirty.dir, 'quarantine.jsonl'), 'utf8')).toContain('"stage":"rescan"');
   expect(existsSync(join(dirty.dir, 'halted.json'))).toBe(false);
 });
@@ -242,7 +244,7 @@ test('real pinned detectors through the handler: a gitleaks-only false positive 
   expect(r.status).toBe(200); expect(a.calls.length).toBe(1);
   expect(JSON.stringify(a.calls[0].body)).not.toContain(fp);
   expect(a.calls[0].body.input[0].content).toBe('product row\n  icon_key: "[REDACTED-BY-BRIDGE:generic-api-key]"\n  name: Rip It Citrus');
-  const b = real(); expect((await b.post({ ...ok, messages: [{ role: 'user', content: 'apiKey = "' + 'Zx81Kq3Lm9Pv2Rt7Wy4Nc6' + '"' }] })).status).toBe(503); expect(b.calls.length).toBe(0);
+  const b = real(); expect((await b.post({ ...ok, messages: [{ role: 'user', content: 'apiKey = "' + 'Zx81Kq3Lm9Pv2Rt7Wy4Nc6' + '"' }] })).status).toBe(400); expect(b.calls.length).toBe(0);
   const c = real(); expect((await c.post(ok)).status).toBe(200);
   expect(c.calls[0].body).toEqual({ model: 'gpt-6-luna', instructions: 'SYS', input: [{ role: 'user', content: 'USER' }], stream: true, store: false, reasoning: { effort: 'medium' } });
   expect(readdirSync(tmp)).toEqual([]);
@@ -270,3 +272,13 @@ test('real maskGitleaks and scan return an error result, never reject, when the 
   expect(await maskGitleaks(['SYS', 'USER'], cfg)).toEqual({ error: 'gitleaks_failed' });
   expect(await scan('The parser reads output_item.done.', cfg)).toEqual({ error: 'gitleaks_failed' });
 }, 60_000);
+
+test('S603 status reports the startup identity main.ts hashed, or null when none was given', async () => {
+  const st = async (h: (r: Request) => Promise<Response>) => (await h(new Request('http://127.0.0.1/v1/bridge/status', { headers: { authorization: `Bearer ${SECRET}` } }))).json();
+  expect((await st(setup().h)).identity).toBeNull();
+  const dir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'bridge-id-'));
+  const cfg = { ...setup().cfg, state_dir: dir };
+  const identity = { script_path: '/opt/x/bridge.js', script_sha256: 'a'.repeat(64), config_sha256: 'b'.repeat(64) };
+  const h = makeHandler(cfg, { callerSecret: Buffer.from(SECRET), limits: new Limits(join(dir, 'counters.json'), cfg.ceilings), accessToken: async () => 't', scan: async () => ({ clean: true }), mask: async () => ({ unmaskable: 'x' }), upstream: async () => { throw Error('no'); }, identity });
+  expect((await st(h)).identity).toEqual(identity);
+});

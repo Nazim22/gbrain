@@ -6,7 +6,7 @@ import { expect, test } from 'bun:test';
 import { afterAll } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadConfig, makeHandler, type Config } from './bridge.ts';
+import { loadConfig, makeHandler, MASK_NOTE, type Config } from './bridge.ts';
 import { costMicro, reservationMicro } from './contract.ts';
 import { BudgetStateError, Limits } from './limits.ts';
 import { CustodyError, readKeyFile } from './custody.ts';
@@ -26,7 +26,7 @@ const state = (dir: string) => JSON.parse(readFileSync(join(dir, 'counters.json'
 const rows = (dir: string) => readFileSync(join(dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
 const body = { model: 'gpt-6-luna', messages: [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'USER' }] };
 
-function setup(o: Partial<{ upstream: (b: any) => Promise<Upstream>; cap: number; spend: Record<string, number> | null; counters: string | null; now: () => number; auth: 'plan' | 'api_key'; concurrency: number }> = {}) {
+function setup(o: Partial<{ upstream: (b: any) => Promise<Upstream>; cap: number; spend: Record<string, number> | null; counters: string | null; now: () => number; auth: 'plan' | 'api_key'; concurrency: number; scan: (t: string) => Promise<any>; mask: (p: string[]) => Promise<any>; body: unknown }> = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'budget-test-'));
   const t0 = Date.parse('2026-11-15T12:00:00Z'), now = o.now ?? (() => t0);
   if (o.counters !== null) writeFileSync(join(dir, 'counters.json'), o.counters ?? JSON.stringify({ hour_start: now(), hour: 0, day_start: now(), day: 0, ...(o.spend === null ? {} : { spend: o.spend ?? {} }) }));
@@ -35,9 +35,9 @@ function setup(o: Partial<{ upstream: (b: any) => Promise<Upstream>; cap: number
     upstream: { connect_ms: 1000, request_ms: 1000, auth: o.auth ?? 'api_key', api_key_file: '/x' }, leak: {} as any };
   const calls: any[] = [];
   const limits = new Limits(join(dir, 'counters.json'), cfg.ceilings, now);
-  const h = makeHandler(cfg, { callerSecret: Buffer.from(SECRET), limits, now, accessToken: async () => 'sk-test', scan: async () => ({ clean: true }),
+  const h = makeHandler(cfg, { callerSecret: Buffer.from(SECRET), limits, now, accessToken: async () => 'sk-test', scan: o.scan ?? (async () => ({ clean: true })), mask: o.mask ?? (async () => ({ unmaskable: 'test_default' })),
     upstream: async (b, token) => { calls.push({ body: b, token }); return o.upstream ? o.upstream(b) : ok200(); } });
-  const post = () => h(new Request('http://127.0.0.1/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${SECRET}` }, body: JSON.stringify(body) }));
+  const post = () => h(new Request('http://127.0.0.1/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${SECRET}` }, body: JSON.stringify(o.body ?? body) }));
   return { dir, post, calls, limits, cfg };
 }
 
@@ -373,3 +373,34 @@ test.skipIf(UID !== 0)('main.ts in paid mode: a bad key file refuses to start wi
   d2.kill('SIGTERM'); await d2.exited;
   expect(existsSync(join(dir, 'no-such-auth-dir'))).toBe(false);
 }, 60_000);
+
+// S603: S590 masking re-landed on the paid branch. The masked request is converted to the PAID body, the rescan reads the
+// exact projection that is sent, and the sentinel never reaches upstream.
+test('S603 paid mode: a gitleaks hit is masked before the paid conversion; the rescanned text is the sent paid body; sentinel absent', async () => {
+  const scanned: string[] = []; let n = 0;
+  const s = setup({
+    scan: async t => { scanned.push(t); return n++ === 0 ? { clean: false, detector: 'gitleaks', rules: ['generic-api-key'] } : { clean: true }; },
+    mask: async p => ({ parts: p.map(x => x.replace('SENTINEL-S603-0000', '[REDACTED-BY-BRIDGE:generic-api-key]')), rules: ['generic-api-key'], spans: 1 }),
+    body: { model: 'gpt-6-luna', messages: [{ role: 'system', content: 'SYS' }, { role: 'user', content: 'icon_key: SENTINEL-S603-0000' }] },
+  });
+  const r = await s.post();
+  expect(r.status).toBe(200); expect(r.headers.get('x-bridge-masked')).toBe('generic-api-key');
+  expect(s.calls.length).toBe(1);
+  const sent = s.calls[0].body;
+  expect(JSON.stringify(sent)).not.toContain('SENTINEL-S603-0000');
+  expect(sent).toMatchObject({ max_output_tokens: route.max_output_tokens, service_tier: 'default', prompt_cache_options: { mode: 'explicit' } });
+  expect(sent.instructions).toBe('SYS' + MASK_NOTE);
+  expect(sent.input).toEqual([{ role: 'user', content: 'icon_key: [REDACTED-BY-BRIDGE:generic-api-key]' }]);
+  expect(scanned[1]).toBe([sent.instructions, ...sent.input.map((m: any) => m.content)].join('\n\n'));
+  const row = rows(s.dir).at(-1); expect(row.masked).toEqual({ rules: ['generic-api-key'], spans: 1 }); expect(row.settled).toBe(true);
+  expect(readFileSync(join(s.dir, 'requests.jsonl'), 'utf8')).not.toContain('SENTINEL-S603-0000');
+});
+
+test('S603 paid mode: a residual refusal is a 400 content block and reserves nothing', async () => {
+  const s = setup({ scan: async () => ({ clean: false, detector: 'redactor', rules: ['2'] }) });
+  const before = state(s.dir);
+  const r = await s.post();
+  expect(r.status).toBe(400); expect(r.headers.get('retry-after')).toBeNull();
+  expect((await r.json()).error.innererror.code).toBe('content_policy_violation');
+  expect(s.calls.length).toBe(0); expect(state(s.dir)).toEqual(before);
+});
