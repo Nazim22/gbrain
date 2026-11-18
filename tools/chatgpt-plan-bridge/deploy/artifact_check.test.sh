@@ -21,10 +21,18 @@ print(json.dumps({"port": 0, "state_dir": "", "auth_dir": "", "routes": {"gpt-6-
   "redactor": f"{b}/detectors/redactor.py", "redactor_sha256": "425615c099e23da64053e1b2d700d252dc52ee193fc45381dfb3bc161aa6ee2d",
   "gitleaks": "/usr/local/bin/gitleaks", "tmp_dir": "", "timeout_ms": 20000}}))
 PY
-run() { "$BUN" "$HERE/artifact_check.ts" "$1" "$T/config.json" > "$T/out.txt" 2>&1; }
+python3 -I - "$T/config.json" "$T/paid-config.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c['routes']['gpt-6-luna@medium'].update({"max_input_tokens": 1050000, "max_output_tokens": 16000, "price_micro_per_mtok": {"input": 250000, "output": 750000}})
+c['ceilings']['usd_micro_per_day'] = 10000000; c['upstream']['auth'] = 'api_key'
+json.dump(c, open(sys.argv[2], 'w'))
+PY
+run() { "$BUN" "$HERE/artifact_check.ts" "$1" "${2:-$T/config.json}" > "$T/out.txt" 2>&1; }
 
 (cd "$W" && "$BUN" build tools/chatgpt-plan-bridge/main.ts --target=bun --outfile "$T/head.js" >/dev/null)
-if run "$T/head.js"; then echo "PASS HEAD bundle passes"; else echo "FAIL HEAD bundle"; cat "$T/out.txt"; fails=$((fails+1)); fi
+if run "$T/head.js"; then echo "PASS HEAD bundle passes (plan config)"; else echo "FAIL HEAD bundle (plan)"; cat "$T/out.txt"; fails=$((fails+1)); fi
+if run "$T/head.js" "$T/paid-config.json" && grep -q '^PASS (a) paid mode: the sent body is the paid shape' "$T/out.txt" && grep -q '^PASS (a) the rescanned text is exactly' "$T/out.txt"; then echo "PASS HEAD bundle passes (paid config: paid body masked, rescan == sent)"; else echo "FAIL HEAD bundle (paid)"; cat "$T/out.txt"; fails=$((fails+1)); fi
 
 cp -r "$TOOL" "$SAB"
 python3 -I - "$SAB/bridge.ts" <<'PY'
@@ -35,6 +43,7 @@ s, n2 = re.subn(r"\n *if \(!again\.clean\) return refuse\(again\.detector, again
 assert n1 == 1 and n2 == 1, (n1, n2); open(p, 'w').write(s)
 PY
 (cd "$W" && "$BUN" build "tools/chatgpt-plan-bridge-sabotage-$$/main.ts" --target=bun --outfile "$T/sab.js" >/dev/null)
+if run "$T/sab.js" "$T/paid-config.json"; then echo "FAIL sabotaged bundle passed (paid)"; cat "$T/out.txt"; fails=$((fails+1)); else echo "PASS sabotaged bundle fails (paid config)"; fi
 if run "$T/sab.js"; then echo "FAIL sabotaged bundle passed"; cat "$T/out.txt"; fails=$((fails+1));
 elif grep -q '^FAIL (a) sent body carries no sentinel' "$T/out.txt"; then echo "PASS sabotaged bundle fails on (a): the sentinel reached the sent body";
 else echo "FAIL sabotaged bundle failed for another reason"; cat "$T/out.txt"; fails=$((fails+1)); fi

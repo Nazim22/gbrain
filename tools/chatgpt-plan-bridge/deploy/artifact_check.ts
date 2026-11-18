@@ -27,6 +27,7 @@ const okStream = ev('response.output_item.done', { item: { type: 'message', role
   + ev('response.completed', { response: { status: 'completed', model: 'gpt-6-luna', output: [], usage: { input_tokens: 10, output_tokens: 5 }, service_tier: 'default' } });
 const alias = Object.keys(live.routes)[0];
 
+const paid = live.upstream?.auth === 'api_key';
 function handler(over: { scan?: (t: string) => Promise<any> } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 's603-artifact-'));
   const tmp = mkdtempSync(join(dir, 'tmp-'));
@@ -34,16 +35,16 @@ function handler(over: { scan?: (t: string) => Promise<any> } = {}) {
   writeFileSync(join(dir, 'counters.json'), JSON.stringify({ hour_start: now, hour: 0, day_start: now, day: 0, spend: {} }));
   const leak = { ...live.leak, tmp_dir: tmp };
   const cfg = { ...live, state_dir: dir, leak };
-  const calls: any[] = [];
+  const calls: any[] = []; const scanned: string[] = [];
   const h = makeHandler(cfg, {
     callerSecret: Buffer.from(SECRET), limits: new Limits(join(dir, 'counters.json'), cfg.ceilings),
     accessToken: async () => 'artifact-check-token',
-    scan: over.scan ?? ((t: string) => scan(t, leak)), mask: (p: string[]) => maskGitleaks(p, leak),
+    scan: over.scan ?? ((t: string) => { scanned.push(t); return scan(t, leak); }), mask: (p: string[]) => maskGitleaks(p, leak),
     upstream: async (body: any) => { calls.push(body); return { status: 200, raw: Buffer.from(okStream), charCapHit: false }; },
   });
   const post = (content: string) => h(new Request('http://127.0.0.1/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${SECRET}` },
     body: JSON.stringify({ model: alias, messages: [{ role: 'system', content: 'Extract atoms.' }, { role: 'user', content }] }) }));
-  return { dir, calls, post };
+  return { dir, calls, post, scanned };
 }
 
 // Fixtures are the real-detector ones from bridge.test.ts: a gitleaks-only generic-api-key hit, and a redactor hit.
@@ -55,6 +56,11 @@ try {
   const sentA = JSON.stringify(a.calls[0] ?? {});
   check('(a) gitleaks hit: 200, masked header, one send', ra.status === 200 && ra.headers.get('x-bridge-masked') === 'generic-api-key' && a.calls.length === 1);
   check('(a) sent body carries no sentinel and does carry the mask marker', !sentA.includes(GL) && sentA.includes('[REDACTED-BY-BRIDGE:generic-api-key]'));
+  const sentText = a.calls[0] ? [a.calls[0].instructions, ...a.calls[0].input.map((m: any) => m.content)].join('\n\n') : '';
+  check('(a) the rescanned text is exactly the text of the body that was sent', a.scanned.length === 2 && a.scanned[1] === sentText);
+  if (paid) check('(a) paid mode: the sent body is the paid shape (output cap, default tier, explicit caching)',
+    a.calls[0]?.service_tier === 'default' && Number.isInteger(a.calls[0]?.max_output_tokens) && a.calls[0]?.prompt_cache_options?.mode === 'explicit');
+  console.log(`mode ${paid ? 'paid' : 'plan'}`);
   const rowA = readFileSync(join(a.dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).at(-1);
   check('(a) ledger row records masked, without the sentinel', !!rowA?.masked && !JSON.stringify(rowA).includes(GL));
 
