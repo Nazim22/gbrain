@@ -52,8 +52,24 @@ tpl = re.search(r"cat > /etc/chatgpt-plan-bridge/config.json <<EOF_PAID\n(.*?)\n
 port = re.search(r'\bPORT=(\d+)\b', inst)
 if not tpl or not port: fail('cannot find the config heredoc / PORT in install.sh')
 want = json.loads(tpl.group(1).replace('$PORT', port.group(1)).replace('$OPT', opt))
+# S603 upgrade: install.sh preserves the running config (repoint_config). The expected config is then the PINNED
+# pre-upgrade config with only the two detector paths moved to this bundle, never the fresh-install template. Every check
+# below (redactor pin, key custody, state dir, ceilings) runs on that expected config.
+_mode = f'{ETC}/swap.mode'
+if os.path.exists(f'{ETC}/rollback.manifest') and os.path.exists(_mode) and open(_mode).read().strip() == 'forward':
+    _lines = open(f'{ETC}/rollback.manifest').read().splitlines()
+    _old = next((l[len('# sha '):] for l in _lines if l.startswith('# sha ')), None)
+    _cpin = next((l[len('# config '):] for l in _lines if l.startswith('# config ')), None)
+    if not _old or not re.fullmatch(r'[0-9a-f]{40}', _old) or not _cpin: fail('the upgrade pin (rollback.manifest) is incomplete')
+    if sha(f'{ETC}/rollback.config.json') != _cpin: fail('rollback.config.json differs from its pinned hash')
+    if f'{OPT_ROOT}/{_old}' != opt:
+        want = json.load(open(f'{ETC}/rollback.config.json'))
+        for _k, _f in (('redactor', 'redactor.py'), ('detector_check', 'detector_check.py')):
+            if want['leak'][_k] != f'{OPT_ROOT}/{_old}/detectors/{_f}': fail(f'pinned config leak.{_k} is not the pinned bundle\'s')
+            want['leak'][_k] = f'{opt}/detectors/{_f}'
+        print(f'ok  upgrade from {_old[:12]}: expecting the pinned pre-upgrade config with only the detector paths moved')
 got = json.load(open(f'{ETC}/config.json'))
-if got != want: fail(f'config.json differs from install.sh for {opt}: {sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))}')
+if got != want: fail(f'config.json differs from the expected config for {opt}: {sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))}')
 print(f"ok  config.json == install.sh {'PAID ' if PAID else ''}heredoc")
 if sha(f'{opt}/detectors/redactor.py') != want['leak']['redactor_sha256']: fail('redactor.py differs from its pin')
 print(f'ok  redactor.py pinned {want["leak"]["redactor_sha256"][:16]}')
