@@ -56,3 +56,57 @@ canary_cleanup() {   # <incoming-rc> <unit> <egress.sh> <canary-config> <evidenc
   [[ $rc != 0 ]] || rc=1
   return "$rc"
 }
+
+# ---- S603: deploy identity, ancestry, manifests, atomic swap and running-process binding ------------------------------
+# Every function takes its roots as arguments (tests run them on scratch dirs) and prints REFUSE/STOP reasons itself.
+: "${PROC:=/proc}" "${GITLEAKS:=/usr/local/bin/gitleaks}"
+
+# The sha the deployed 'current' names. Only <optroot>/<40-hex> is a known identity; anything else refuses.
+deployed_sha() {   # <optroot>
+  local t; t=$(readlink "$1/current") || { echo "REFUSE: $1/current is not a symlink" >&2; return 1; }
+  [[ $t =~ ^$1/([0-9a-f]{40})$ && -d $t && ! -L $t ]] || { echo "REFUSE: unknown deployed identity ($t)" >&2; return 1; }
+  echo "${BASH_REMATCH[1]}"
+}
+# Forward installs only: the candidate must contain what is deployed now (no silent rollback of a live fix).
+require_descendant() {   # <repo> <deployed-sha> <head-sha>
+  git -C "$1" cat-file -e "$2^{commit}" 2>/dev/null || { echo "REFUSE: deployed commit $2 is not in this repo (unknown identity)" >&2; return 1; }
+  git -C "$1" merge-base --is-ancestor "$2" "$3" || { echo "REFUSE: $3 does not contain the deployed $2 (use --rollback-to for a deliberate rollback)" >&2; return 1; }
+}
+# Hashes of every file the bundle runs with, relative to the bundle dir, plus the system gitleaks by absolute path.
+manifest_of() {   # <bundle-dir>
+  (cd "$1" && sha256sum bridge.js bun detectors/* && sha256sum "$GITLEAKS")
+}
+manifest_ok() {   # <bundle-dir> <manifest-file>
+  (cd "$1" && sha256sum --quiet -c "$2") || { echo "REFUSE: $1 does not match $2" >&2; return 1; }
+}
+# rename(2) over the old link: 'current' names the old bundle or the new one, never neither.
+atomic_current() {   # <optroot> <sha>
+  local tmp="$1/.current.new.$$"
+  rm -f "$tmp"; ln -s "$1/$2" "$tmp" && mv -T "$tmp" "$1/current"
+}
+# Process start in epoch seconds from /proc/<pid>/stat field 22 (clock ticks since boot) + btime.
+proc_start_epoch() {   # <pid>
+  local ticks btime hz
+  ticks=$(sed -E 's/^.*\) //' "$PROC/$1/stat" | awk '{print $20}') || return 1
+  btime=$(awk '/^btime /{print $2}' "$PROC/stat") || return 1
+  hz=${CLK_TCK:-$(getconf CLK_TCK)}
+  echo $(( btime + ticks / hz ))
+}
+# Accept the running bridge only when script, start time, interpreter and effective config all bind to <bundle>.
+bind_running() {   # <pid> <optroot> <sha> <config-path> <pinned-config-sha256> <swap-epoch>
+  local pid=$1 opt=$2 sha=$3 cfg=$4 pin=$5 swap=$6 b="$2/$3" want got start
+  want=$(printf '%s\0' "$opt/current/bun" "$opt/current/bridge.js" "$cfg" | od -An -c | tr -d ' \n')
+  got=$(od -An -c "$PROC/$pid/cmdline" | tr -d ' \n')
+  [[ $got == "$want" ]] || { echo "STOP: cmdline is not <current>/bun <current>/bridge.js $cfg" >&2; return 1; }
+  [[ $(readlink -f "$opt/current") == "$b" ]] || { echo "STOP: current does not resolve to $b" >&2; return 1; }
+  start=$(proc_start_epoch "$pid") || { echo "STOP: cannot read the process start time" >&2; return 1; }
+  (( start >= swap )) || { echo "STOP: process started before the swap ($start < $swap): it may run the old script" >&2; return 1; }
+  [[ $(readlink "$PROC/$pid/exe") == "$b/bun" ]] || { echo "STOP: interpreter is not $b/bun" >&2; return 1; }
+  [[ $(sha256sum < "$cfg" | cut -c1-64) == "$pin" ]] || { echo "STOP: config bytes differ from the pinned config" >&2; return 1; }
+  python3 -I - "$cfg" "$b" <<'PY' || { echo "STOP: config detectors are not this bundle's" >&2; return 1; }
+import hashlib, json, sys
+c = json.load(open(sys.argv[1]))['leak']; b = sys.argv[2]
+assert c['redactor'] == f'{b}/detectors/redactor.py' and c['detector_check'] == f'{b}/detectors/detector_check.py'
+assert hashlib.sha256(open(c['redactor'], 'rb').read()).hexdigest() == c['redactor_sha256']
+PY
+}
